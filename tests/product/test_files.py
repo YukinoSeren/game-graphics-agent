@@ -261,6 +261,22 @@ def test_backup_uses_a_consistent_snapshot(tmp_path):
     assert _uid(3) not in ids_after
 
 
+def test_managed_files_are_written_with_owner_only_permissions(tmp_path):
+    import os
+    import stat
+
+    repo = ProductRepository(tmp_path / "product.sqlite3")
+    repo.migrate()
+    service = FileService(repo, tmp_path / "managed")
+    result = _publish(service)
+
+    if os.name != "posix":
+        pytest.skip("POSIX permission bits are not enforced on this platform")
+    final = _objects_dir(service) / result.file_ids[0]
+    assert stat.S_IMODE(final.stat().st_mode) == 0o600
+    assert stat.S_IMODE(_objects_dir(service).stat().st_mode) == 0o700
+
+
 def test_backup_refuses_an_existing_destination(tmp_path):
     repo = ProductRepository(tmp_path / "product.sqlite3")
     repo.migrate()

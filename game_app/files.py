@@ -277,17 +277,14 @@ class FileService:
             _verify_file(self.objects_dir / file_id, entry)
             return file_id
 
-        self.objects_dir.mkdir(parents=True, exist_ok=True)
+        self.objects_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         final = self.objects_dir / file_id
         if final.is_file():
             _verify_file(final, entry)
         else:
             temporary = self.objects_dir / f".{file_id}.tmp"
             try:
-                with temporary.open("wb") as handle:
-                    handle.write(data)
-                    handle.flush()
-                    os.fsync(handle.fileno())
+                _write_private(temporary, data)
                 os.replace(temporary, final)
             except OSError as error:
                 temporary.unlink(missing_ok=True)
@@ -466,8 +463,7 @@ class FileService:
         for name in sorted(material):
             data = material[name]
             path = staging / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(data)
+            _write_private(path, data)
             entries.append(FileEntry(
                 relative_name=name,
                 byte_length=len(data),
@@ -499,7 +495,7 @@ class FileService:
         material: Mapping[str, bytes],
         hooks: PublishHooks,
     ) -> None:
-        self.objects_dir.mkdir(parents=True, exist_ok=True)
+        self.objects_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         for entry, file_id in zip(operation.manifest.entries, operation.file_ids):
             final = self.objects_dir / file_id
             if final.is_file():
@@ -521,10 +517,7 @@ class FileService:
             try:
                 if hooks.before_write is not None:
                     hooks.before_write(final)
-                with temporary.open("wb") as handle:
-                    handle.write(data)
-                    handle.flush()
-                    os.fsync(handle.fileno())
+                _write_private(temporary, data)
                 os.replace(temporary, final)
             except OSError as error:
                 temporary.unlink(missing_ok=True)
@@ -572,6 +565,16 @@ def _materialise(files: Mapping[str, bytes]) -> dict[str, bytes]:
             raise ContractError(ErrorCode.INPUT_VALIDATION_FAILED, "file content must be bytes")
         material[name] = bytes(data)
     return material
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    """Write bytes with owner-only permissions where the OS honours them."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def _media_type(name: str) -> str:

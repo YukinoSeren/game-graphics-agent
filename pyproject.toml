@@ -16,7 +16,10 @@ test = ["pytest>=8,<10"]
 game-collector = "game_collector.__main__:main"
 
 [tool.setuptools.packages.find]
-include = ["game_collector*"]
+include = ["game_collector*", "game_app*"]
+
+[tool.setuptools.package-data]
+game_app = ["migrations/*.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

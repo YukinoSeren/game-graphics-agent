@@ -1,6 +1,6 @@
 # 阶段 B2：共享数据契约
 
-> 建议基线 `product-contract/0.1`；2026-11-01；未实现。
+> 建议基线 `product-contract/0.2`；2026-11-01；未实现。相对 0.1 的读取兼容规则见 §12。
 > 依据：[架构基准](../00-architecture-overview.md)、[确认与决策台账](../README.md)、[公共知识契约 v0.1](../../../knowledge-intake-contract.md)、[原始 07](../../design/07-data-and-architecture.md)。
 > 本文是新增共享逻辑对象及 DTO 的唯一定义。公共原载荷继续由旧契约与现有 Schema 解释；不得据此回改冻结样本。
 
@@ -29,7 +29,7 @@
 | 类型/字段 | 类型与必填/默认 | 约束 |
 |---|---|---|
 | EntityHeader.id | ID，后台生成 | 全产品对象 ID 唯一；跨类型引用仍须校验类型 |
-| EntityHeader.schema_version | string，D=`product-contract/0.1` | 新产品对象的格式版本；不是公共知识原契约版本 |
+| EntityHeader.schema_version | string，D=`product-contract/0.2` | 新产品对象的格式版本；不是公共知识原契约版本 |
 | EntityHeader.created_at | Timestamp，后台生成 | 创建该产品对象的时间 |
 | EntityHeader.created_by_task_id | ID?，D=null | null 表示同步用户操作或历史导入无对应产品任务；不得虚构任务 |
 | VersionHeader.series_id | ID，R | 同一逻辑对象的版本族；ID 本身始终指单一版本 |
@@ -45,7 +45,7 @@
 
 ### 1.2 时间、单位、空值与引用
 
-- 时间段使用半开区间 `[start,end)`；相对时间必须附 time_basis 和 unit。end=null 只表示活动中未结束，不能用于已结束区段的有效时长。
+- 时间段使用半开区间 `[start,end)`；相对时间必须附 time_basis 和 unit。TimeRange 的 end 必须为有限值；仅活动区段及其 BindingRange 可用 end=null 表示尚未结束，不能以此生成分析时长。
 - 内存统一计算值以 byte、间隔以 ms、时长以 s 保存；原文单位原样保留，换算另列方法和输入引用。原文 GB/GiB 不混同。
 - 标识/关系的 null 表示表格明确允许的“无该关系”；未知测量/设备值一律用 FieldValue 或 NumericValue 的未知分支。不得要求所有可空外键都编造 unknown_reason。
 - 历史引用不得指向“当前指针”。引用失效、类型错配、跨游戏/安装、资源未发布或被隔离时，由消费者拒绝相应操作，历史仍可展示原因。
@@ -241,13 +241,14 @@
 | 对象/字段 | 类型与必填/默认 | 约束 |
 |---|---|---|
 | AppliedConfiguration（版本对象）.user_scope_id / installation_id / game_id | ID / ID / ID，R | 同一安装的当前指针唯一；game_id 与安装一致 |
+| AppliedConfiguration.registration_kind | ConfigurationRegistrationKind，D=`current_adoption` | 区分推进当前指针的采用与仅登记过去事实；historical_record 的守卫见 state §4.4 |
 | AppliedConfiguration.device_snapshot_id / game_context_id | ID / ID，R | 固定当时背景；未知字段在快照内表达 |
 | AppliedConfiguration.origin / recommendation_id | AppliedOrigin / ID?，R | baseline 可无推荐；origin=recommendation 必须有推荐引用 |
 | AppliedConfiguration.parent_applied_id / change_set_id / restored_from_applied_id | ID? / ID? / ID?，R | 首次 parent 可空；调整 parent=ChangeSet.base_applied_id；恢复 parent=当前版本，restored_from 指目标 |
 | AppliedConfiguration.settings / preset_reference | ConfirmedSetting[] / string?，R | 至少有已确认项或显式预设引用；不掌握的预设项不展开，未知配置会话不造空采用对象 |
-| AppliedConfiguration.adopted_at / activation_state / checks | Timestamp / ActivationState / CheckResult[]，R | adopted_at 是玩家声明采用时间；确认不等于实际生效 |
+| AppliedConfiguration.adopted_at / activation_state / checks | Timestamp? / ActivationState / CheckResult[]，R | current_adoption 必须给声明采用时间；historical_record 仅在有当时依据时给历史采用时间，否则 null；登记时间见 created_at，不用补录时间冒充历史采用时间；确认不等于实际生效 |
 | AppliedConfiguration.declaration_id | ID，R | 指向本次玩家声明，不以采用对象自我引用代替声明依据 |
-| PlayerDeclaration.installation_id / input / raw_text / submitted_at | ID? / AdoptConfigurationInput或ContextDeclarationInput / string / Timestamp，R | 同步保存玩家提交内容及原话；安装未定的上下文声明可 installation=null；采用声明须安装一致；原话可空，结构化确认仍保留；不含幂等键/认证信息 |
+| PlayerDeclaration.installation_id / input / raw_text / submitted_at | ID? / AdoptConfigurationInput或HistoricalConfigurationInput或ContextDeclarationInput / string / Timestamp，R | 同步保存玩家提交内容及原话；安装未定的上下文声明可 installation=null；采用/历史配置声明须安装一致；原话可空，结构化确认仍保留；不含幂等键/认证信息 |
 | ConfirmedSetting.setting_ref / setting_identity_ref | SettingRef / ID?，R | 同一配置内同一规范设置或原始引用唯一，冲突不能保留成两个可执行真值 |
 | ConfirmedSetting.value / unit / confirmation_method / activation_state | FieldValue<Scalar> / string? / AcquisitionMethod / ActivationState，R | 实际采用值不含待实例化候选/条件；user_provided、player_confirmed、system_probe 不混淆 |
 | CurrentAppliedPointer.user_scope_id / installation_id / applied_id / revision | ID / ID / ID? / Revision，R | 唯一键 `(user_scope_id,installation_id)`；初始 applied_id=null；每次推进保存事件及预期当前 ID |
@@ -280,7 +281,8 @@
 | SessionSegment.scenario / excluded_ranges / stream_selection | FieldValue<string> / ExcludedRange[] / StreamSelection，R | 清洗和流选择均带依据；未知主流不能合并统计 |
 | SessionSegment.run_conditions | RunConditions，R | 与场景/时段一同保存在具体 segment revision，不能事后按当前配置覆盖 |
 | ConfigurationBinding.segment_id / binding_revision / applied_id | ID / Revision / ID?，R | 唯一键 `(segment_id,binding_revision)`，只追加；初次也建 revision=1 |
-| ConfigurationBinding.configuration_state / effective_range / evidence_refs / supersedes_revision | ConfigurationState / TimeRange / EvidenceRef[] / Revision?，R | 后补须适用于当时区间的依据；不改旧摘要 |
+| ConfigurationBinding.configuration_state / effective_range / evidence_refs / supersedes_revision | ConfigurationState / BindingRange / EvidenceRef[] / Revision?，R | 活动段可用开放结束点；结束/切段追加闭合绑定；后补须适用于当时区间的依据；不改旧摘要 |
+| BindingRange | `{start:float,end:float?,time_basis:string,unit:string}` | 全字段 R，start>=0，非空 end 为有限值且>start，unit=s 或 ms；end=null 仅适用于对应活动段修订，不可进入分析；与段边界及时基一致 |
 | TimeRange | `{start:float,end:float,time_basis:string,unit:string}` | 全字段 R，end>start，unit=s 或 ms；精确换算必须有映射依据 |
 | ExcludedRange | `{range:TimeRange,reason:string,evidence_refs:EvidenceRef[]}` | 全字段 R；不可因真实游戏尖峰离群而排除 |
 | StreamSelection | `{process:ProcessIdentity?,swapchain_id:string?,frame_stream_kind:FrameStreamKind,checks:CheckResult[]}` | 全字段 R；空选择意味着未确认，不能生成 valid 目标流结论 |
@@ -305,7 +307,7 @@
 | MetricValue.definition_id / numeric / unit / frame_stream_kind | ID / NumericValueV01 / string / FrameStreamKind，R | 输入数据不足 numeric=unknown；有限值不以 null 默默省略 |
 | MetricValue.input_refs / denominator / method | ObjectRef[] / MetricDenominator? / string，R | 百分比/比率须有分母及输入；原来源未知定义按原文保存而非补公式 |
 | MetricDenominator | `{value:float,unit:string,input_refs:ObjectRef[]}` | 全字段 R，值>=0；分母零时派生结果 unknown，不执行除零 |
-| PerformanceSummary.artifact_id / bindings / analyzed_ranges | ID / BindingRef[] / TimeRange[]，R | 非空 bindings；每个 BindingRef 包含 segment_id:ID、segment_revision:Revision、binding_revision:Revision，均 R；读取该段元数据快照与当时绑定，不取当前投影 |
+| PerformanceSummary.artifact_id / bindings / analyzed_ranges | ID / BindingRef[] / TimeRange[]，R | 非空 bindings；每个 BindingRef 包含 segment_id:ID、segment_revision:Revision、binding_revision:Revision，均 R；读取该段元数据快照与当时绑定，不取当前投影；所引段及绑定必须已闭合，分析范围在二者交集内 |
 | PerformanceSummary.analyzer_version / cleaning_protocol_version / manifest_file_id | string / string / ID，R | 原件、清洗、算法可复算；manifest 记录坏值/断段/排除及原始区间 |
 | PerformanceSummary.valid_interval_count / effective_duration_s | int / float，R | >=0；只来自有效区段，不把缺口或排除时间计入 |
 | PerformanceSummary.metrics / adaptive_long_frames / quality / checks | MetricValue[] / AdaptiveLongFrame[] / LogQuality / CheckResult[]，R | 每个有效连续区段各一项；无有效区段可空并在 checks 说明；质量与每项指标可用性独立，无有效数据可存诊断摘要但不能作有效比较 |
@@ -407,21 +409,22 @@ response_body 只含受控 ID/状态及错误包，不保存未经清洗的请�
 | KnowledgeImportInput | kind=`knowledge_import`、file_ids:ID[]、game_context_id:ID、mapping_version:string、identity_mapping_ids:ID[] | 02a 经 07 对已受管理的冻结文件组建导入快照；file_ids 非空，不接受任意本机路径，游戏身份未知只暂存 |
 | ContextDeclarationInput | kind=`context_declaration`、installation_id:ID?、game_id:ID、fields:map<string,Scalar> | 01 保存玩家主动选择/更正的原始字段及声明；字段名须为 01 声明的上下文/路径字段白名单，不触发系统执行；非重任务输入 |
 | RecommendationInput | kind=`recommendation`、game_context_id:ID、device_snapshot_id:ID、package_id:ID、preference_ids:ID[]（D=[]）、applied_id:ID?（D=null）、history_summary_ids:ID[]（D=[]） | 03 读取固定快照；ExplicitPreferences 是所引 Preference 的只读视图，不新增独立表 |
-| AdoptConfigurationInput | kind=`adopt_configuration`、origin:AppliedOrigin、installation_id:ID、device_snapshot_id:ID、game_context_id:ID、expected_current_applied_id:ID?、recommendation_id:ID?、base_applied_id:ID?、change_set_id:ID?、restored_from_applied_id:ID?、declared_settings:SettingDeclaration[]、preset_reference:string?、claimed_activation:ActivationState | 01；声明先保存，后台构造确认/来源事实，再协调当前指针校验与完整合并快照；按推荐一次确认继承哪些确定项仍沿 Q3 建议，不继承未落实条件项 |
-| CreateSessionInput | installation_id:ID、device_snapshot_id:ID、game_context_id:ID、applied_id:ID?、configuration_state:ConfigurationState、scenario:FieldValue<string>、test_protocol_id:ID?、run_conditions:RunConditions | 04；保存会话/初段/初绑定，允许 applied=null；推荐引用从实际采用关系读取或显式另填可选 recommendation_id:ID?（D=null） |
+| AdoptConfigurationInput | kind=`adopt_configuration`、origin:AppliedOrigin、installation_id:ID、device_snapshot_id:ID、game_context_id:ID、expected_current_applied_id:ID?、recommendation_id:ID?、base_applied_id:ID?、change_set_id:ID?、restored_from_applied_id:ID?、declared_settings:SettingDeclaration[]、preset_reference:string?、claimed_activation:ActivationState | 01；后台准备声明与确认/来源事实，校验后将声明、完整合并快照与当前指针原子提交；按推荐一次确认继承哪些确定项仍沿 Q3 建议，不继承未落实条件项 |
+| HistoricalConfigurationInput | kind=`historical_configuration`、installation_id:ID、device_snapshot_id:ID、game_context_id:ID、segment_ref:BindingRef、effective_range:TimeRange、adopted_at:Timestamp?、declared_settings:SettingDeclaration[]、preset_reference:string?、claimed_activation:ActivationState、evidence_refs:EvidenceRef[] | 01 经 07 同步登记历史配置及声明；evidence_refs 非空，核验已结束段的具体修订与时段依据，生成 registration_kind=historical_record、origin=baseline 的独立版本；不检查/推进当前指针，不继承当前值；绑定另走 BindConfigurationInput |
+| CreateSessionInput | installation_id:ID、device_snapshot_id:ID、game_context_id:ID、applied_id:ID?、configuration_state:ConfigurationState、scenario:FieldValue<string>、test_protocol_id:ID?、run_conditions:RunConditions | 04；保存活动会话/初段/初绑定，初绑定 BindingRange.end=null，允许 applied=null；推荐引用从实际采用关系读取或显式另填可选 recommendation_id:ID?（D=null） |
 | BindConfigurationInput | segment_id:ID、expected_segment_revision:Revision、expected_binding_revision:Revision、applied_id:ID、effective_range:TimeRange、evidence_refs:EvidenceRef[] | 04；同时校验场景/区间投影与绑定版本；追加绑定，不改旧摘要或当前指针；冲突不写入 |
-| AnalyzeInput | kind=`analysis`、artifact_id:ID、bindings:BindingRef[]、analyzer_version:string、cleaning_protocol_version:string | 04；生成新摘要，不能静默用最新绑定重算覆盖旧摘要 |
+| AnalyzeInput | kind=`analysis`、artifact_id:ID、bindings:BindingRef[]、analyzer_version:string、cleaning_protocol_version:string | 04；只接受已闭合段/绑定的具体修订；生成新摘要，不能静默用最新绑定重算覆盖旧摘要 |
 | CaptureInput | kind=`capture`、session_id:ID、segment_ref:BindingRef、adapter_id:string、adapter_version:string、protocol_id:ID? | 04；protocol_id 指 TestProtocol；只允许已验证适配器；保存初始段/绑定修订，后续切段显式记新修订；同会话已有活动采集拒绝重复启动 |
 | LogImportInput | kind=`log_import`、file_id:ID、session_id:ID、segment_ref:BindingRef、source_schema:string | 04；受管理上传原件，不接受任意路径，段/绑定版本固定，未知格式保留但不猜列 |
 | FeedbackInput | kind=`feedback`、session_id:ID、segment_id:ID?、raw_text:string、selections:map<string,Scalar> | 05；保存原文/选项后解析，不强迫非空文本 |
 | NextActionInput | kind=`next_action`、session_id:ID、bindings:BindingRef[]、summary_ids:ID[]、feedback_ids:ID[]、current_applied_id:ID?、package_id:ID? | 05；无日志可空摘要、无基线不得产正式可采用 ChangeSet；research 意图交应用层另建任务 |
 | CompareInput | summary_ids:ID[2]、protocol_id:ID | 04；创建不可变 PerformanceComparison；查询既有结果无写副作用；具体创建路由 C 定义 |
 | OutcomeInput | change_set_id:ID、base_applied_id:ID、tested_applied_id:ID、before_bindings:BindingRef[]、after_bindings:BindingRef[]、comparison_id:ID?、player_acceptance:PlayerAcceptance、feedback_ids:ID[] | 05；程序核对链路后推导效果与兼容标签，不接受客户端直接声明 controlled/improved |
-| ResumeTaskInput | parent_task_id:ID、checkpoint_id:ID、budget:Budget | 07；新建 parent 关联任务，仅复用可核验步骤，未知外部调用不自动重发 |
+| ResumeTaskInput | parent_task_id:ID、checkpoint_id:ID?、budget:Budget | 07；新建 parent 关联任务；有检查点须属于该父任务且输入兼容，仅复用可核验步骤；父任务没有检查点时显式传 null，从其已持久输入登记新任务，仍须核对全部调用审计，不以空检查点绕过未知调用限制 |
 | DeviceScanInput | kind=`device_scan`、game_context_id:ID?、field_paths:string[] | 01 经 07；仅受控探测范围，未知字段路径拒绝 |
 | InformationResponseInput | request_id:ID、expected_request_version:Revision、expected_context_revision:Revision、answers:map<string,Scalar>、skipped_fields:string[]、raw_text:string、conflict_selections:map<string,int> | 07＋领域校验者；短事务保存回答，不经过等待自身的重队列 |
 
-`TaskInput` 联合类型只包含 KnowledgeInput/KnowledgeImportInput/RecommendationInput/AnalyzeInput/CaptureInput/LogImportInput/FeedbackInput/NextActionInput/DeviceScanInput；恢复任务保存可复用父输入及新的 budget，额外保存 ResumeTaskInput 作为原因，不把恢复本身当可任意执行的新业务类型。ContextDeclarationInput 是同步声明，不进入该联合类型。
+`TaskInput` 联合类型只包含 KnowledgeInput/KnowledgeImportInput/RecommendationInput/AnalyzeInput/CaptureInput/LogImportInput/FeedbackInput/NextActionInput/DeviceScanInput；恢复任务保存可复用父输入及新的 budget，额外保存 ResumeTaskInput 作为原因，不把恢复本身当可任意执行的新业务类型。ContextDeclarationInput 与 HistoricalConfigurationInput 是同步声明，不进入该联合类型。
 
 这些 DTO 是受信任应用层间的逻辑输入，不允许浏览器/模型自报 provenance、system_probe、检查通过或比较资格。HTTP/CLI 入口只接收声明原值、选择项和已有引用，07 与领域所有者核验后构造 FieldValue/RunConditions 等包装；具体外部请求体在 C/07 定义。原始声明先保存，再把后台生成的 PlayerDeclaration/InformationResponse 引用附到新事实中，避免要求客户端事先提供尚不存在的声明 ID。
 
@@ -485,7 +488,13 @@ response_body 只含受控 ID/状态及错误包，不保存未经清洗的请�
 | B-DAT-07 / A12、A13 | 无基线文字反馈；另有接受但未测和更快但拒绝 | 生成下一动作/Outcome | 无假 ChangeSet/回滚值；接受与效果字段独立，不假造实测变化 | 反馈/模型输出桩；不需真实环境 |
 | B-DAT-08 / A05 | 冻结导入缺文件或复制期间来源改变 | 校验 manifest 与引用，再请求发布 | 保留诊断原件，未发布，推荐不可用；不能导出伪成功包 | 临时文件与 DB；不需网络 |
 | B-DAT-09 / 历史一致性、D05 | 旧摘要已固定 segment_revision；随后更正场景/排除范围 | 保存新段修订，再读旧摘要并以旧段版本提交绑定 | 旧元数据与旧统计仍可复现；绑定提交冲突；新分析显式引用新段修订 | 版本/时间区间夹具；不需真实环境 |
+| B-DAT-10 / D03、D05 | 自然游玩无预计结束时间，配置可已知或未知 | 创建会话与开放初绑定，结束/切段后再分析；另用开放修订请求分析 | 初绑定 end=null 合法；闭合产生新段/绑定修订，旧修订保留；开放修订不可分析，有限时长不靠猜测 | 时间/绑定夹具；不需真实环境 |
+| B-DAT-11 / D03、D04 | 旧段配置未知，当前指针为 B；后来取得旧段使用 A 的依据 | 提交 HistoricalConfigurationInput，随后显式补绑 | 新历史 A 有独立 ID/声明/时段依据，未知 adopted_at=null；不虚构与 B 的父链，当前仍为 B；补绑后新分析引用新修订 | 声明/历史区段夹具；不需真实环境 |
+| B-DAT-12 / A06、D02 | queued 任务未建检查点即重启；另有首检查点前的未知调用 | 以 checkpoint_id=null、明确预算恢复；用外来检查点/隐去已有检查点另试 | 无检查点也可登记 parent 关联任务；外来/隐去已有检查点拒绝，未知调用不因 null 重发 | 调用桩/任务夹具；不需网络 |
+| B-DAT-13 / 版本兼容、D02 | 0.1 采用对象/有限绑定及已登记幂等响应，另有公共知识原载荷 | 用兼容视图读取，再重送原提交；创建 0.2 历史记录 | 原对象/原载荷/旧 hash/响应不改写；旧采用映射 current_adoption，有限绑定可读；新历史对象标 0.2，不重跑旧任务 | 旧格式/幂等夹具；不需真实环境 |
 
 ## 12. B2 退出边界
 
 本篇固定共享名称、字段、引用、必填/null/默认策略、不可变规则和原型映射；B3 在此基础上补齐合法状态与提交/恢复约定。C2/C3/C4 仍需完成覆盖与 readiness 归约、具体本机字段/设置扩展、候选算法、适配器签名、具体 CSV 格式与数值容差；这些模块缺项不由模型临时解释为已确定规则。
+
+0.2 修订只影响产品建议契约，公共知识 v0.1 及冻结原件保持原格式。旧 product-contract/0.1 对象按原 schema_version 读取：AppliedConfiguration 在兼容视图中映射 registration_kind=current_adoption，原 adopted_at 保留；旧有限 effective_range 可无损读取为闭合 BindingRange，不为旧开放段猜造结束时间。新历史记录及开放绑定须按 0.2 写入；不能只换旧对象版本标签而补造事实。旧幂等记录继续按其 request_schema_version/原 hash 与响应核对，规范化规则和历史响应不随升级重写；具体迁移代码与旧记录夹具在 C1/07 定义。

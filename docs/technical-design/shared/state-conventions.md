@@ -1,6 +1,6 @@
 # 阶段 B3：共享状态、守卫与恢复约定
 
-> 建议基线 `product-contract/0.1`；2026-11-01；未实现。
+> 建议基线 `product-contract/0.2`；2026-11-01；未实现。读取兼容规则见 data §12。
 > 类型/字段见[data-contracts.md](./data-contracts.md)，错误见[error-conventions.md](./error-conventions.md)，需求与建议状态见[台账](../README.md)。
 > 本篇统一状态含义、跨模块不变量及提交边界；不设计 SQLite 语句、采集工具参数或完整模块算法。
 
@@ -41,6 +41,7 @@
 | RecommendationActionKind | set_value / keep_current / conditional_strategy / check_in_game / defer | keep_current 当前未知须保留未知；条件动作不能当已确定 fixed |
 | ReviewState | current / needs_review / superseded | current 只指尚无已登记复核要求，不代表完美/已测；与 readiness 独立 |
 | AppliedOrigin | baseline / recommendation / change_set / manual_edit / rollback | 合法关联见 §4；都只登记事实，不自动设置游戏 |
+| ConfigurationRegistrationKind | current_adoption / historical_record | current_adoption 按 §4.1—4.2 推进当前指针；historical_record 按 §4.4 仅补录过去事实 |
 | ActivationState | active_confirmed / restart_pending / unknown / conflicting / not_applicable | active_confirmed 须有依据且仍保留 method；不能只因文件读到或单击采用而推定运行生效 |
 | ConfigurationState | bound / unverified / mixed | bound 是版本已关联；unverified 无可靠配置绑定；mixed 是该时段发生无法可靠分段的变动 |
 | SessionLifecycle | active / ended | 与实际配置状态独立；active 的结束时间为空，ended 必须有合法结束时间/相对时点；开始与结束事件追加保存 |
@@ -134,7 +135,7 @@ ImportSnapshot 的产品导入任务不是被导入的历史采集任务，两�
 
 ### 4.1 Origin 的关联守卫
 
-所有关系必须同用户/游戏/安装，输入版本存在且未被伪造。表中“必须空”表示禁止拿其他 origin 的语义混用；派生来源仍可从父链/声明追溯。
+所有关系必须同用户/游戏/安装，输入版本存在且未被伪造。下表用于 registration_kind=current_adoption；历史补录单独遵守 §4.4，不套用“父版本必须为当前”的守卫。表中“必须空”表示禁止拿其他 origin 的语义混用；派生来源仍可从父链/声明追溯。
 
 | origin | recommendation_id | parent_applied_id | change_set_id | restored_from_applied_id |
 |---|---|---|---|---|
@@ -148,7 +149,7 @@ ImportSnapshot 的产品导入任务不是被导入的历史采集任务，两�
 
 ### 4.2 采用事务
 
-1. 解析幂等键及不可变输入，检查设置值、安装、推荐/ChangeSet、声明与必要生效条件，保存原话和结构化声明。
+1. AdoptConfigurationInput 只创建 registration_kind=current_adoption。解析幂等键及不可变输入，检查设置值、安装、推荐/ChangeSet、声明与必要生效条件，准备原话和结构化声明，校验通过后才与采用版本一同提交。
 2. 在产品库事务内检查 expected_current_applied_id：首次与 null 比较，后续与当前指针比较。冲突返回 CURRENT_CONFIGURATION_CONFLICT，不创建采用版本/声明或推进指针。
 3. 调整从 ChangeSet.base 的完整快照合并差异；额外玩家改动一并登记，不能继续声称只执行了原实验单元。保留未改字段、未知与自定义值。
 4. 同一事务保存 PlayerDeclaration、新 AppliedConfiguration、父/变更/恢复引用、CurrentAppliedEvent、CurrentAppliedPointer 与幂等原响应。提交后才对外返回新 ID。
@@ -167,6 +168,17 @@ ImportSnapshot 的产品导入任务不是被导入的历史采集任务，两�
 | 后补历史配置 | 校验时段依据和 expected_binding_revision，追加 ConfigurationBinding | 用“确认当前配置”自动回填过去；改变当前采用指针 |
 
 后补绑定同时校验 expected_segment_revision 与 expected_binding_revision，保存新投影快照/事件，旧摘要仍引用旧 segment_revision/binding_revision。场景、排除区间或运行条件更正也须保存新段快照；不能在相同配置绑定下静默漂移。使用新段/绑定必须生成新 PerformanceSummary 和新的比较/Outcome，不能覆盖既有结论。原比较含单项口径不统一时仅该项降级；实际配置、关键生效或场景不明则整体不能 controlled。
+
+创建活动段时同步建立 revision=1 的 ConfigurationBinding，effective_range 使用 BindingRange，end=null，不填预计结束时间；配置未知仍为 applied_id=null/unverified。结束或切段的同一事务校验段/绑定修订，保存已结束段快照及有实际结束点的新绑定修订（supersedes_revision 指旧绑定），不原地闭合旧绑定。切段还须保存新活动段与其开放初绑定；半开区间在边界衔接，不重叠。采集结果返回最终段/绑定定位，AnalyzeInput 显式选用闭合修订；以开放段或开放绑定分析返回 PRECONDITION_UNVERIFIED，不能自动改用最新修订或补造时长。
+
+### 4.4 历史配置登记事务
+
+旧会话没有可引用的实际配置版本时，01 经 07 接收 HistoricalConfigurationInput，先登记过去事实，再由 04 显式补绑；若已有适用历史版本则可直接提交 BindConfigurationInput。
+
+1. 核验用户/安装/游戏、设备与游戏快照及 segment_ref；目标段须已结束，所给段/绑定修订仍匹配，effective_range 为段内非空有限区间且时基可核对。时段依据必须覆盖所声明配置；仅证明“现在如此”的回答不够，缺依据返回 PRECONDITION_UNVERIFIED，修订过时返回 BINDING_REVISION_CONFLICT。
+2. 基于历史声明与原件构造完整的已知/未知项及预设引用，不从当前配置补齐。同事务保存 PlayerDeclaration（input 为 HistoricalConfigurationInput）、registration_kind=historical_record 的新 AppliedConfiguration 及幂等原响应，返回 ResourceResult。该对象仍须满足至少有已确认项或显式预设的规则；其 adopted_at 仅在历史采用时刻可核验时填写，否则 null，created_at/submitted_at 保存本次登记时间。
+3. 本操作的新记录作为独立版本族、version=1、origin=baseline；recommendation_id、parent_applied_id、change_set_id、restored_from_applied_id 均为 null。不得把当前 B 设为过去 A 的父版本，也不凭补录主张某个 ChangeSet 已执行；已有可靠采用链的历史版本直接引用，不在此伪造实验链。补录更正追加另一事实，旧记录/声明仍保留，替代关系通过新绑定的 supersedes_revision 表达。
+4. 该事务不检查 expected_current_applied_id，不创建 CurrentAppliedEvent、不更新 CurrentAppliedPointer，也不自动修改段绑定或终态任务。随后补绑仍单独核验时段依据及最新段/绑定修订；中途冲突只拒绝补绑，已登记历史事实可保留并按原 key 查询。若玩家现在手动采用该历史配置，另走 AdoptConfigurationInput 和当前指针守卫，创建新的 current_adoption 事实。
 
 ## 5. 推荐复核、偏好与结果
 
@@ -216,10 +228,10 @@ prepared→in_flight 的事务与网络发送无法原子提交；即使在二�
 
 ### 6.3 恢复前核对
 
-1. 读取旧终态、检查点、输入版本、原件 hash 与所有调用状态；运行未结束不能并行恢复同一检查点。
-2. 重用已完成且与新输入兼容的步骤；后补信息影响的步骤必须重验，其旧成果继续保留。
+1. 读取旧终态、已持久输入修订、可空检查点、原件 hash 与父任务全部调用状态（包括未进入检查点的调用及恢复链关联的调用）；运行未结束不得恢复，不能靠省略检查点绕过该守卫。
+2. checkpoint_id 非空时必须属于父任务且输入兼容；重用已完成且可验证的步骤，后补信息影响的步骤必须重验，其旧成果继续保留。父任务确无检查点时允许 checkpoint_id=null，从其已持久输入创建新任务，不虚构检查点或进程内完成步骤；已有检查点却传 null，或检查点归属/完整性不合法时拒绝恢复并给出具体原因。
 3. 创建新 TaskRun、parent_id、新输入与明确预算；注册新的幂等键。原终态任务及其预算不改写。
-4. 未知调用不重发；有足够部分成果则继续其他范围或交付受限结果，无法继续时给具体状态/动作，不做“空成功”。
+4. 无检查点也必须核对调用审计：父任务确无可能发送的调用时可从头执行；已有响应仅在可核验输入/步骤归属后复用，可能已发送或结果未知的调用不重发。无法安全定位步骤时只继续独立范围或交付受限结果/具体恢复动作，不能把 null 解释为“没有调用过”，也不做“空成功”。
 
 ## 7. InformationRequest 回答与继续
 
@@ -293,6 +305,9 @@ stateDiagram-v2
 | B-STA-07 / A05：文件与库窗口 | staging 导入和完整临时文件 | 在最终改名后/DB 提交前/DB 后响应前退出，再重试 | 未发布资源不被消费；孤立文件可核对；已提交重试回同 ID，无原目录回写 | 临时目录/DB，故障注入；不需网络 |
 | B-STA-08 / A13：接受与改善 | 玩家接受但未复测；测得更快却拒绝；平均升但尾部退 | 计算 Outcome 扩展与兼容标签 | accepted+not_measured 不变 improved；拒绝理由保留；指标矛盾不强归约成功 | 受控摘要/反馈；真实效果留 C/08 |
 | B-STA-09 / 更新传播 | 历史推荐引用旧包，02 登记受影响证据 | 通知 03、追加复核事件后读取历史 | needs_review 不改原推荐、旧包、采用或会话；重算新版本后旧版本 superseded | 包/推荐夹具；不需网络 |
+| B-STA-10 / D03、D05：开放绑定闭合 | 活动段初绑定 end=null，另有并发过时的结束请求 | 结束/切段，重读旧修订，分别请求分析 | 段结束与闭合绑定同事务，切段建立新开放绑定；旧修订不改；过时请求冲突；仅闭合修订可分析 | 时间夹具/临时 DB；不需游戏 |
+| B-STA-11 / D03、D04：仅补录过去事实 | 当前指针 B，旧段配置未知且有历史 A 的依据 | 登记历史 A；模拟登记响应丢失后重试，再显式补绑 | 只产生一个 A/声明，无当前指针事件，A 不以 B 为父；缺时段依据拒绝；绑定冲突不删 A，旧摘要不变 | 两客户端/临时 DB；不需游戏 |
+| B-STA-12 / A06、D02：首检查点前恢复 | queued 未执行即重启；另有无检查点但 in_flight 调用的任务 | 显式以 null 检查点与新预算恢复；重试同 key | 新任务 parent_id 正确且仅登记一次；无调用分支可执行；未知调用分支保留审计、不自动重发；旧任务终态/输入不改 | 调用桩/故障注入；不需网络 |
 
 ## 10. B3 与阶段 C 的分界
 

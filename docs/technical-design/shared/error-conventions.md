@@ -1,6 +1,6 @@
 # 阶段 B3：共享错误、幂等与重试契约
 
-> 建议基线 `product-contract/0.1`；2026-11-01；未实现。
+> 建议基线 `product-contract/0.2`；2026-11-01；未实现。读取兼容规则见 data §12。
 > 对象字段见[data-contracts.md](./data-contracts.md)，合法转移与提交边界见[state-conventions.md](./state-conventions.md)。
 > HTTP 部分沿 Q1 的本地网页建议展开；CLI 复用错误码、资源引用和动作语义。完整路由和各操作超时参数在 C/07 定义。
 
@@ -70,14 +70,14 @@ GET 只查询已存在资源，不生成持久比较或导出文件；比较/导
 | RESOURCE_GONE / not_found | 410 | 资源受控清理且保留墓碑；旧键不复活结果 | none；view_saved_results/create_new_task |
 | IDEMPOTENCY_CONFLICT / conflict | 409 | 同作用域 key、不同规范请求 hash；不执行新输入 | refresh_then_new_submission；edit_input |
 | CURRENT_CONFIGURATION_CONFLICT / conflict | 409 | expected_current_applied_id 不等于当前；不创建采用版本/声明、不推进指针 | refresh_then_new_submission；review_configuration |
-| BINDING_REVISION_CONFLICT / conflict | 409 | expected_segment_revision 或 expected_binding_revision 旧；field_errors 标明具体维度，不追加绑定 | refresh_then_new_submission；view_saved_results |
+| BINDING_REVISION_CONFLICT / conflict | 409 | expected_segment_revision、expected_binding_revision 或历史登记 segment_ref 中相应修订旧；field_errors 标明具体维度，不登记历史配置或追加绑定；先前独立提交的历史事实仍保留 | refresh_then_new_submission；view_saved_results |
 | INFORMATION_REQUEST_VERSION_CONFLICT / conflict | 409 | 仅请求 version 旧，上下文仍有效；无状态变更 | refresh_then_new_submission；read_information_request |
 | INFORMATION_CONTEXT_CHANGED / conflict | 409 | 上下文已失效；必要时原子保存 superseded/替代问题或解除等待 | refresh_then_new_submission；read_information_request/read_task |
 | TASK_STATE_CONFLICT / conflict | 409 | 对不允许状态执行恢复/绑定等；终态取消另按幂等无操作返回当前终态 | none；read_task/view_saved_results |
 | ACTIVE_CAPTURE_EXISTS / conflict | 409 | 同会话已有 queued/running 采集，即使 key 不同也不另建 | none；read_task，返回已有 task 引用 |
-| REFERENCE_INVALID / dependency | 422 | 引用错类型/错游戏/错安装/不属于该包，或依赖记录隔离 | none；edit_input/view_saved_results |
+| REFERENCE_INVALID / dependency | 422 | 引用错类型/错游戏/错安装/不属于该包，依赖记录隔离，或恢复检查点不属于父任务/输入不兼容 | none；edit_input/view_saved_results |
 | BASELINE_REQUIRED / dependency | 409 | 请求正式 ChangeSet/采用时没有有效实际基线或无法恢复必要原值 | repair_then_new_submission；review_configuration |
-| PRECONDITION_UNVERIFIED / dependency | 409 | 操作要求的关键适用/生效前提缺证据；无伪造结果写入 | repair_then_new_submission；read_information_request/view_saved_results |
+| PRECONDITION_UNVERIFIED / dependency | 409 | 操作要求的关键适用/生效前提缺证据、历史配置没有适用于目标时段的依据、分析引用开放段/绑定，或恢复时隐去父任务已有检查点；无伪造结果写入 | repair_then_new_submission；read_information_request/view_saved_results |
 | UNSUPPORTED_ARTIFACT_FORMAT / validation | 422 | 未验证 CSV Schema/单位/时钟；已上传原件可保留但不假解析 | repair_then_new_submission；reupload_file/view_saved_results |
 | IMPORT_SNAPSHOT_INCONSISTENT / storage | 409 | 源快照变动、缺文件/坏引用/重复键，不发布导入 | repair_then_new_submission；view_saved_results |
 | ARTIFACT_UNAVAILABLE / storage | 409 | 登记资源对应文件缺失/损坏/未发布；不返回空文件成功 | repair_then_new_submission；view_saved_results/reupload_file |
@@ -120,7 +120,7 @@ hash 针对经校验规范化的外部业务请求；不针对本次重新构造
 | 提交成功、响应丢失 | 读已提交的幂等记录，返回原 ID；不能靠“客户端没见成功”重做 |
 | 无法判断 DB 是否提交 | 查询同 key 后再决定；存储仍不可用则返回 STORAGE_COMMIT_FAILED，不改 key、不启动任何外部调用 |
 
-任务创建事务包含 TaskRun、初始 TaskInputRevision、注册事件与 IdempotencyRecord；提交后入队。同步采用/回答等事务包含领域事实、所有受影响投影/事件和同一幂等原响应。文件创建/发布另遵守 state §8，不能先返回有效文件引用再慢慢写原件。
+任务创建事务包含 TaskRun、初始 TaskInputRevision、注册事件与 IdempotencyRecord；提交后入队。同步采用/回答等事务包含领域事实、所有受影响投影/事件和同一幂等原响应。历史配置登记仅提交其声明/历史版本/幂等响应，不写当前指针或绑定；后续补绑是另一逻辑提交，使用新 key。文件创建/发布另遵守 state §8，不能先返回有效文件引用再慢慢写原件。
 
 报文、类型、访问校验失败且尚无业务写入时不消耗 key；纯并发前置冲突也不产生假任务。业务校验在事务内复核。INFORMATION_CONTEXT_CHANGED 如确实提交了 superseded/替代问题等维护事件，必须在同事务保存该 409 响应的幂等记录；同 key 重试返回原 409，不重复造替代问题。若没有提交任何变化，则可不登记 key；客户端更新内容后必须用新 key，不能借此偷改已注册提交。
 
@@ -137,7 +137,7 @@ hash 针对经校验规范化的外部业务请求；不针对本次重新构造
 | 供应商明确失败响应 | 不把整个任务从头重跑；认证失败停止该服务继续调用；已知限流按真实依据处理 | 保存部分成果，修复后新恢复任务 |
 | 外部请求超时/连接断开/进程退出，可能已送 | outcome_unknown；绝不把一般异常当 failed_known 后自动再试 | 先核验结果；无法核验则保留未知，独立新调用需明确新预算与可能重复说明 |
 | 文件写入/发布失败 | 未发布资源不被消费，保留暂存/操作日志，核对原件与 DB | 原 key 重试核对；修复或受管理重新上传，不传任意路径 |
-| 后台重启，旧 queued/running | 标 interrupted，保留原状态历史，不自动继续外部调用 | 检查点兼容后显式恢复为新任务 |
+| 后台重启，旧 queued/running | 标 interrupted，保留原状态历史，不自动继续外部调用 | 有检查点先校验兼容性；确无检查点可显式传 null，核对父任务全部调用审计后以新预算创建 parent 关联任务 |
 | 后台重启，waiting_input | 保留问题与等待，不占队列 | 可继续按版本回答/明确跳过 |
 | 终态任务后补信息 | 不修改旧任务成果/输入、不复活 | 新事实保存后显式新建相关分析任务 |
 
@@ -204,5 +204,7 @@ expected_revision/current_revision 为 null 是因为本操作按不可变 appli
 | B-ERR-06 / A05：提交不确定 | DB 提交后模拟响应丢失，另一次文件校验失败 | 原 key 重试，读取错误资源 | 前者回原 ID；后者不发布/不空成功，给保存成果定位 | 故障注入/临时目录；不需网络 |
 | B-ERR-07 / 安全边界：脱敏 | 供应商异常含密钥/请求体，本机路径含用户名 | 构造错误包、日志和导出 | 页面/可分享数据不含敏感原文，只有稳定码/关联 ID/可见资源引用 | 异常/路径夹具；不需真实环境 |
 | B-ERR-08 / 领域与错误分离 | 任务产 blocked 推荐与 failed 任务各一例 | 查询两个已有任务，再查不存在 ID | 已有任务均 200 且保留不同领域/执行结果；不存在 404；不隐式重跑 | 任务夹具；不需真实环境 |
+| B-ERR-09 / D03、D04：历史登记去重 | 当前 B，旧段 A 的登记已提交但响应丢失；另有过时 segment_ref | 原 key 重送历史登记，再以新 key 补绑；提交过时登记 | 原 key 返回同 A/声明，当前 B 不变；补绑独立去重；过时登记返回 BINDING_REVISION_CONFLICT，无部分写入 | 历史/版本夹具与临时 DB；不需游戏 |
+| B-ERR-10 / A06、D02：无检查点恢复边界 | interrupted 父任务 checkpoint=null；另有外来检查点和父任务未知调用 | 分别提交恢复，再重试原 key | 合法恢复返回同新 task/parent；外来检查点 REFERENCE_INVALID；未知调用仍适用 CALL_OUTCOME_UNKNOWN，不因 null 自动重发 | 调用桩/临时 DB；不需网络 |
 
 静态检查须同时核对 data 的 MutationContext/IdempotencyRecord、state 的终态/未知窗口以及本篇 retry_policy。完整页面文案、错误到按钮的映射和逐操作接口验收在 C5/06/07/08 展开。

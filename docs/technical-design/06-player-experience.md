@@ -1,6 +1,6 @@
 # 06 玩家旅程、页面状态与交互接口详细设计
 
-> 阶段 C5；2026-11-01；建议基线 `product-contract/0.2`；未生成网页、前端代码或像素稿。
+> 阶段 C5及D-P01—D-P04补全；2026-11-01；建议基线 `product-contract/0.4`；未生成网页、前端代码或像素稿。（独立审计修订；兼容见共享数据§12.2）
 > 来源：[原始 06](../design/06-player-experience.md)、C02/C06/C07/C11、D01—D05、[07路由登记](./07-data-and-architecture.md#11-c5-路由集成登记)、各领域模块及 shared 契约。
 
 ## 1. 范围与产品选择
@@ -102,6 +102,36 @@ sequenceDiagram
 
 外部日志入口：上传取得file ID→GET log-inspection预览已登记格式的原始时间范围/候选流→选择“关联已有记录”或“补录过去一次游玩”→填写可确认的时间对应和依据→POST log-associations→读取新artifact/闭合绑定→显式analyses。页面按04 §4.3组装LogAssociationRequest，时间锚点展示换算前后单位与范围，流选择绑定后台stream_key；不让玩家手填映射系数或JSON。已有记录修订过时保留输入并刷新；历史模式必须有真实过去开始时间，未知时可保留文件、稍后补充，不能默认上传时刻。配置未知无需补造采用版本；仅凭玩家时间声明不显示“已自动确认”。终态导入任务不会因此复活，修正映射创建新artifact/新分析，旧结果仍可查看。
 
+### 7.1 D-P01 空库进入与本机记录
+
+首次页面GET games仅查本地候选；空页仍允许直接填写游戏名称，平台/设备/FPS/偏好均非必填。提交02 GameSelectionRequest，页面用ResourceResult定位GameSelection：selected则读取固定GameContext进入设备扫描/公共knowledge；needs_choice则列候选原名/平台/身份局限，玩家明确选择后新key提交，不自动取首项，也不展示未取得的路径/能力为已支持。
+
+provisional显示“名称已记录，游戏身份和平台待核验”；它允许收集资料，不显示“已确认支持/可直接推荐”。返回上下文installation=null时，可先公共收集。玩家需要保存本机配置/游玩记录时，查看当前用户安装列表并明确选择，或以01 CreateInstallationRequest新建路径未知本机记录；取得返回带安装上下文后再探测。相同标签可以属于两个安装，不按名字自动合并。选已有安装时保存其revision，409刷新列表保留草稿，重新确认才新key。
+
+普通用户始终从选择和返回引用继续，不输入任何游戏/安装/上下文ID。公共选择成功、后续扫描失败是两个提交：选择保留，扫描显示逐字段失败/集中问题，不要求重复选游戏；无模型配置也能完成选择/登记/回答。
+
+### 7.2 D-P02 本机条目与基线
+
+原配置表允许“添加我记得的设置”：只填原名、可选菜单路径和说明，向local-settings提交01局部请求。目录登记返回后页面使用definition_id组装SettingRef，再另行收集已知值/不知道和生效声明，提交原AdoptConfigurationInput保存baseline。条目登记不显示“设置已应用”，不推断预设未展开值，也不把玩家原话当自动读取结果。
+
+路径已声明时普通登记使用identity_mode=auto；路径未知时先GET local-settings列候选，玩家明确选“复用这项”则reuse并带固定reuse_local_setting_id，或选“这是另一项”则distinct/null，保留同名不同项而不改原名/伪造路径。目录更正使用reuse且reuse_local_setting_id=supersedes_local_setting_id，展示旧条目与后继；409读取已有后继供核对。更正不自动改配置引用或复制值。需要让新当前配置使用新定义时，另显示“替换这项记录”：从固定当前A选择旧项，重新确认旧值/单位和新值/生效情况，组装manual_edit的setting_ref_replacements及新SettingDeclaration；保留K/未知项/预设。旧值未知先确认，不能用改目录绕过。登记成功而采用冲突时两次草稿分别保留，新确认才换key；没有适配器/公共知识同样可记录。
+
+### 7.3 D-P03 保存测试计划
+
+测试页在开始采样前提供“保存测试计划”：填写可确认场景/条件，选GET metric-definitions返回的指标，并保留明确的未规定热身/时长/次数。界面可介绍原建议值，但不得将未选择的值混入提交；metric_registry_version与选择的key一并冻结到MutationDraft。POST test-protocols后读取返回具体协议版本，新会话/ChangeSet明确引用；更改计划另存子版本，不替换历史会话。
+
+“测试计划”与基线后“保存比较方式”是两个入口，后者沿现有comparison-protocols。页面显示测试计划登记时间/声明范围，但不标“已执行/受控”；实际每轮条件/绑定仍核对。目录缺规则时解释暂不可保存协议，允许自然游玩test_protocol_id=null；不能让用户手填MetricDefinition或用ComparisonProtocol ID顶替。响应未知沿原key/规则版本重送，后台规则升级不自动改草稿。
+
+### 7.4 D-P04 已处理问题的稍后补充
+
+resolved/skipped问题显示“补充或更正这份记录”。页面读取源问题两修订，选需补字段并填理由，POST information-amendments；成功后根据返回新InformationRequest创建**另一个**回答草稿，按其version/context revision填写InformationResponseInput。原创建提交与新回答各自有key；任何一条响应未知仅重试自己的原内容。
+
+新面板展示来源记录/当时范围与旧回答供参考，不预填成已确认新答案。facts_only明确显示“保存新事实；原任务和旧结果保持原输入”；完成后如需重新分析，再明确选择新快照/范围创建任务。原任务仍running也不会用本次更正悄悄替换其输入；终态任务不出现“已继续”文案。过去配置补录/绑定仍是独立入口。
+
+源问题尚open/partial时引导原回答面板；源已superseded或已有更正后继时，409读取后台替代/后继，保留草稿，不建并列链。0.4更正字段选择来自amendment_root_ref指定的根问题revision（首次源问题自身），即使最新后继只问过GPU，仍能再选根域中的显存；原答值仅参考，不预确认。新回答的背景使用后继固定的历史派生上下文，页面不能丢掉前轮更正或换成当前设备。旧链根依据不可用显示具体原因，不自行补根。LOCAL_SETTING_CONFLICT、INSTALLATION_REVISION_CONFLICT、INFORMATION_REQUEST_STATE_CONFLICT按共享动作处理。
+
+新变更草稿request_schema_version=product-contract/0.4，发送时放X-Product-Contract-Version头；旧草稿沿其旧版本查原响应，不自动改0.4或换key。登记的identity_mode/复用选择、采用的显式替换映射均是业务内容，确认修改后才新key；后台根引用不是客户端可填写字段。
+
 ## 8. 依赖与降级
 
 服务端模板+原生JS优于独立SPA作为首版建议，理由是减少双份模型与构建依赖；复杂路由/离线多窗口需求若增大再评估。关键表单即使图表脚本失败也可读数值/限制；JS失效不得显示已发送成功，提供可恢复的只读结果与重试提示。
@@ -120,13 +150,14 @@ ECharts官方无障碍文档说明可提供图形描述/非单纯颜色区分，
 | UX-V06 / D02：响应未知 | 双击、提交后断连、后台重启、403、旧键410 | 刷新/恢复会话/原key重试/显式新任务 | 同task/result且供应商次数不增；unknown不换key；410不复活，明确预算才新调用 | SpyProvider；真实浏览器/临时库 |
 | UX-V07 / D03、历史 | 当前B、过去A依据、旧方案、不同条件两摘要 | 历史补录/绑定、查看、手动恢复确认、比较/导出 | 补录不切B，查看不推进，恢复新ID；不可比项解释；导出固定修订且脱敏 | 固定历史/临时文件；真实浏览器/下载 |
 | UX-V08 / D02/D03/D05：协议与日志入口 | 空协议库、相对时间历史日志、可确认过去起点；另有响应丢失/过时段/无依据 | 页面保存比较方式→用返回协议比较；上传预览→人工关联→显式分析；刷新重试 | 普通流程可取得合法protocol_id/闭合引用，无需手改JSON；原key不重复创建，过时保留草稿；无依据仅保留文件，事后口径显示探索性，当前配置/旧摘要不改 | 固定CSV/服务桩/临时DB；真实浏览器回环与存储测试 |
+| UX-V09 / D-P01—04、C02/C11：空库补全旅程 | 无Game/安装/协议库、模型未配置；固定规则目录及领域桩；原skipped问题 | 仅名称选择→路径未知本机记录→登记条目/独立baseline→保存测试计划/另比较口径→更正已跳过问题/补答；每步模拟丢响应/刷新/冲突 | 普通流程全由选择/返回取得ID；未输入FPS/平台也可选择；身份未核验明确降级；登记不采用、两协议不混型；新问题facts_only，原任务零写；规则版本/原key保留，全部旧事实可读；未知位置明确选不同项/复用；目录更正后另确认旧值/新值替换；根域两轮不同字段不丢先前回答；版本头随草稿恢复 | 真实浏览器/临时DB/服务与探测桩；免付费，真实游戏/兼容另验 |
 
 ## 10. 实施任务与 DoD
 
 | 任务/目标 | 依赖 | 拟建组件/文件 | 必须逻辑与接口 | 验收/完成定义 |
 |---|---|---|---|---|
-| UX-T01 页面读取与状态映射 | ENG-T01—03、领域只读接口 | game_app/templates/、static/；tests/product/test_view_models.py | 六页信息结构/状态、固定历史查询、图表文本替代 | UX-V01/03/07；无私有路径或原型工程词暴露 |
-| UX-T02 提交草稿与回答恢复 | UX-T01、DEV-T04、ENG-T04路由基础 | static/submissions.js、templates/information.html；tests/integration/test_submissions.py | 发送前持久key、unknown/403/刷新/冲突/部分回答、反馈声明 | UX-V02/06；调用/对象次数可查，键盘焦点与输入保留 |
-| UX-T03 闭环及可访问集成 | UX-T02、PERF-T04、FBK-T03、ENG-T04完成 | templates/、static/、tests/integration/test_journey.py | 采用/基线/未知、协议冻结、日志预览/人工关联、采集收尾、反馈/Outcome/历史/导出、安全错误动作 | UX-V04/05/07/08及VAL-V06/07；普通旅程不需手改JSON，真实能力按证据标注 |
+| UX-T01 页面读取与状态映射 | ENG-T01—03、领域只读接口 | game_app/templates/、static/；tests/product/test_view_models.py | 六页信息结构/状态、空目录/候选与安装/规则查询、固定历史/图表文本替代 | UX-V01/03/07/09读取部分；无私有路径或原型工程词暴露 |
+| UX-T02 提交草稿与回答恢复 | UX-T01、DEV-T04、ENG-T04路由基础 | static/submissions.js、templates/information.html；tests/integration/test_submissions.py | 发送前持久key、unknown/403/刷新/冲突/部分回答、facts_only更正双提交、规则版本固定及反馈声明 | UX-V02/06/09恢复部分；调用/对象次数可查，键盘焦点与输入保留 |
+| UX-T03 闭环及可访问集成 | UX-T02、PERF-T04、FBK-T03、ENG-T04完成 | templates/、static/、tests/integration/test_journey.py | D-P首次进入/本机条目/测试计划/更正、采用/未知、比较冻结/日志关联、采集收尾、反馈/Outcome/历史/导出 | UX-V04/05/07/08/09及VAL-V06/07/08；普通旅程不需手改JSON，真实能力按证据标注 |
 
 UX-T01与ENG-T04可以在领域接口稳定后交替增量交付；ENG-T04的路由基础不依赖UX实现，UX-T02依赖该基础，最后ENG-T05依赖UX-T03/VAL-T04做完整集成，不能写成相互阻塞的任务环。

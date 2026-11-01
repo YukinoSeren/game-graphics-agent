@@ -1,6 +1,6 @@
 # 阶段 B2：共享数据契约
 
-> 建议基线 `product-contract/0.2`；2026-11-01；未实现。相对 0.1 的读取兼容规则见 §12。
+> 建议基线 `product-contract/0.4`；2026-11-01；D-P01—D-P04补全，未实现。0.1/0.2读取兼容规则见 §12。（独立审计修订；兼容见共享数据§12.2）
 > 依据：[架构基准](../00-architecture-overview.md)、[确认与决策台账](../README.md)、[公共知识契约 v0.1](../../../knowledge-intake-contract.md)、[原始 07](../../design/07-data-and-architecture.md)。
 > 本文是新增共享逻辑对象及 DTO 的唯一定义。公共原载荷继续由旧契约与现有 Schema 解释；不得据此回改冻结样本。
 
@@ -29,7 +29,7 @@
 | 类型/字段 | 类型与必填/默认 | 约束 |
 |---|---|---|
 | EntityHeader.id | ID，后台生成 | 全产品对象 ID 唯一；跨类型引用仍须校验类型 |
-| EntityHeader.schema_version | string，D=`product-contract/0.2` | 新产品对象的格式版本；不是公共知识原契约版本 |
+| EntityHeader.schema_version | string，D=`product-contract/0.4` | 审计修订后新产品对象格式；不是公共知识原契约版本；旧0.1/0.2/0.3对象保留原标签 |
 | EntityHeader.created_at | Timestamp，后台生成 | 创建该产品对象的时间 |
 | EntityHeader.created_by_task_id | ID?，D=null | null 表示同步用户操作或历史导入无对应产品任务；不得虚构任务 |
 | VersionHeader.series_id | ID，R | 同一逻辑对象的版本族；ID 本身始终指单一版本 |
@@ -108,14 +108,17 @@
 |---|---|---|
 | Game（版本对象）.canonical_name | string，R | 规范展示名，不用名字哈希充当稳定游戏身份 |
 | Game.aliases | GameAlias[]，D=[] | 别名带来源；未核实候选不得用于自动合并 |
-| Game.platform_scope | string[]，R | 非空；每个平台保留原标识映射，不能假设不同平台构建号可比较 |
+| Game.platform_scope | string[]，R | verified时非空；provisional/legacy_unverified可为空，须有unknown检查，表示平台未取得而非“不支持任何平台”；不默认商店或PC兼容性 |
+| Game.identity_status / identity_checks / declaring_user_scope_id | GameIdentityStatus / CheckResult[] / ID?，R | provisional由明确玩家名称登记，作用域为该持久用户且末项非空；verified需02的来源/身份检查依据，末项null；legacy_unverified仅旧格式读取视图，不据其自动确认匹配 |
 | GameAlias | `{name:string, platform:string?, evidence_refs:EvidenceRef[], status:CheckStatus}` | 全字段 R；有通过依据才生效，未知候选仅展示 |
 | IdentityMapping.id / legacy_namespace / legacy_value | ID / string / LegacyID，R | namespace 含采集运行或研究文件指纹；不能只按 legacy_value 全局唯一 |
 | IdentityMapping.target_game_id / checks | ID? / CheckResult[]，R | null 表示尚未确认映射，只能暂存；确认生成新映射记录 |
 
-所有 `game_id` 指规范游戏的稳定 `Game.series_id`；需要冻结名称/平台等元数据时另存 `game_revision_id=Game.id`。不能因增加别名的新 Game 版本使历史安装变成另一个游戏，也不能只从稳定 ID 读取最新元数据替代历史。
+所有`game_id`指Game的稳定`series_id`，0.3允许明确标记的provisional声明身份，不能把它称已核验规范身份；需要冻结名称/平台/身份状态时另存`game_revision_id=Game.id`。不能因别名/身份核验的新版本使历史安装变成另一个游戏，也不能只从稳定ID读最新元数据替代历史。
 
 同游戏别名、多平台与重装都不直接合并本机安装。来源游戏名、请求游戏名及历史 game_id 原值保留；规范 Game ID 的建立需现有明确名/显式别名或复核依据，不能按相似名称猜测。
+
+D-P01首次名称登记、目录查询和选择响应由[02 §5.1](../02-knowledge-and-collection.md#51-d-p01-空库游戏目录与选择)唯一定义。provisional Game的series_id是该明确收集意图的稳定身份，不是已验证的外部游戏/平台匹配。它允许创建GameContext及knowledge任务，不能将未核验来源发布为匹配知识包。证据证明同一游戏后02另建同series的verified版本；若实为另一游戏，另建身份/上下文，不能重定向旧引用或原key。Game目录可为空，不依赖预装FH6目录或联网初始化。
 
 ### 3.2 本机上下文
 
@@ -211,6 +214,10 @@
 
 本机原配置不应依赖公共知识先存在。`LocalSettingDefinition` 是 01 登记的不可变本机目录条目，含 EntityHeader 及 `installation_id:ID, namespace:string, raw_name:string, menu_path:string[], evidence_refs:EvidenceRef[]`（均 R）；名称和值来自受控适配器或玩家声明，不自动成为公共知识。`SettingRef` 为带 kind 的联合类型：`{kind:"knowledge",record:KnowledgeRecordRef}` 或 `{kind:"local",local_setting_id:ID}`，分支内字段均 R。跨本机条目/公共条目的归一仍需有依据的映射；未映射不能按名字直接相等。
 
+01的[本机条目登记请求](../01-device-game-configuration.md#52-d-p02-本机设置条目登记)生成声明manifest及LocalSettingRegistration；手工namespace由后台固定为player。条目只登记名称/菜单位置，不声明合法菜单枚举或实际采用值。更正另建定义及显式关系，不原地改定义或把旧配置中的引用替换为新ID；来源/重用规则在01唯一定义。
+
+0.3起LocalSettingDefinition为版本对象（含VersionHeader），另有`parent_definition_id:ID?`（D=null）。新条目新series/version=1；元数据更正基于当前固定父版本另建同series下一版本，旧SettingRef仍指旧id。0.4当前目录精确键仅索引menu_path非空的已定位有效头；未知位置[]同名条目可为独立series，只能显式按ID复用，不能按未知位置自动合并。历史不参与当前键唯一性；恢复旧名称产生新版本，不复用祖先成环。目录谱系不等于实际值/采用事实；输入及消歧规则以01 §5.2为准。
+
 ## 5. 推荐与配置版本
 
 ### 5.1 推荐内容
@@ -261,6 +268,8 @@ TargetProposal 是包含 EntityHeader 的持久对象，作为推荐内容一并
 
 `SettingDeclaration={setting_ref:SettingRef,value:Scalar?,unknown_reason:LegacyUnknownReason?,unit:string?,claimed_activation:ActivationState,activation_note:string?,observation_id:ID?}`，全字段 R。value=null 时须给 unknown_reason，非 null 时 reason 必须空；observation_id 只是玩家选定的已有观测引用，由后台核验其字段/安装/时段，不能由客户端借此自报 system_probe。claimed_activation 仅为玩家声明，服务端仍核对重启/冲突依据，再构造 ConfirmedSetting 与来源包装。
 
+0.4新增嵌入值`SettingRefReplacement={old_local_setting_id:ID,new_local_setting_id:ID,expected_old_value:Scalar,expected_old_unit:string?}`，全字段R。仅由AdoptConfigurationInput.setting_ref_replacements表达本次显式引用替换；新值/单位/生效声明仍在对应新ID的SettingDeclaration中，不复用旧来源。仅manual_edit可非空；基于固定当前base、同安装同series严格后继、旧值/单位核对、一对一/不成链、完整快照保留及错误归属见[01 §5.2](../01-device-game-configuration.md#52-d-p02-本机设置条目登记)。一个配置内同一本机series也只能有一个可执行引用；目录升版不能隐式换值。
+
 公共资料未发现的本机设置用 LocalSettingDefinition 定位，不编造 KnowledgeRecordRef，也不阻止先记录原配置基线。无法可靠归一的原话仍保存在声明/回答/观测原件，相关值保持未知；不为此丢掉会话。
 
 完整配置快照包括已知、自定义、未知项及预设引用。调整从基础实际快照合并差异，未改项原样保留。只有查看推荐或历史不能推进 CurrentAppliedPointer；历史后补也不切换当前指针。origin 的合法引用组合见 state §4。
@@ -299,6 +308,8 @@ TargetProposal 是包含 EntityHeader 的持久对象，作为推荐内容一并
 `RunConditions={output_resolution:FieldValue<Resolution>,render_resolution:FieldValue<Resolution>,frame_generation:FieldValue<bool>,upscaling:FieldValue<string>,scene_conditions:map<string,FieldValue<Scalar>>}`，全字段 R。分辨率/FG 等须有观测或玩家声明；天气/昼夜/路线等已知条件在 scene_conditions 按适配器声明键保存，未知条件不猜值。
 
 `TestProtocol` 为版本对象（04 所有），含 `game_id:ID,scenario:FieldValue<string>,conditions:RunConditions,controlled_variables:string[],metric_definition_ids:ID[],warmup_seconds:float?,sample_duration_seconds:float?,repeat_count:int?,note:string`（均 R）。时长非负、样本时长若有须>0、重复数若有须>=1；自然游玩或未规定项可 null，note 说明范围，不把原稿建议 60—120 秒/3 次写成通用充分性保证。该协议描述计划，实际 run_conditions 仍须逐轮核对；ComparisonProtocol 单独定义长帧比较口径。
+
+0.3新增`TestProtocol.parent_protocol_id:ID?`、`declaration_file_id:ID?`（均D=null）：新入口首次parent=null，更正指同游戏/版本族的固定父版本；新创建必须有已发布声明manifest，只有旧格式读取可无此文件。字段/版本分配及初始MetricDefinition登记沿[04 §4.4](../04-performance.md#44-d-p03-测试协议创建与指标目录)。它不等于ComparisonProtocol，不授予controlled或实际执行事实。
 
 历史日志人工关联使用04 §4.3的局部请求，由后台构造TimeMapping与StreamSelection；不改变LogImportInput的旧载荷。既有段关联须核对会话/段/绑定修订，新增artifact不能改旧映射。独立历史日志可在有实际开始时间依据时直接登记ended的PlaySession/SessionSegment及闭合初绑定；created_at表示登记时间，started_at/ended_at表示有来源的过去事实。初始applied_id=null/unverified，后补配置另按历史登记/绑定守卫，不能从当前采用反推。声明manifest用artifact EvidenceRef追溯，未核验的用户对应关系不升为系统观测。
 
@@ -380,13 +391,17 @@ TaskType 的输入是带 `kind` 的 TaskInput 联合类型，见 §9；禁止通
 | InformationRequest.source_task_id / version / context_refs | ID / Revision / VersionRef[]，R | version 为请求乐观锁；问题关联具体历史或当前上下文，不只指最新设备 |
 | InformationRequest.expected_context_revision / fields / state | Revision / RequestedField[] / InformationRequestState，R | expected_context_revision 是该请求上下文组合的修订号，非任意一个对象 version |
 | InformationRequest.result_refs / superseded_by_request_id | ObjectRef[] / ID?，R | 被替代时指向替代请求或 note 说明无需新问题 |
+| InformationRequest.continuation_mode / amends_request_id | InformationContinuationMode / ID?，D=`source_task` / null | source_task为原任务问题；facts_only必须指向已处理请求，source_task_id保留原触发任务的历史关联，回答绝不修改该任务输入/状态/成果或排队 |
+| InformationRequest.amendment_root_ref | InformationRequestRevisionRef?，D=null | 0.4 source_task必须null；新facts_only必须非空，指首次更正时冻结的根问题快照，完整可更正字段域来自此快照，不随所选fields缩小 |
 | RequestedField | `{field_path:string,purpose:string,required_for:string[],candidates:Scalar[],answer_state:AnswerState,value:FieldValue<Scalar>}` | 全字段 R；required_for 说明影响哪些操作，空数组表示非关键；不能把空白自动当跳过 |
 | InformationResponse.request_id / expected_request_version / expected_context_revision | ID / Revision / Revision，R | 必须与提交时请求一致；旧版本 409，不部分落库 |
 | InformationResponse.answers / skipped_fields / raw_text | map<string,Scalar> / string[] / string，R | 两集合不能交叉、字段必须属于请求；自然语言归一不可靠时保留原话，字段仍 unresolved |
 | InformationResponse.conflict_selections / submitted_at | map<string,int> / Timestamp，R | 无冲突选项可空映射；索引对应该问题候选依据；submitted_at 后台登记 |
-| InformationResponse.result_refs / post_request_version / post_context_revision | ObjectRef[] / Revision / Revision，后台生成 | 回答与结果快照/请求/任务输入修订原子登记；自己的部分回答不使下一批回答过时 |
+| InformationResponse.result_refs / post_request_version / post_context_revision | ObjectRef[] / Revision / Revision，后台生成 | 回答/结果快照/请求修订原子；仅source_task且源任务非终态按守卫更新任务输入修订，facts_only禁止源任务写；部分回答使用post版本继续 |
 
 InformationResponse 的记录不可变；InformationRequest 是由回答/替代事件形成的投影。问题终态后补、关键项已明确跳过的继续规则见 state §7；领域字段更改仍由所属模块校验。
+
+`InformationRequestRevisionRef={request_id:ID,version:Revision}`，全字段R，指完整不可变聚合快照，不能仅按request_id取最新。facts_only的新请求/关联记录及创建守卫见[01 §5.3](../01-device-game-configuration.md#53-d-p04-已处理问题的关联更正)。根字段域固定；context_refs以直接源的固定历史派生上下文为基底，回答只叠加本次字段并保留先前更正，version/context修订各从1开始。根与直接源可属同一对象不同快照，引用必须各自存在/可见。不会把当前值追填过去；后续采用、历史登记/补绑或分析仍独立。
 
 ### 8.3 外部调用、去重与文件注册
 
@@ -415,7 +430,7 @@ response_body 只含受控 ID/状态及错误包，不保存未经清洗的请�
 | KnowledgeImportInput | kind=`knowledge_import`、file_ids:ID[]、game_context_id:ID、mapping_version:string、identity_mapping_ids:ID[] | 02a 经 07 对已受管理的冻结文件组建导入快照；file_ids 非空，不接受任意本机路径，游戏身份未知只暂存 |
 | ContextDeclarationInput | kind=`context_declaration`、installation_id:ID?、game_id:ID、fields:map<string,Scalar> | 01 保存玩家主动选择/更正的原始字段及声明；字段名须为 01 声明的上下文/路径字段白名单，不触发系统执行；非重任务输入 |
 | RecommendationInput | kind=`recommendation`、game_context_id:ID、device_snapshot_id:ID、package_id:ID、preference_ids:ID[]（D=[]）、applied_id:ID?（D=null）、history_summary_ids:ID[]（D=[]） | 03 读取固定快照；ExplicitPreferences 是所引 Preference 的只读视图，不新增独立表 |
-| AdoptConfigurationInput | kind=`adopt_configuration`、origin:AppliedOrigin、installation_id:ID、device_snapshot_id:ID、game_context_id:ID、expected_current_applied_id:ID?、recommendation_id:ID?、base_applied_id:ID?、change_set_id:ID?、restored_from_applied_id:ID?、declared_settings:SettingDeclaration[]、preset_reference:string?、claimed_activation:ActivationState | 01；后台准备声明与确认/来源事实，校验后将声明、完整合并快照与当前指针原子提交；按推荐一次确认继承哪些确定项仍沿 Q3 建议，不继承未落实条件项 |
+| AdoptConfigurationInput | kind=`adopt_configuration`、origin:AppliedOrigin、installation_id:ID、device_snapshot_id:ID、game_context_id:ID、expected_current_applied_id:ID?、recommendation_id:ID?、base_applied_id:ID?、change_set_id:ID?、restored_from_applied_id:ID?、declared_settings:SettingDeclaration[]、preset_reference:string?、claimed_activation:ActivationState、setting_ref_replacements:SettingRefReplacement[]（D=[]） | 01；0.4显式替换仅manual_edit、base=非空当前；其余origin空映射。声明、完整合并、替换关系及指针原子提交，未改项保留；Q3仍为建议，不继承未落实条件项 |
 | HistoricalConfigurationInput | kind=`historical_configuration`、installation_id:ID、device_snapshot_id:ID、game_context_id:ID、segment_ref:BindingRef、effective_range:TimeRange、adopted_at:Timestamp?、declared_settings:SettingDeclaration[]、preset_reference:string?、claimed_activation:ActivationState、evidence_refs:EvidenceRef[] | 01 经 07 同步登记历史配置及声明；evidence_refs 非空，核验已结束段的具体修订与时段依据，生成 registration_kind=historical_record、origin=baseline 的独立版本；不检查/推进当前指针，不继承当前值；绑定另走 BindConfigurationInput |
 | CreateSessionInput | installation_id:ID、device_snapshot_id:ID、game_context_id:ID、applied_id:ID?、configuration_state:ConfigurationState、scenario:FieldValue<string>、test_protocol_id:ID?、run_conditions:RunConditions | 04；保存活动会话/初段/初绑定，初绑定 BindingRange.end=null，允许 applied=null；推荐引用从实际采用关系读取或显式另填可选 recommendation_id:ID?（D=null） |
 | BindConfigurationInput | segment_id:ID、expected_segment_revision:Revision、expected_binding_revision:Revision、applied_id:ID、effective_range:TimeRange、evidence_refs:EvidenceRef[] | 04；同时校验场景/区间投影与绑定版本；追加绑定，不改旧摘要或当前指针；冲突不写入 |
@@ -498,9 +513,39 @@ response_body 只含受控 ID/状态及错误包，不保存未经清洗的请�
 | B-DAT-11 / D03、D04 | 旧段配置未知，当前指针为 B；后来取得旧段使用 A 的依据 | 提交 HistoricalConfigurationInput，随后显式补绑 | 新历史 A 有独立 ID/声明/时段依据，未知 adopted_at=null；不虚构与 B 的父链，当前仍为 B；补绑后新分析引用新修订 | 声明/历史区段夹具；不需真实环境 |
 | B-DAT-12 / A06、D02 | queued 任务未建检查点即重启；另有首检查点前的未知调用 | 以 checkpoint_id=null、明确预算恢复；用外来检查点/隐去已有检查点另试 | 无检查点也可登记 parent 关联任务；外来/隐去已有检查点拒绝，未知调用不因 null 重发 | 调用桩/任务夹具；不需网络 |
 | B-DAT-13 / 版本兼容、D02 | 0.1 采用对象/有限绑定及已登记幂等响应，另有公共知识原载荷 | 用兼容视图读取，再重送原提交；创建 0.2 历史记录 | 原对象/原载荷/旧 hash/响应不改写；旧采用映射 current_adoption，有限绑定可读；新历史对象标 0.2，不重跑旧任务 | 旧格式/幂等夹具；不需真实环境 |
+| B-DAT-14 / D-P01—04、0.4/旧版本兼容 | 旧0.2 Game/问题/协议/响应；新provisional Game、声明条目、两种协议、facts_only请求 | 构造新对象并读旧视图，重试旧提交；错类型引用/新字段缺失分支 | 新对象按0.4严格校验；未知平台不补默认；旧Game不无依据升级verified；旧问题视图source_task/null，旧协议manifest未知；旧字节/hash/响应/历史标签不改；新问题不需虚构新任务；0.3原字节保留，根引用严格校验/旧链回溯需固定manifest；旧采用读取空替换，旧目录歧义不合并 | 固定版本夹具/临时DB/文件；非本轮已运行测试 |
 
 ## 12. B2 退出边界
 
 本篇固定共享名称、字段、引用、必填/null/默认策略、不可变规则和原型映射；B3 在此基础上补齐合法状态与提交/恢复约定。C2/C3/C4 仍需完成覆盖与 readiness 归约、具体本机字段/设置扩展、候选算法、适配器签名、具体 CSV 格式与数值容差；这些模块缺项不由模型临时解释为已确定规则。
 
 0.2 修订只影响产品建议契约，公共知识 v0.1 及冻结原件保持原格式。旧 product-contract/0.1 对象按原 schema_version 读取：AppliedConfiguration 在兼容视图中映射 registration_kind=current_adoption，原 adopted_at 保留；旧有限 effective_range 可无损读取为闭合 BindingRange，不为旧开放段猜造结束时间。新历史记录及开放绑定须按 0.2 写入；不能只换旧对象版本标签而补造事实。旧幂等记录继续按其 request_schema_version/原 hash 与响应核对，规范化规则和历史响应不随升级重写；具体迁移代码与旧记录夹具在 C1/07 定义。
+
+### 12.1 D-P补全的0.3读写兼容
+
+本节记录D-P阶段0.3兼容基线；审计修订后的新对象写0.4并叠加§12.2，不把本节历史说明解释为新对象仍写0.3。Game身份/未知平台、TestProtocol声明/父关系、InformationRequest继续模式的0.3语义继续保留。公共知识0.1及旧请求原义不变，TaskType/TaskState不增加。
+
+| 旧内容 | 0.3读取视图 | 禁止的隐式写入/升级 |
+|---|---|---|
+| Game无identity字段 | identity_status=legacy_unverified、identity_checks记录未取得旧身份核验依据、declaring_user_scope_id=null；原platform_scope原样 | 不因旧对象存在就补verified或反改旧包/推荐；新用途要核验后另建Game版本 |
+| InformationRequest无新字段 | continuation_mode=source_task、amends_request_id=null；仍按原任务终态/状态守卫处理 | 不把旧问题自动变facts_only，不复活旧任务；新更正须创建关联新对象 |
+| TestProtocol无parent/声明字段 | parent_protocol_id=null、declaration_file_id=null，注明旧证据缺失，保留原VersionHeader | 不补造原计划时刻/声明；更正另建0.3版本、旧Session引用不变 |
+| LocalSettingDefinition无版本头/parent | 仅读取视图映射series_id=旧id、version=1、parent_definition_id=null | 原SettingRef/id/字节不变；首个更正另建0.3版本，不能复用旧id充新后继或把旧采用值自动迁移 |
+| 新局部GameSelection/InstallationRegistration/LocalSettingRegistration/InformationAmendment | 仅按模块登记的0.3类型读取，ObjectRef类型注册及可见性由07检查 | 不将局部记录伪装已有0.2历史事实，不要求旧数据虚构这些记录 |
+| 0.1/0.2幂等记录/草稿/响应 | 按其原request_schema_version/hash/默认展开规则核对及返回；无法兼容则明确拒绝或展示已存响应 | 不用0.3新默认、规则目录或派生文件重新计算旧key身份，不静默重跑 |
+
+这些映射只在读取/适配层展开，原对象schema_version、字节、哈希、原响应保持不变。索引/类型注册迁移由ENG-T01/03提供可回滚步骤；旧对象缺证据的限制不抹去历史，只阻止无依据的新能力声明。0.3记录仍按0.3规范化；当前新提交的版本选择见§12.2。
+
+### 12.2 独立审计修订的0.4兼容
+
+新产品对象统一写`product-contract/0.4`；新增根问题字段域、手工目录消歧及采用引用替换不得通过旧默认悄然生效。公共知识仍0.1，TaskType/TaskState不变。
+
+| 内容 | 读取/新消费规则 | 不可改变的历史 |
+|---|---|---|
+| 旧0.1—0.3对象/原请求/响应 | 按原schema_version和request_schema_version读取；原key先按原规则查重/回原响应；不能接收的新旧混合输入明确422，旧Schema不接受0.4新字段 | 不重写字节、原hash/状态码/响应，不借升级重跑 |
+| 旧AdoptConfigurationInput无替换字段 | 读取视图setting_ref_replacements=[]；新提交明确选择0.4才能使用替换；原字段省略的新0.4提交展开[]参与hash | 旧采用/来源/指针事件不补造替换关系 |
+| 旧RegisterLocalSettingRequest无identity_mode/reuse字段 | 只读原输入/原响应；未命中的旧版本创建明确拒绝并引导确认0.4新草稿。新未知位置条目distinct或按ID复用，不能重演旧自动合并语义 | 原合并身份保留并注明限制；纠正需新登记及显式采用，不拆写旧值 |
+| 旧LocalSettingDefinition | 版本头沿§12.1；[]只表示未知位置，不据旧ID相等推断不同原话一定同项。迁移投影若已有多个已定位同键头，登记歧义桶并暂不建立该桶唯一位置槽，GET列全部候选；auto/补齐目标遇歧义409，显式元数据更正可移出该桶，余一头后才恢复槽 | 保留全部series/定义/原引用，不挑第一项、不静默合并或删除历史；索引迁移不伪造来源 |
+| 旧0.3 facts_only无amendment_root_ref | 读取视图不捏造根快照。新建0.4后继时沿固定amends关系及已有amendment manifest的source版本回溯至原source_task问题，检测环并校验全链可见；取得固定根快照后仅给新对象写root_ref | 缺manifest/历史快照则PRECONDITION_UNVERIFIED或ARTIFACT_UNAVAILABLE，旧问题仍可看，不用当前投影补根、不改任务 |
+
+07在变更请求读取`X-Product-Contract-Version`（CLI等价选项），新客户端/新草稿显式发送`product-contract/0.4`，写入IdempotencyRecord.request_schema_version；版本不属于业务JSON字段。对已有key先读记录再按其原版本校验/hash；请求声明版本与已登记版本不符返回IDEMPOTENCY_CONFLICT，不重新执行。旧草稿恢复仍带旧版本；无key命中且旧请求无法安全执行时给明确校验错误，不能升级后自动提交。默认兼容规则见07 §11；会话令牌更新不改变Schema或hash。

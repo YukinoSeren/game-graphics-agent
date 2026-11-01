@@ -1,6 +1,6 @@
 # 08 验收基准、夹具、证据与交付详细设计
 
-> C1 建立测试基准，C5 回补完整旅程；2026-11-01；`product-contract/0.2`。本文定义未来验收，不报告产品代码已实现或测试已通过。
+> C1建立基准、C5及D-P01—D-P04回补完整旅程；2026-11-01；`product-contract/0.4`。本文定义未来验收，不报告产品代码已实现或测试已通过。（独立审计修订；兼容见共享数据§12.2）
 > 依据：[原始 08](../design/08-validation-and-delivery.md)、[总设计](../../project-design.md)、[B 台账](./README.md)、[工程骨架](./07-data-and-architecture.md)。
 
 ## 1. 范围与证据等级
@@ -34,6 +34,11 @@
 | D03 | DEV-V05、PERF-V01/05/08、UX-V04/07/08 | 无推荐基线、未知配置、历史补录/日志关联均可保存；不改当前指针 |
 | D04 | DEV-V01、ENG-V02、UX-V02 | 回答与输入修订原子，等待释放槽，终态不复活 |
 | D05 | PERF-V02/03/04/07、FBK-V05、UX-V08 | 自适应定位与共同阈值分开，协议可创建冻结，分母/缺口/零时长正确 |
+| D-P01 / C02、D02/D03 | KNW-V06、DEV-V06、ENG-V07、UX-V09、VAL-V08 | 空库取得合法选择/上下文与路径未知安装，不需手填ID，不把待核验身份当已匹配 |
+| D-P02 / D01/D03 | DEV-V07、ENG-V07、UX-V09、VAL-V08 | 无包登记本机条目→独立基线→连续调整保留项；目录更正不改历史值 |
+| D-P03 / D02/D05 | PERF-V09、ENG-V07、UX-V09、VAL-V08 | 空库指标规则选择→TestProtocol具体版本→另建ComparisonProtocol；旧引用/规则版本不漂移 |
+| D-P04 / C11、D04 | DEV-V08、B-STA-13、ENG-V07、UX-V09、VAL-V08 | 已处理问题创建facts_only后继，旧事实/任务不变，补答/失效/取消竞态均无源任务写 |
+| 0.3读取兼容 | B-DAT-14、B-ERR-12、ENG-V07、VAL-V08 | 0.1/0.2原对象/原key/hash/响应保留；读取视图不补造旧身份或计划证据 |
 
 ## 3. 组件与执行边界
 
@@ -110,6 +115,7 @@ FixtureLoader 校验文件哈希与格式；ScenarioRunner 驱动应用服务/HT
 | VAL-V05 / C06、D05：效果限制 | 三轮基线/调整及玩家反馈，另有单次/不同场景 | 按同协议比较并评估 | 真实改善只限本环境；单次/场景差异降级；接受不等于 improved | 公式桩先行；local_effect 需真实游戏/玩家 |
 | VAL-V06 / C02/C11、D02：页面旅程 | 新用户、模型失联、过时回答、响应丢失 | 走 UX-V01—08 与下节脚本 | 无入口目标关卡，刷新不重复调用，冲突可恢复，普通旅程不需查看 JSON | 浏览器/服务桩；真实回环集成必需 |
 | VAL-V07 / D02/D03/D05：修补入口贯通 | 空协议库、基线中位40ms、历史日志[900,960)s及有依据的起点；过时/无依据分支 | 经HTTP冻结derived协议；原key重试；预览/关联历史日志并显式分析；尝试事后非探索比较 | 实际阈值80ms、协议ID/frozen_at不变；映射后[0,60)s且绑定闭合，新artifact可分析；过时无部分写，无依据不猜时间；事后走探索路径，旧对象/当前指针不改 | 固定序列/已验证CSV/临时DB/后台时间桩；真实浏览器集成另验 |
+| VAL-V08 / D-P01—04、D01—D05：新增入口串联 | 空产品库/目录、未配置模型；打包指标规则、探测失败桩、旧0.2响应及已处理问题 | 先GET零写→仅名称选择→本机记录/条目→baseline A与B→测试协议/比较协议分别创建→更正源问题并答新请求→显式新任务；插入双击/丢响应/并发/过时/文件退出 | 各ID均来自正式响应/授权GET；声明槽/后继唯一，未核验不发布匹配包；旧配置/问题/协议不改；facts_only对running/终态源任务均零写/零调用；旧hash/响应不变；跨安装/错协议/半条件明确拒绝，无半事实；AUD-D-01/02/03反例：根域两轮不同字段、未知同名两项/明确复用、显式L1→L2保留K/U；文件消费者前置包含ENG-T03；0.4/旧0.3响应分开验 | 离线服务/临时文件DB/供应商计数桩先验；真实浏览器层由UX-V09集成，真实硬件/效果另验 |
 
 原始 M0—M6 里程碑含义保留：M1 知识输入、M2 推荐、M3 采用与性能、M4 反馈闭环、M5 产品演示、M6 迁移评价。每次只报告已完成的证据级别；第二游戏未验证不阻止单游戏声明范围演示，但禁止通用性宣传。
 
@@ -118,9 +124,9 @@ FixtureLoader 校验文件哈希与格式；ScenarioRunner 驱动应用服务/HT
 | 任务/目标 | 依赖 | 拟建组件/文件 | 必须实现的接口/逻辑 | 验收/完成定义 |
 |---|---|---|---|---|
 | VAL-T01 夹具与结果规范 | B 共享契约 | tests/product/conftest.py；tests/fixtures/product/；未来验收报告工具 | FixtureLoader/CaseSpec/manifest/合法 UUID 映射、hash | VAL-V01；损坏夹具拒绝、旧期望不覆盖 |
-| VAL-T02 确定性与故障门禁 | VAL-T01、ENG-T01—03 | tests/product/test_contracts.py、test_faults.py | CaseRunner/SpyProvider/CrashInjector；串联全部模块 V 用例 | VAL-V02/03；调用/对象数量断言可复现 |
+| VAL-T02 确定性与故障门禁 | VAL-T01、ENG-T01—03先建框架；最终依赖全部所有者，详见全局计划 | tests/product/test_contracts.py、test_faults.py | CaseRunner/SpyProvider/CrashInjector；串联63个模块V及B契约/D-P的离线部分 | VAL-V02/03/08；调用/对象数量及facts_only零源任务写可复现，未执行不算通过 |
 | VAL-T03 兼容与未见评价 | VAL-T01、IMP-T03、DEV-T02、PERF-T01 | tests/integration/；独立标注与格式 manifest | 固定版本、真实文件样本、差异报告与分母 | VAL-V04；区分回归/未见，真实限制已登记 |
-| VAL-T04 闭环与演示证据 | VAL-T02/03、UX-T03 | tests/integration/test_journey.py；脱敏效果报告 | 浏览器旅程、协议创建/冻结、历史日志人工关联、真实配置协议与前后比较、接受情况 | VAL-V05—07；无本机证据不得标 local_effect 通过 |
+| VAL-T04 闭环与演示证据 | VAL-T02/03、UX-T03 | tests/integration/test_journey.py；脱敏效果报告 | 浏览器空库/D-P旅程、测试协议/比较冻结、历史日志关联、真实配置协议与前后比较、接受情况 | VAL-V05—08；无本机证据不得标 local_effect 通过 |
 
 ## 11. C5 完整旅程与交接
 
@@ -129,3 +135,9 @@ FixtureLoader 校验文件哈希与格式；ScenarioRunner 驱动应用服务/HT
 补充执行：基线分析后、复测前经comparison-protocols保存比较方式并读取实际冻结阈值，comparisons必须使用返回的具体ID；事后选择口径另建探索协议。外部日志既可按原log-imports尝试自动映射，也可从受管理文件直接log-inspection→log-associations，显式提供锚点/当时依据，得到新artifact/闭合绑定后再建analysis；不要求先伪建实时会话。串联PERF-V07/08、UX-V08、VAL-V07验证默认/派生阈值、同key丢响应、历史闭合、过时冲突与旧结果保护；没有实际依据的分支明确停在文件保留。
 
 另走失败链：模型无配置→已有资料可读；未知调用→不隐式重发；活动段开放→先结束再分析；历史配置补录→当前指针不变；上下文失效→替代问题/解除等待；文件损坏→明确不可用；第二次点击/刷新→同一逻辑提交。C5 设计齐备后可进入 D 的全局审阅与实施计划，本次不自动进入 D 或业务编码。
+
+### 11.1 D-P补全后的验收入口
+
+原C交接句为历史记录。D-P补全以本章新增VAL-V08为串联入口：空目录GET不写→game-selections取得选择/上下文→installations取得本机记录→device-scans失败集中提问→local-settings返回定义后另行baseline→metric-definitions/test-protocols取得具体计划→会话/基线→comparison-protocols冻结→调整/复测/Outcome；原skipped/resolved问题经information-amendments生成facts_only新请求，回答后需显式新分析。所有后台ID从返回/GET取得，不从夹具直接塞入正常页面流程。
+
+规则目录、别名、平台、路径、适配器未核验时分别降级/拒绝相应能力；本轮没有执行这条程序旅程，63个模块V是设计数量（原55＋新增8），新增B-DAT-14/B-STA-13/B-ERR-12也为未来用例。证据报告保留static_design/offline_fixture/integration/local_effect四层，不能用入口文档闭合替代模型或游戏实测。

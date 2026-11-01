@@ -1,6 +1,6 @@
 # 01 设备、游戏上下文与配置历史详细设计
 
-> 阶段 C2；2026-11-01；建议基线 `product-contract/0.2`；产品模块未实现。
+> 阶段 C2及D-P01/02/04补全；2026-11-01；建议基线 `product-contract/0.4`；产品模块未实现。（独立审计修订；兼容见共享数据§12.2）
 > 来源：[原始 01](../design/01-device-game-configuration.md)、C01/C05/C07/C11、D01/D03/D04、[共享数据 §2—6/9](./shared/data-contracts.md)、[状态 §4/7](./shared/state-conventions.md)。
 
 ## 1. 职责与确认状态
@@ -95,11 +95,128 @@ sequenceDiagram
   "restored_from_applied_id": null,
   "declared_settings": [],
   "preset_reference": "玩家声明的预设P，具体项未展开",
-  "claimed_activation": "unknown"
+  "claimed_activation": "unknown",
+  "setting_ref_replacements": []
 }
 ```
 
+### 5.1 D-P01 本机安装登记与选择
+
+公共游戏目录、选择和GameSelectionRequest唯一见[02 §5.1](./02-knowledge-and-collection.md#51-d-p01-空库游戏目录与选择)。07协调02身份与01上下文构造，领域所有者分别提供事务内校验/写入，不互相递归调用。01提供纯`prepare_game_context(game_revision_id:ID,platform:string?,installation_id:ID?,base_context_id:ID?=null)->GameContext候选`给协调层；07提交前复核其引用，候选构造不自行提交、不探测/联网。base非空仅限同game series/同安装的固定原上下文，用于有依据的身份核验新输出，保留原build/process/声明背景及未知，不从当前安装或设备投影补值；新身份/平台证据单列检查，原上下文不改。
+
+本节局部DTO字段全R（标D者除外），是外部原始声明，不接收FieldValue/来源或路径：
+
+| DTO | 字段 | 守卫与返回 |
+|---|---|---|
+| InstallationCatalogQuery | game_id:ID、cursor:string?、limit:int（D=20） | 同用户/游戏，1—100；游标固定过滤和截止点；无记录空页 |
+| InstallationChoice | installation_id:ID、revision:Revision、display_label:string、game_context_id:ID | game_context_id为固定版本，标签取登记声明，不泄露路径；不表示当前配置已读取 |
+| InstallationChoicePage | choices:InstallationChoice[]、next_cursor:string? | 有序分页，只读；不创建安装/上下文 |
+| CreateInstallationRequest | game_context_id:ID、display_label:string? | 引用已选GameContext；null标签由后台生成“本机记录＋短编号”，仅展示用途；不根据标签判断同一安装 |
+| InstallationRegistration（持久，含EntityHeader） | input:CreateInstallationRequest、installation_id:ID、game_context_id:ID、declaration_file_id:ID | 关联原公共上下文、新安装及带安装的新GameContext；声明manifest按文件发布保存 |
+
+接口`list_installations(InstallationCatalogQuery)->InstallationChoicePage`、`create_installation(CreateInstallationRequest,MutationContext)->ResourceResult`。后者首次201返回InstallationRegistration、GameInstallation与新GameContext三类引用；新上下文固定同Game版本/玩家背景，installation_id为新安装。此前上下文不变。已有安装从列表选择，经02 GameSelectionRequest带installation_id/expected_installation_revision复核后生成新选择上下文；不要用创建接口“更新”已有安装。
+
+创建前读key；准备声明manifest后，短事务保存registration、origin=user_provided的安装、private_path_ref=null、平台继承原上下文声明/未知、新GameContext、引用与原响应。不同key表示明确新建独立本机记录，不按相同标签/游戏自动合并；同key丢响应回同ID，异内容409。用户先前创建的无安装公共上下文可收集知识，本机采用/会话必须使用返回的带安装上下文。此操作不伪造DeviceSnapshot：接着以新game_context_id提交DeviceScanInput，失败按C11问答；全部字段无法取得也保留逐字段unknown快照/失败问题，但Task领域仍按limited/unavailable如实归约，快照不是“成功探测”。
+
+选择、登记不预置当前配置，不写CurrentAppliedPointer；paths未知且没有已验证适配器时，不产生ConfigurationObservation。实际路径只能经原有受控声明/适配器校验，不新增模型或网页任意磁盘访问权限。安装修订过时使用INSTALLATION_REVISION_CONFLICT；同名游戏选择歧义由02正常needs_choice处理。
+
+虚构安装登记输入；game_context_id来自游戏选择返回，不由玩家填写，display_label=null不表示路径已识别：
+
+```json
+{
+  "game_context_id":"00000000000000000000000000000903",
+  "display_label":null
+}
+```
+
+### 5.2 D-P02 本机设置条目登记
+
+01拥有以下同步操作；它登记目录身份，不采用值，也不直接建立公共SettingIdentityMapping。DTO字段全R：
+
+| DTO | 字段 | 约束 |
+|---|---|---|
+| RegisterLocalSettingRequest | installation_id:ID、raw_name:string、menu_path:string[]、identity_mode:string、reuse_local_setting_id:ID?、supersedes_local_setting_id:ID?、raw_text:string | 0.4字段全R；identity_mode仅auto/reuse/distinct；raw_name非空白且原字保留，路径未知可[]；raw_text可空；namespace后台固定player，不接受取值/来源/合法枚举 |
+| LocalSettingRegistration（持久，含EntityHeader） | input:RegisterLocalSettingRequest、definition_id:ID、declaration_file_id:ID | input保留更正前引用；声明manifest含原输入与目标定义ID；不能用定义自我引用作为证据 |
+
+接口`register_local_setting(RegisterLocalSettingRequest,MutationContext)->ResourceResult`，201返回LocalSettingRegistration、LocalSettingDefinition及manifest的ManagedFile引用。原key命中在新建声明/时间之前返回原响应；同key异内容IDEMPOTENCY_CONFLICT。
+
+- 定位与身份分开：位置键为`(user_scope_id,installation_id,namespace,raw_name,menu_path的有序原字JSON)`，不折叠大小写/空白/翻译。menu_path非空表示玩家明确声明的位置，当前精确键唯一索引仅覆盖这些已定位的有效头；[]表示位置未知，不参与位置唯一性、不证明同名条目相同。未知位置可有多个同名series，各有独立后台ID；raw_text只作原件，不由模型据此自动合并。历史版本不参与当前位置索引。
+- 首次且supersedes=null：auto要求menu_path非空、reuse_local_setting_id=null，事务内精确键唯一时复用，否则新series/version=1、parent=null；distinct要求menu_path=[]、reuse_local_setting_id=null，表示玩家明确选择“作为不同条目登记”，每个新key创建独立series；reuse要求显式reuse_local_setting_id指同安装同player namespace的当前头，且原名/路径逐字相符，复用指定ID并保存新声明。路径未知却auto、缺少选择ID或字段组合非法均422；同名未知候选不能自动取第一项。不同key的distinct是明确不同意图，不自动去重；同key仍回同资源。
+- 更正：supersedes非空时必须identity_mode=reuse且reuse_local_setting_id等于supersedes；它是当前定义头，不要求新元数据等于旧元数据。若父已非当前头/已有后继，LOCAL_SETTING_CONFLICT返回后继。元数据未变则返回原定义及新登记声明；变化则另建同series/version+1、parent=固定旧id及local_setting_supersedes引用。新路径非空时若目标位置已属另一series则409，不合并；新路径仍[]时只移动该series头，不与其他同名未知条目冲突。补齐/清除路径时同事务进入/退出已定位精确索引。恢复历史名称也另增版本/ID；每父一个直接后继，竞争仅一方推进，绝不复用祖先成环。
+- 无隐式值迁移：目录更正只解释元数据谱系，不改变采用值/历史引用。新当前配置需要替换旧引用时，使用shared AdoptConfigurationInput.setting_ref_replacements，按下述显式替换守卫重新确认旧值/新值。适配器namespace仍只能由受控适配器登记。
+- 提交：先查key→准备manifest→短事务重查安装、identity_mode对应定位/指定头/后继守卫→保存定义/registration/引用/文件发布和原响应。并发auto精确登记只得到一个定义，并发distinct允许独立未知条目；并发补齐相同已定位位置只有一方成功。冲突/发布失败无半定义；文件就绪但未提交沿07恢复。
+
+`list_local_settings(installation_id:ID)->LocalSettingChoice[]`为01只读接口；LocalSettingChoice全R字段`definition_id:ID,series_id:ID,raw_name:string,menu_path:string[],location_known:bool`，只列当前用户该安装每series当前头，location_known等于menu_path非空。通过GET /api/local-settings提供选择，返回[]合法，无写入/探测；明确复用/目录更正均从该列表取得固定definition_id，禁止手填ID。过时头用LOCAL_SETTING_CONFLICT，跨安装用REFERENCE_INVALID。
+
+显式引用替换只允许origin=manual_edit，且base_applied_id=expected_current_applied_id为同安装非空当前A。setting_ref_replacements每项给旧/新本机ID、严格标量expected_old_value及显式可空expected_old_unit；旧ID须在A恰出现一次且其值known、值/单位逐字逐类型匹配。新ID须为旧定义同series的严格后继、同安装当前头，且不在A；每个旧/新ID仅出现一次，两集合不交叉，不接受替换链。declared_settings必须恰有一份新ID的known值/单位和本次生效声明，不能同时再声明旧ID。先从A完整复制，移除明确列出的旧引用，以新声明构造新ConfirmedSetting，再合并其余显式差异，K/未知项/预设原样保留。未给映射却声明同series另一ID、旧值/单位不符或新头过时用LOCAL_SETTING_CONFLICT；错类型/跨安装/跨series用REFERENCE_INVALID；非法组合或重复用INPUT_VALIDATION_FAILED；旧值未知用PRECONDITION_UNVERIFIED，先独立确认原值。expected当前冲突仍用CURRENT_CONFIGURATION_CONFLICT。任一失败无声明/采用/指针部分写。替换不是ChangeSet，不授予实验归因；A、旧摘要、目录原件不变，B.parent=A。其他origin必须空映射；baseline不作为隐式全量替换的绕过入口。
+
+玩家从返回定义取得`SettingRef={kind:"local",local_setting_id:<返回ID>}`，另以SettingDeclaration提交baseline或历史配置。登记成功、随后采用因当前指针冲突，是两次独立提交：条目和原声明保留，采用无部分写。没有任何公共知识或配置适配器也能完成此路径；登记的名称不证明菜单取值合法、设置已生效或有优化依据。
+
+虚构条目登记输入：
+
+```json
+{
+  "installation_id":"00000000000000000000000000000101",
+  "raw_name":"玩家自定义设置甲",
+  "menu_path":["图形","自定义"],
+  "identity_mode":"auto",
+  "reuse_local_setting_id":null,
+  "supersedes_local_setting_id":null,
+  "raw_text":"这是我在菜单里记得的条目，当前值稍后确认"
+}
+```
+
+### 5.3 D-P04 已处理问题的关联更正
+
+本入口与ContextDeclarationInput分开；它只对原记录事实补答/更正，不推进当前配置、不回填过去区段，也不自动重算。01校验领域字段，07管理问题/原子登记。局部DTO全R：
+
+| DTO | 字段 | 约束 |
+|---|---|---|
+| CreateInformationAmendmentRequest | source_request_id:ID、expected_request_version:Revision、expected_context_revision:Revision、field_paths:string[]、reason:string | source须为链头的resolved/skipped请求；field_paths非空无重复且属于固定根问题字段域，允许未出现在直接源.fields的根字段；保留用户次序；reason非空白；根定位由后台推导，不接受source_task_id/状态/上下文指针 |
+| InformationAmendment（持久，含EntityHeader） | input:CreateInformationAmendmentRequest、new_request_id:ID、declaration_file_id:ID | 声明manifest固定源request版本/上下文引用、选定字段和后台新request ID；同一源请求只允许一个直接更正后继 |
+
+接口`create_information_amendment(CreateInformationAmendmentRequest,MutationContext)->ResourceResult`，201含InformationAmendment、新InformationRequest与manifest引用；响应丢失按原key返回相同ID，改字段/理由须新key。新的request：version=1、expected_context_revision=1、continuation_mode=facts_only、amends_request_id=直接源ID，source_task_id保留原触发任务。后台固定amendment_root_ref={request_id,version}：首次取原source_task问题本次已处理快照，后续沿用链中根引用；根字段域不随每次选择缩小。根快照、直接源快照及两者context_refs写入声明manifest/references；不读根问题当前投影替代固定版本。旧0.3链按shared §12.2回溯，缺证据拒绝，不创建半问题。
+
+新问题仅将本次选中的根field_path/purpose/required_for及经领域校验的候选依据复制到fields，answer_state重置unanswered、value为unknown/not_provided/not_attempted。字段合法性查根域，不要求直接源也问过该字段。GET新问题返回amendment_root_ref，页面再GET根问题指定revision取得完整可更正字段选项；旧已答值/原话仅供参考，不算新答案。context_refs以直接源已固定的派生历史上下文为基底，首次为根上下文；回答只覆盖本次选择字段，前轮更正的其他字段/出处保留，不能因重新选根字段而回退先前更正。各轮仍须同设备series/安装/历史范围，不从最新设备或当前采用补值；根域不授予扩大原适用时段的权限。创建不伪造事实快照，回答后按既有规则派生新版本/context修订。facts_only不占重槽、不排队、不写源任务，即使源任务仍running。
+
+创建守卫按顺序：权限和报文→查原key→复核源request version/context revision→复核resolved/skipped与直接后继→校验字段/历史对象可用性→准备manifest→短事务重查全部守卫并保存问题、amendment、关系、open事件及原响应。request版本旧用INFORMATION_REQUEST_VERSION_CONFLICT；上下文修订旧用INFORMATION_CONTEXT_CHANGED；尚open/partial用INFORMATION_REQUEST_STATE_CONFLICT并引导回答原问题。superseded源不可创建，返回INFORMATION_CONTEXT_CHANGED及已有替代；已存在直接更正后继也返回该码与后继定位，不另建并列链、无维护写。纯冲突不消耗key。再次更正应从最新已resolved/skipped的后继发起，形成可追踪链，不回改祖先状态/回答。
+
+新请求回答的短事务保存InformationResponse、派生事实、问题投影/事件及post版本；**facts_only分支不写任何TaskInputRevision/TaskEvent/TaskRun**。facts_only固定原历史上下文：本请求context修订过时只返回409及当前问题定位，无维护写；原历史引用暂不可用返回ARTIFACT_UNAVAILABLE或PRECONDITION_UNVERIFIED，不自动supersede、改指当前背景或创建替代问题，修复原依据后仍对本请求补答。它不能复用source_task问题的“外部背景变化→自动替代/解除等待”分支。原本仍open/partial的终态后补继续用旧回答入口，原本已resolved/skipped的补答必须本入口；两者不要混同。
+
+虚构更正请求示例；返回ResourceResult包含后台新建InformationAmendment、新InformationRequest及ManagedFile三个引用，客户端随后GET新问题再回答：
+
+```json
+{
+  "source_request_id":"00000000000000000000000000000141",
+  "expected_request_version":3,
+  "expected_context_revision":2,
+  "field_paths":["gpus.0.raw_name"],
+  "reason":"此前选择不知道，现在补充当时记录的型号"
+}
+```
+
+设备/游戏字段回答只生成对应派生快照；设置回答先作为InformationResponse依据，当前采用须另AdoptConfigurationInput，过去配置须HistoricalConfigurationInput及04独立补绑，不能把回答直接转成对过去已生效的证明。新分析仍由玩家显式提交固定新引用/预算。
+
+```mermaid
+sequenceDiagram
+    participant U as 玩家
+    participant A as 07
+    participant D as 01
+    participant S as 产品库与文件
+    U->>A: 原问题ID及两修订、选择字段、理由
+    A->>D: 校验已处理源与固定历史上下文
+    D-->>A: facts_only新问题候选
+    A->>S: manifest就绪后原子登记新问题/关联/原响应
+    A-->>U: ResourceResult含新问题引用
+    U->>A: 对新问题提交InformationResponseInput
+    A->>S: 新回答/派生事实/问题修订同事务
+    A-->>U: 新事实已保存；需要时另建分析
+    Note over A,S: 源任务输入、成果与状态始终不变
+```
+
 ## 6. 采用、回答与历史补录的关键步骤
+
+本节“回答后更新等待任务/继续”仅用于continuation_mode=source_task且任务状态允许的分支；facts_only必须执行§5.3的零源任务写入规则。两者共享答案归一及问题修订，不共享排队副作用。
 
 采用：取固定推荐/基础/变更→展开已明确的项（条件项不自动选）→合并玩家差异→核对依赖/重启→事务比较 expected_current_applied_id→保存本次声明、完整新版本和父链→推进当前指针并存原响应。多余玩家改动不丢弃，但不能继续把实验说成只改原单元。回滚先由玩家手动操作，确认后 parent=恢复前当前、restored_from=历史目标，不重用旧 ID。
 
@@ -135,12 +252,15 @@ sequenceDiagram
 | DEV-V03 / C07、D03：独立基线 | 无推荐，只有显式预设；另有完全未知配置 | 保存 baseline / 仅创建会话 | baseline 推荐空、预设不展开；未知无假采用对象；受控适配器未写游戏文件 | 文件写入监视桩；真实只读探测需集成 |
 | DEV-V04 / D01：连续调整/恢复 | A含自定义项，C1只改一项；另页推进 | 采用B→C2基于B→旧A提交→手动恢复确认 | 未改项/未知保留，过期409；父链/ChangeSet正确；恢复新ID | 临时DB/抽象设置；手动游戏操作另验 |
 | DEV-V05 / D03/D04：历史补录 | 当前B，旧段未知，有/无当时A的依据 | 回答→登记历史A→显式补绑；模拟响应丢失 | 有依据生成独立A及声明，未知采用时间null；当前B不变，同key同A；无依据不绑 | 时间/声明夹具；免游戏 |
+| DEV-V06 / D-P01：路径未知安装 | 已选公共上下文，无安装/GPU/路径；另有两个同游戏本机记录 | 登记安装→同key重试→扫描失败回答；列安装并显式选择；旧revision重选 | 同key同安装/新上下文；不同记录不按游戏合并；无默认路径/GPU/采用；失败快照保留unknown，任务不假成功；旧修订409无半上下文 | 临时库/探测桩；不做真实设备扫描 |
+| DEV-V07 / D-P02、D01/D03：本机条目 | 无包/配置适配器；当前指针null；两客户端登记相同条目，另有跨安装/更正竞态 | 登记→baseline A→局部变更B；重试登记；更正目录再恢复旧名；采用时注入冲突；另测未知路径同名distinct两项/按ID复用、补齐路径冲突、目录后继L2的显式采用替换 | 当前精确键唯一；原hash/依据可读；A/B保留自定义项；登记不采用/不改历史引用；更正后继唯一，恢复旧名另增ID/version且无环；跨安装422，冲突采用零部分写且条目保留；仅已定位键唯一；未知同名不误合并；替换仅B移除L1/重新声明L2，K/未知U/预设保留，旧A不变；无映射/错旧值/跨series拒绝 | 文件/DB/抽象菜单与领域桩；无游戏写入 |
+| DEV-V08 / D-P04、D02/D04：已处理问题补答 | 已skipped/resolved问题、原任务终态或仍running、旧历史上下文 | 建facts_only更正→丢响应重试→部分回答→跳过/完成→从后继再更正；并发建两个后继/过时/源superseded；R0含GPU/显存，第一轮只改GPU，第二轮从链头再选显存；旧0.3链缺根依据 | 每源一个直接后继、同key同ID；旧问题/原话不变，新两修订从1起；任何回答/取消竞态均不写源任务输入/事件/状态/成果；过时/非法源409、错误指后继；过去配置仍独立登记/绑定；根域始终包含两字段，第二轮可达且保留第一轮GPU更正；根固定revision，缺依据拒绝不猜根 | 双客户端/临时库/任务事件计数桩；免网络 |
 
 ## 10. 实施任务与 DoD
 
 | 任务/目标 | 依赖 | 拟建组件/文件 | 必须逻辑与接口 | 验收/完成定义 |
 |---|---|---|---|---|
-| DEV-T01 只读获取与来源包装 | ENG-T01/02 | game_app/device.py、adapters/windows_probe.py；tests/product/test_device.py | scan_device、字段白名单/单位/原件、失败提问与快照 | DEV-V01/02；无默认值造假，脚本只读/超时可测 |
-| DEV-T02 安装与配置目录 | DEV-T01、KNW-T01 身份服务 | game_app/adapters/games/、device.py；test_context.py | 安装隔离/路径保护/配置读取能力、LocalSettingDefinition | DEV-V02/03；未核验适配器不得报支持 |
-| DEV-T03 采用及历史事实 | DEV-T02、ENG-T01—03 | device.py；test_adoption.py、test_historical_configuration.py | adopt/历史登记/合并/父链/声明/幂等；04绑定独立 | DEV-V03—05；并发/丢响应/历史指针均可断言 |
-| DEV-T04 问题归一与接续 | DEV-T01/03、ENG-T02 | device.py、tasks.py；test_information_answers.py | 两版本校验、冲突选择、FieldResolution、终态后补 | DEV-V01/05；所有回答状态有夹具，来源不可升级 |
+| DEV-T01 只读获取与来源包装 | ENG-T01/02/03 | game_app/device.py、adapters/windows_probe.py；tests/product/test_device.py | scan_device、字段白名单/单位/原件、失败提问与快照 | DEV-V01/02；无默认值造假，脚本只读/超时可测 |
+| DEV-T02 安装与配置目录 | DEV-T01、KNW-T01 身份服务 | game_app/adapters/games/、device.py；test_context.py | prepare_game_context、list/create_installation、register_local_setting、安装隔离/路径保护/配置读取能力及声明manifest；list_local_settings及auto/reuse/distinct，已定位槽/未知位置独立身份 | DEV-V02/03/06/07；无包也可登记条目，未核验适配器不得报支持 |
+| DEV-T03 采用及历史事实 | DEV-T02、ENG-T01—03 | device.py；test_adoption.py、test_historical_configuration.py | adopt/历史登记/合并/父链/声明/幂等；04绑定独立 | DEV-V03—05；并发/丢响应/历史指针均可断言；DEV-V07显式引用替换保留K/未知U及旧A |
+| DEV-T04 问题归一与接续 | DEV-T01/03、ENG-T02 | device.py、tasks.py；test_information_answers.py | 两版本校验、冲突选择、FieldResolution、终态后补、create_information_amendment与facts_only分支；固定根域、两轮不相交字段更正及先前更正保留 | DEV-V01/05/08；所有回答状态有夹具，来源不可升级，facts_only不写源任务 |

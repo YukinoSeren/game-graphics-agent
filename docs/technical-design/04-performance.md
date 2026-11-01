@@ -1,6 +1,6 @@
 # 04 会话、采集、分析与比较详细设计
 
-> 阶段 C3；2026-11-01；建议基线 `product-contract/0.2`；未安装/启动采集工具，未验证 FH6 日志。
+> 阶段 C3及D-P03补全；2026-11-01；建议基线 `product-contract/0.4`；未安装/启动采集工具，未验证 FH6 日志。（独立审计修订；兼容见共享数据§12.2）
 > 依据：[原始 04](../design/04-performance.md)、D03/D05、[共享数据 §6/9](./shared/data-contracts.md)、[状态 §4](./shared/state-conventions.md)。公式继续以原始04为准，本稿给出实现步骤与夹具，不另创统计口径。
 
 ## 1. 职责、范围与能力门禁
@@ -101,6 +101,55 @@ NormalizedFrame 为分析器内存值，不入产品表：`event_index:int,times
 
 CaptureLease 是04局部恢复日志（含EntityHeader），字段全R：`task_id:ID,session_id:ID,native_name:string,process_pid:int?,process_started_at:Timestamp?,file_id:ID,state:string`；state仅prepared/owned/finalized/unresolved，每次变化保存事件。按session保证未finalized租约唯一，工具启动前先登记owned意图；native_name由后台task ID生成。重启遇到可能仍活动的本次工具进程，先核验PID+启动时刻及native_name；无法确认归属则PRECONDITION_UNVERIFIED，不启动第二采集，不使用停止所有会话的命令。原任务仍按B3 interrupted，新任务不能借旧任务终态绕过租约检查。
 
+### 4.4 D-P03 测试协议创建与指标目录
+
+TestProtocol描述本轮拟固定的场景、条件和采样计划；ComparisonProtocol描述跨轮长帧比较口径。前者的ID用于CreateSessionRequest.test_protocol_id、CaptureInput.protocol_id、ChangeSet.protocol_id，后者的ID只用于CompareInput.protocol_id；类型错误REFERENCE_INVALID。创建计划不表示已执行、已生效或controlled，也不能把事后登记伪装为事前实验。
+
+以下为04唯一拥有的外部/局部DTO，字段全R；接口同步且不新增TaskType：
+
+| DTO | 字段 | 规则 |
+|---|---|---|
+| MetricCatalogQuery | frame_stream_kind:FrameStreamKind? | null列全部；只读打包规则及已登记定义，不联网/写库 |
+| MetricChoice | key:string、label:string、unit:string、frame_stream_kind:FrameStreamKind、definition_id:ID? | key为固定`metric_key/definition_version`；空库definition_id=null，创建时后台分配，页面不手填ID |
+| MetricChoicePage | choices:MetricChoice[]、registry_version:string | 打包规则版本固定；缺少规则目录则空choices，不伪造度量定义 |
+| CreateTestProtocolRequest | game_context_id:ID、parent_protocol_id:ID?、scenario:string?、condition_fields:map<string,Scalar>、controlled_variables:string[]、metric_registry_version:string、metric_keys:string[]、warmup_seconds:float?、sample_duration_seconds:float?、repeat_count:int?、note:string | 字段均R；规则版本来自GET目录并进入请求hash；schema不接受FieldValue/provenance/created_at/controlled；scenario非空白或null，note可空 |
+
+接口`list_metric_definitions(MetricCatalogQuery)->MetricChoicePage`、`create_test_protocol(CreateTestProtocolRequest,MutationContext)->ResourceResult`；201返回具体TestProtocol和声明manifest的ManagedFile引用，经资源GET可读固定版本。无需先建Session/AppliedConfiguration；game_context_id可指无安装的公共上下文，Game身份/实际测试可行性未知以检查/说明保留，不把玩家给了标题当作适配已验证。
+
+请求/来源守卫：condition_fields只允许本章RunDeclaration已有的output_width/height、render_width/height、frame_generation、upscaling及已登记scene.*；scenario单列，不在条件映射重复。分辨率必须成对且正整数，类型严格；缺失整个条件构造成unknown/not_provided/not_attempted，已声明的值以user_provided及artifact EvidenceRef包装。controlled_variables无重复，只能引用`scenario`或本次condition_fields中完整、已知且受词表支持的逻辑变量（成对尺寸用output_resolution/render_resolution）；不能把缺条件说成已受控。空列表表示未声明固定变量，不暗含“全都相同”。
+
+frame_generation须严格bool，upscaling为非空白string，scene.*按登记词表类型核对；不把字符串false转bool。初版project-metrics/1的四个规则key明确登记frame_stream_kind=application_present，选择该指标不证明实际采集流；实际流若displayed/unknown，需使用对应已登记定义或将该计划指标标不可用，不能改名为原生FPS。后续支持其他帧流须另增无歧义规则key/版本并验收，不在同一个key下用不同流替换。
+
+metric_keys非空无重复且全部来自返回目录的固定规则key。初版打包目录按本章现有算法登记`average_present_rate/v1`、`interval_p95_nearest_rank/v1`、`interval_p99_nearest_rank/v1`、`slowest_1pct_inverse_mean/v1`，其原文算法/帧流/minimum_sample_rule由打包manifest固定，版本及hash进入声明；这些是项目拟建规则，不依赖未知PresentMon列。共同阈值长帧指标需具体ComparisonProtocol，不从测试协议冒造。不存在的key或未登记规则INPUT_VALIDATION_FAILED；空目录时PRECONDITION_UNVERIFIED，不接受用户填写任意MetricDefinition JSON。首个协议创建的事务同时登记所需不可变MetricDefinition，unique(rule key,registry version,规则hash)，并发复用同一映射ID；GET不触发惰性写入。
+
+初版拟建规则目录标识为`project-metrics/1`；metric_registry_version必须定位后台保留的具体规则manifest，不隐式取最新。升级规则另增版本并保留旧manifest；同key查重先于版本可用性重算，原key已提交则回原响应。尚未提交且所选版本已不可用为PRECONDITION_UNVERIFIED，无部分定义/协议；客户端刷新目录、确认改变后用新key，不能自动替换规则版本。
+
+warmup_seconds若非null须有限且>=0；sample_duration_seconds若非null须有限且>0；repeat_count为严格整数>=1或null，bool不算整数；null保留未规定，不默认60秒/3次。值合法不代表满足报告/效果的样本门槛；05仍独立核对至少三轮/重复波动/资格，实际热身、时长及条件逐轮核验。
+
+版本/事务：先按外部请求及打包规则版本查key；manifest准备中不重算新的提交身份。parent=null时创建新series/version=1；parent非空须同Game.series_id且可见，表示基于固定父协议另建同series的新版本，在短事务分配下一version并保存parent_protocol_id，不覆盖父内容。并发两个不同key可形成两个有同一父的显式版本，version按提交分配，仅表示登记顺序，不自动选择“最新计划”；场景/条件是否一致仍逐轮判。GameContext、完整外部输入、声明来源、规则key→definition ID映射、规则manifest hash和后台登记时刻写入受管理声明manifest；TestProtocol.declaration_file_id必须非空，references固定所有输入。manifest就绪后同事务保存定义映射、协议/版本、引用、文件发布及幂等原响应；失败零部分协议，孤立文件按07恢复。
+
+编辑已有计划用新key及parent协议ID另存版本，已有Session/ChangeSet仍引用旧ID；采样后新增/更正不回写早前采样计划，也不绕过ComparisonProtocol冻结时序。原key重送回同协议/声明/原响应，不因现在规则版本变化或时间变化重算。旧协议无声明manifest可以只读显示未核验来源，但不补造当时计划事实。
+
+虚构首次协议请求（没有客户端生成ID/来源/资格字段）：
+
+```json
+{
+  "game_context_id":"00000000000000000000000000000401",
+  "parent_protocol_id":null,
+  "scenario":"玩家声明的固定路线甲",
+  "condition_fields":{"output_width":1920,"output_height":1080,"frame_generation":false},
+  "controlled_variables":["scenario","output_resolution","frame_generation"],
+  "metric_registry_version":"project-metrics/1",
+  "metric_keys":["average_present_rate/v1","interval_p99_nearest_rank/v1"],
+  "warmup_seconds":null,
+  "sample_duration_seconds":60,
+  "repeat_count":3,
+  "note":"仅为计划示例，真实执行与可比性另核对"
+}
+```
+
+最短旅程：选择游戏/本机上下文→GET指标目录→POST test-protocols→新会话明确引用返回ID→采样/闭合基线→POST comparison-protocols保存口径→采用B及新会话明确沿用测试协议→复测→comparisons→Outcome。若无需协议可显式test_protocol_id=null记录自然游玩；不能据此声称固定协议已执行。
+
 ## 5. 核心接口与格式准入
 
 `create_session(CreateSessionInput,MutationContext)`、`end_segment(EndSegmentInput,MutationContext)`、`split_segment(SplitSegmentInput,MutationContext)`、`end_session(EndSessionInput,MutationContext)`、`bind_configuration(BindConfigurationInput,MutationContext)` 为同步资源操作；与01跨域只经07事务协调。
@@ -160,12 +209,13 @@ MetricDefinition 建议注册 `average_present_rate/v1`、`interval_p95_nearest_
 | PERF-V06 / D02、采集归属 | queued/running采集；重启后本任务工具归属不明 | 不同key再开、停止/取消、重启核验 | 原任务引用/租约阻止重复；只停止可确认自己进程，不提权；原件就绪才发布 | 进程适配器桩；真实Windows/PresentMon必需 |
 | PERF-V07 / D02/D05：协议入口 | 空协议库、合法基线中位40ms；缺原件/开放基线及已看后测分支 | 创建fixed默认协议；创建derived；原key重试/改输入；冻结后采样并比较，另在后测后创建探索协议 | 可取得具体protocol_id，默认50/derived80ms；同key同ID/frozen_at，异内容409；基线摘要/范围固定，无依据不冻结；正常先冻结路径可比较，事后非探索拒绝，探索不冒称预先计划 | 临时DB/固定序列/后台时间桩；免网络 |
 | PERF-V08 / D03/D04：历史日志关联 | 相对日志[900,960)s、有历史起点/锚点及unknown配置；另有开放旧段、过时修订/无依据/未知格式 | 预览→historical_session以900映射0→分析；existing_segment显式闭合；丢响应重试/更正 | 得到[0,60)s闭合绑定与新artifact，可显式分析；同key同ID，过时冲突无半声明；未知配置仍unverified，当前指针不变；无依据不猜，旧artifact/摘要不改 | 已验证抽象CSV/临时文件DB/时间桩；真实格式另验 |
+| PERF-V09 / D-P03、D02/D05：测试协议入口 | 空协议/指标库但有打包规则；另有缺规则、坏key/条件、父协议及两个并发编辑 | GET目录→创建TestProtocol→同key重试/异内容→基线会话→冻结ComparisonProtocol→后测引用原测试协议；另存子版本 | GET零写；同key同协议/manifest/定义ID；并发规则映射不重复；合法父同series递增且旧会话引用不变；null时长/次数不补默认，bool次数/半分辨率/跨游戏父拒绝；测试与比较协议错型422；创建不自报controlled/已执行 | 临时DB/文件/打包规则/时间桩；无网络/真实采集，实际协议执行另验 |
 
 ## 10. 实施任务与 DoD
 
 | 任务/目标 | 依赖 | 拟建组件/文件 | 必须逻辑与接口 | 验收/完成定义 |
 |---|---|---|---|---|
 | PERF-T01 格式与标准帧适配 | ENG-T03、DEV-T02、VAL-T01 | adapters/presentmon.py；tests/product/test_log_formats.py | FormatRegistry、真实样本manifest、列/时钟/流、未知格式保留 | PERF-V05/06；未有样本不得启用支持标志 |
-| PERF-T02 会话与不可变绑定 | ENG-T01/02、DEV-T03 | performance.py；test_sessions.py | create/end/split/bind、开放→闭合、RunDeclaration来源；历史日志关联守卫接口 | PERF-V01/08；状态/双修订/历史均可复现 |
+| PERF-T02 会话与不可变绑定 | ENG-T01/02、DEV-T03 | performance.py；test_sessions.py、test_test_protocols.py | create/end/split/bind、开放→闭合、RunDeclaration来源；list_metric_definitions/create_test_protocol、打包规则定义映射及历史日志关联守卫接口 | PERF-V01/08/09；状态/双修订/历史/协议均可复现 |
 | PERF-T03 确定性分析比较 | PERF-T01/02 | performance.py；test_metrics.py、test_comparisons.py、test_log_association.py | Analyzer、ComparisonService、create_comparison_protocol/inspect_log/associate_log、固定协议与逐项资格/分母 | PERF-V02—05/07/08；与原04公式一致，协议创建/冻结、锚点闭合、幂等/故障窗口通过 |
 | PERF-T04 拥有采集及安全收尾 | PERF-T01/02、ENG-T02/03 | adapters/presentmon.py、performance.py；test_capture_lifecycle.py | CaptureLease、单任务停止/取消/重启核对、原件发布 | PERF-V06；真实目标游戏权限/格式另验，禁止通用支持宣称 |

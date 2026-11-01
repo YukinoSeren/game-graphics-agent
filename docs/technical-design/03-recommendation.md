@@ -1,6 +1,6 @@
 # 03 多来源推荐、约束与准备状态详细设计
 
-> 阶段 C3；2026-11-01；建议基线 `product-contract/0.2`；未实现推荐引擎。
+> 阶段 C3；2026-11-01；共享建议基线 `product-contract/0.4`（D-P兼容回补）；未实现推荐引擎。（独立审计修订；兼容见共享数据§12.2）
 > 来源：[原始 03](../design/03-recommendation.md)、C01/C02/C04—C06、R03、[共享数据 §4—5/9](./shared/data-contracts.md)、[状态 §5](./shared/state-conventions.md)。
 
 ## 1. 目标、范围与确认状态

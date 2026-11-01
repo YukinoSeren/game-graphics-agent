@@ -1,6 +1,6 @@
 # 05 反馈、偏好、诊断与调整实验详细设计
 
-> 阶段 C4；2026-11-01；建议基线 `product-contract/0.2`；闭环尚未实现。
+> 阶段 C4及D-P03引用回补；2026-11-01；建议基线 `product-contract/0.4`；闭环尚未实现。（独立审计修订；兼容见共享数据§12.2）
 > 来源：[原始 05](../design/05-feedback-optimization.md)、D01/D03/D05、[共享数据 §7/9](./shared/data-contracts.md)、[状态 §5](./shared/state-conventions.md)、[01](./01-device-game-configuration.md)、[04](./04-performance.md)。
 
 ## 1. 职责、边界与确认状态
@@ -58,6 +58,8 @@ sequenceDiagram
 | Outcome→ChangeSet/采用/绑定 | base等于ChangeSet.base，tested沿采用链包含此变更，前后绑定对应实际版本 | 后补更正生成新结果，不反写旧测量/接受事实 |
 
 Hypothesis支持/反例/未知并列，不能仅因模型措辞肯定关闭缺口。ChangeSet.hypothesis_id须定位本次Diagnosis的假设；rollback_ref指同安装可恢复版本，实际恢复步骤只展开已知旧值/预设，未知旧值影响恢复时先询问。
+
+TestProtocol通过[04 §4.4](./04-performance.md#44-d-p03-测试协议创建与指标目录)正式创建，ChangeSet.protocol_id可引用明确选定的具体版本；比较口径仍由ComparisonProtocol单独冻结。没有已选测试协议可保留null并限制结果，不能让模型自行构造TestProtocol ID或把比较协议ID填入。协议子版本不自动替换旧ChangeSet/Session的计划；实际条件/次数/生效依然逐轮核验，计划登记本身不证明受控或改善。
 
 ## 5. 接口、声明与幂等
 

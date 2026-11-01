@@ -1,6 +1,6 @@
 # 02a 采集原型只读接入与兼容导入详细设计
 
-> 阶段 C2；2026-11-01；建议基线 `product-contract/0.2`。02a 是原型与产品的边界适配器，尚未实现。
+> 阶段 C2；2026-11-01；共享建议基线 `product-contract/0.4`（D-P兼容回补）。02a是原型与产品的边界适配器，尚未实现。（独立审计修订；兼容见共享数据§12.2）
 > 来源：[采集原型设计](../../web-collector-prototype-design.md)、[现有 storage.py](../../game_collector/storage.py)、[workflow.py](../../game_collector/workflow.py)、[schema.py](../../game_collector/schema.py)、[共享数据 §4/10](./shared/data-contracts.md)、[状态 §8](./shared/state-conventions.md)。
 
 ## 1. 职责、现状与边界

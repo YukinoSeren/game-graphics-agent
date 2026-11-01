@@ -1,6 +1,6 @@
 # 阶段 B3：共享状态、守卫与恢复约定
 
-> 建议基线 `product-contract/0.2`；2026-11-01；未实现。读取兼容规则见 data §12。
+> 建议基线 `product-contract/0.4`；2026-11-01；D-P补全，未实现。读取兼容规则见 data §12。（独立审计修订；兼容见共享数据§12.2）
 > 类型/字段见[data-contracts.md](./data-contracts.md)，错误见[error-conventions.md](./error-conventions.md)，需求与建议状态见[台账](../README.md)。
 > 本篇统一状态含义、跨模块不变量及提交边界；不设计 SQLite 语句、采集工具参数或完整模块算法。
 
@@ -28,6 +28,7 @@
 | 类型 | 合法值 | 语义/守卫 |
 |---|---|---|
 | ValueState | known / unknown / conflicting / not_applicable | FieldValue 形状见 data §2；冲突未选择前 value=null；不适用须有依据 |
+| GameIdentityStatus | provisional / verified / legacy_unverified | provisional为该用户明确名称的待核验身份；verified须02可定位身份/平台证据；legacy_unverified仅旧记录读取，不推断已核验 |
 | AcquisitionStatus | not_attempted / succeeded / failed / skipped | skipped 要求玩家明确动作；字段留白不是 skipped；历史失败尝试不能删除 |
 | AcquisitionMethod | system_probe / user_provided / player_confirmed / source_statement / source_author_measurement / agent_derived | 前三项为本机获取/确认，后三项保持来源性质；方法不等于可信度评分 |
 | CheckStatus | not_run / pass / fail / unknown / not_applicable | not_applicable 须证明该检查对当前操作不适用，不能替代未知 |
@@ -59,6 +60,7 @@
 | TaskType | device_scan / knowledge / knowledge_import / recommendation / analysis / capture / log_import / feedback / next_action | kind 与 data §9 联合类型一一对应 |
 | TaskState | queued / running / waiting_input / completed / partial / failed / cancelled / interrupted | 终态为 completed/partial/failed/cancelled/interrupted，禁止重新运行原终态任务 |
 | InformationRequestState | open / partially_answered / resolved / skipped / superseded | 请求版本与字段回答独立；详见 §7 |
+| InformationContinuationMode | source_task / facts_only | source_task按原任务状态/关键字段处理继续；facts_only为已处理问题的关联更正，任何分支都不写/唤醒源任务 |
 | AnswerState | unanswered / unresolved / answered / skipped | 无法可靠归一的原话为 unresolved，不能算有效回答；跳过须明确 |
 | ExternalCallState | prepared / in_flight / succeeded / failed_known / outcome_unknown | prepared 已保存意图、未准许发送；in_flight 已进入可能发送窗口；succeeded 仅表示返回原件已保存 |
 | BillingState | not_applicable / not_reported / reported / unknown | 无该类费用/供应商未报告/有真实报告/请求结果或计费状态未知，不能推估金额 |
@@ -151,7 +153,7 @@ ImportSnapshot 的产品导入任务不是被导入的历史采集任务，两�
 
 1. AdoptConfigurationInput 只创建 registration_kind=current_adoption。解析幂等键及不可变输入，检查设置值、安装、推荐/ChangeSet、声明与必要生效条件，准备原话和结构化声明，校验通过后才与采用版本一同提交。
 2. 在产品库事务内检查 expected_current_applied_id：首次与 null 比较，后续与当前指针比较。冲突返回 CURRENT_CONFIGURATION_CONFLICT，不创建采用版本/声明或推进指针。
-3. 调整从 ChangeSet.base 的完整快照合并差异；额外玩家改动一并登记，不能继续声称只执行了原实验单元。保留未改字段、未知与自定义值。
+3. 调整从ChangeSet.base完整快照合并差异；manual_edit从固定当前base完整复制。0.4的setting_ref_replacements仅允许manual_edit，按01 §5.2核验旧值/单位、同安装同series新头、一对一关系和新值声明，然后仅移除映射旧引用、写本次新声明；其余未改字段/未知/自定义/预设原样保留。空映射不推断替换，同series另一ID不能无映射追加；其他origin非空映射拒绝。额外改动不能继续声称只执行原实验单元。
 4. 同一事务保存 PlayerDeclaration、新 AppliedConfiguration、父/变更/恢复引用、CurrentAppliedEvent、CurrentAppliedPointer 与幂等原响应。提交后才对外返回新 ID。
 5. 该事务只登记手动操作的声明，不写游戏/驱动文件。若来源显示待重启或冲突，版本仍可记录但比较不得为 controlled。
 
@@ -245,23 +247,29 @@ prepared→in_flight 的事务与网络发送无法原子提交；即使在二�
 |---|---|---|
 | 自动获取失败需补充 | 任务 running，字段及用途明确，旧检查点已存 | 保存 open 问题及上下文；关键字段待答才 waiting_input，非关键可继续 |
 | 部分合法回答 | open/partially_answered；请求/上下文版本匹配 | 保存不可变回答、值/新快照、问题 version/context revision；仍有未处理项→partially_answered |
-| 所有字段有可用回答 | 同上；未知自然语言不能算 answered | resolved；等待任务关键项已闭合则转 queued |
-| 有明确跳过且无未处理项 | 同上 | skipped；未知保留，等待任务可按有限范围继续，不无限等候 |
+| 所有字段有可用回答 | 同上；未知自然语言不能算 answered | resolved；仅source_task且源任务仍waiting_input、关键项已闭合才转queued |
+| 有明确跳过且无未处理项 | 同上 | skipped；未知保留，source_task等待任务可按有限范围继续；facts_only不排队 |
 | 请求版本旧但上下文仍有效 | expected_request_version 过时 | 409，返回当前请求定位，不改状态/快照 |
-| 目标上下文已变使问题失效 | expected_context_revision 失效且历史目标不再匹配 | 原问题 superseded；同事务登记替代问题或解除等待，并更新任务输入关联；返回 409 及替代/当前定位 |
+| 目标上下文已变使问题失效 | expected_context_revision失效且历史目标不再匹配 | source_task必要时superseded/替代；仅非终态源任务才解除等待/改输入关联。facts_only修订过时仅409与本请求定位，无维护写；原历史引用不可用时保留问题并拒绝，不自动替代/改背景 |
 | 终态任务仍有 open/partial 问题，后补回答 | 校验原历史上下文，不用当前安装指针替代 | 保存回答与新快照/请求修订；不改终态任务输入或成果，不重启；再分析显式建新任务 |
 
 归约以全部字段为准：有 unanswered/unresolved 且已有回答或跳过→partially_answered；全部 unanswered→open；无未处理项且存在 skipped→skipped；全为 answered→resolved。任务是否继续只看本步骤关键字段的处理情况，问题可因非关键项未答继续 partially_answered。
 
-resolved/skipped 请求保留为已处理事实；玩家更正或后续补充已跳过字段时建立关联的新问题/上下文版本，原问题/回答不覆盖。superseded 不接收写入；界面读取替代问题。具体更正入口在 C1/01/06/07 定义，不把更正混成旧请求的幂等重试。
+resolved/skipped 请求保留为已处理事实；玩家更正或后续补充已跳过字段时按[01 §5.3](../01-device-game-configuration.md#53-d-p04-已处理问题的关联更正)创建facts_only新问题，原问题/回答不覆盖。superseded不接收写入；界面读取替代问题。新请求保留原source_task_id作历史关联，但该关联不授予修改源任务的权限。
 
 ### 7.2 回答事务与竞态
 
-领域所有者先验证 answers、skipped_fields、候选选择及来源，07 在短事务内再次检查版本，追加 InformationResponse、新对象版本、请求投影和等待任务 TaskInputRevision。自己的部分回答同时推进请求 version 与 context revision，后续页面使用返回的新版本；不被当成外部失效。
+领域所有者先验证answers、skipped_fields、候选选择及来源，07短事务再检查版本，追加InformationResponse、新对象版本、请求投影/事件。仅continuation_mode=source_task且源任务非终态时按原规则更新等待任务TaskInputRevision；facts_only禁止写入源TaskInputRevision/TaskEvent/TaskRun。自己的部分回答同时推进请求version与context revision，后续使用post版本，不当成外部失效。
 
-等待任务的关键字段都 answered/skipped 时转 queued，沿用剩余预算，仅重做受影响步骤。跳过仍不足以生成推荐时可以产 blocked 或 partial，不能补猜值。取消与回答并发时以事务内任务状态为准：取消先提交则按终态后补路径；回答先排队后取消则 queued→cancelled。不能丢回答或在终态后暗中重排队。
+source_task等待任务的关键字段都answered/skipped时转queued，沿用剩余预算，仅重做受影响步骤。跳过不足可产blocked/partial，不能补猜值。取消与回答并发以事务内状态为准：取消先提交走终态后补，回答先排队后取消则queued→cancelled。facts_only始终只保存事实/问题，不参与此排队竞态；不能丢回答或在终态后暗中重排队。
 
 历史问题按其绑定的历史版本校验。合法后补回答只生成新事实；更新过去区段还须独立 BindConfigurationInput 的时段依据/绑定版本守卫，不自动推进当前采用指针。
+
+### 7.3 D-P04 更正链与创建原子性
+
+01的CreateInformationAmendmentRequest只接受resolved/skipped链头及其当前两修订；每个直接源最多一个amends后继，唯一约束覆盖并发不同key。已有后继返回INFORMATION_CONTEXT_CHANGED和后继定位，无第二条链；再次更正从最新已处理后继发起。0.4新问题必须保存固定amendment_root_ref；可选field_paths来自该根快照完整字段域，而非直接源.fields子集。只将本次选择作为新fields，open且version/context修订各1，所选字段unanswered，facts_only、amends_request_id非空；context基底是直接源固定的历史派生上下文，后续答案仅覆盖所选字段，保留前轮更正及出处。根域/基底校验在同事务复核，不取当前设备/采用补值。源问题/旧回答不改；superseded替代关系仍独立。
+
+更正创建准备声明manifest后，重查版本/状态/后继并同事务写新问题、InformationAmendment、open事件、固定上下文引用及原幂等响应；FileOperation恢复沿§8。任一冲突无半问题，纯409不消耗key。新请求所有回答、跳过及失败处理均保持facts_only；source_task_id只作来源。原历史引用不可用时不创建自动替代，避免与更正直接后继唯一性冲突，修复后可在本问题继续补答。若涉及AppliedConfiguration，只存新依据/声明，正式当前采用或历史配置仍走01独立事务，不能用问题操作推进指针/改绑定。
 
 ## 8. 原型导入、发布与文件恢复边界
 
@@ -312,6 +320,7 @@ stateDiagram-v2
 | B-STA-10 / D03、D05：开放绑定闭合 | 活动段初绑定 end=null，另有并发过时的结束请求 | 结束/切段，重读旧修订，分别请求分析 | 段结束与闭合绑定同事务，切段建立新开放绑定；旧修订不改；过时请求冲突；仅闭合修订可分析 | 时间夹具/临时 DB；不需游戏 |
 | B-STA-11 / D03、D04：仅补录过去事实 | 当前指针 B，旧段配置未知且有历史 A 的依据 | 登记历史 A；模拟登记响应丢失后重试，再显式补绑 | 只产生一个 A/声明，无当前指针事件，A 不以 B 为父；缺时段依据拒绝；绑定冲突不删 A，旧摘要不变 | 两客户端/临时 DB；不需游戏 |
 | B-STA-12 / A06、D02：首检查点前恢复 | queued 未执行即重启；另有无检查点但 in_flight 调用的任务 | 显式以 null 检查点与新预算恢复；重试同 key | 新任务 parent_id 正确且仅登记一次；无调用分支可执行；未知调用分支保留审计、不自动重发；旧任务终态/输入不改 | 调用桩/故障注入；不需网络 |
+| B-STA-13 / D-P04、D04：事实更正不续任务 | 原skipped/resolved问题，source_task分别running/终态；已存一个更正后继 | 并发创建后继、回答/跳过、取消源任务；新请求原历史引用暂不可用、修复后补答 | 一个直接后继；facts_only所有分支无源TaskInputRevision/TaskEvent/TaskRun写入；引用不可用不自动替代/改背景，修复后同问题可答；新版本/旧事实独立，后继冲突返回定位；两轮根域不同字段更正均可达且前轮派生值不回退，旧链缺根依据不写任务/替代问题 | 两连接屏障/临时文件DB，任务写入spy；免网络 |
 
 ## 10. B3 与阶段 C 的分界
 

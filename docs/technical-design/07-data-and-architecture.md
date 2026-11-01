@@ -1,6 +1,6 @@
 # 07 工程骨架、持久化与接口集成详细设计
 
-> 阶段 C1 建立、C5 回补；2026-11-01；建议基线 `product-contract/0.2`。本文件是设计，未新增服务、数据库或依赖。
+> 阶段 C1建立、C5及D-P01—D-P04回补；2026-11-01；建议基线 `product-contract/0.4`。本文件是设计，未新增服务、数据库或依赖。（独立审计修订；兼容见共享数据§12.2）
 > 依据：[原始 07](../design/07-data-and-architecture.md)、[架构基准](./00-architecture-overview.md)、[数据](./shared/data-contracts.md)、[状态](./shared/state-conventions.md)、[错误](./shared/error-conventions.md)。确认状态见[台账](./README.md)。
 
 ## 1. 范围、状态与技术取舍
@@ -69,6 +69,12 @@ sequenceDiagram
 | references / package_members | unique(owner_id,relation,target_id,locator) / unique(package_id,record_id) | 实际外键指向已存在对象，引用检查另核对类型/安装/包成员 |
 | file_operations / managed_files | operation id / file id；operation 状态见下文 | 发布前不可消费；已发布失败通过检查/撤回事件表达 |
 
+D-P新增的GameSelection、InstallationRegistration、LocalSettingRegistration、InformationAmendment仍放immutable_objects并登记类型/所有者/用户可见性，不拆成新的服务。07提供四类必要唯一索引：声明游戏槽`(user_scope_id,normalized_raw_name,declared_platform的显式null标记)`→Game.series_id；本机精确条目键→definition_id；`supersedes_local_setting_id`→直接后继；`amends_request_id`→直接后继。空平台须用明确键编码/非空哨兵列，不能依赖SQL nullable UNIQUE误放重复null。索引目标和声明/对象/原响应同事务，冲突回读已有映射或按所有者规则409；不按标签或游戏ID去重不同安装。MetricDefinition规则映射另以`(key,registry_version,规则hash)`唯一，同事务登记协议引用。
+
+0.4本机精确位置唯一索引仅覆盖menu_path非空的每series当前有效头；[]未知位置另以series_id登记头，位置/原名查询是非唯一候选索引，多个同名未知条目合法。01的auto只接受已定位位置，reuse必须显式固定ID，distinct只创建未知位置独立series。更正保存新版本并按路径是否已知进入/退出位置槽；每父仍一个后继、恢复旧名另增ID；旧版多个已定位同键头按data §12.2歧义桶保留，不能为建立唯一索引先挑一项或合并。头/槽是可重建投影，全部定义/登记/parent关系追加，采用/摘要不随目录自动换ID。
+
+GameSelection的声明manifest、安装登记、本机条目登记、测试协议与问题更正均复用kind=import的FileOperation；后台把operation_id与持久用户/路由/key、规范请求hash关联，准备文件后的原key重试可定位同一操作并核验复用，不能只靠最终资源尚不存在就重复准备无限manifest。该准备关联不算成功幂等响应，仍在最终领域事务内发布资源和原响应。文件复制/哈希不包入长DB事务。新局部记录全部可用授权资源GET读取；不接受未登记entity_type，更不允许绕过所有者反序列化任意对象。
+
 每个连接启用并检查 `PRAGMA foreign_keys=ON`；采用显式短写事务（建议 `BEGIN IMMEDIATE`），不共享跨线程连接，不把网络放进事务。锁忙最多等待 5 秒作为可配置工程初值；仍失败返回 STORAGE_COMMIT_FAILED，同 key 可重送。文件/网络重试不能借数据库锁重试隐式发生。初版采用默认日志模式；只有读写压测证明需要且验证备份后再启用 WAL，不把 WAL 当多写者方案。
 
 `FileOperation` 是 07 的局部恢复记录：`operation_id:ID,kind:string,owner_ref:ObjectRef?,file_ids:ID[],manifest:FileManifest,phase:string,last_error_code:string?` 全字段 R；kind 仅 upload/import/export，phase 仅 prepared/files_ready/committed/abandoned。created_at/updated_at 为后台 Timestamp；phase 变更保留操作日志，不能据此替代共享 PublicationStatus。目标文件检查后按后台路径解析；同步创建在该日志中暂存，不提前注册成功幂等响应。
@@ -132,6 +138,7 @@ FastAPI 提供响应后后台处理，但本设计的持久队列/恢复由应�
 | ENG-V04 / A05：文件窗口 | 完整 staging 文件/manifest | 在改名后、DB 提交前、提交后响应前退出 | 孤立文件不可消费；原 key 查重；缺失文件 409，无空成功 | 故障注入；需真实本地文件系统，免网络 |
 | ENG-V05 / A06、兼容 | 旧 queued、waiting、in_flight，无检查点任务，0.1 记录 | 重启、恢复、迁移失败回滚 | interrupted/waiting/outcome_unknown 正确；null 恢复不重发未知；旧响应/hash不改 | 临时 DB/调用桩；真实 Windows 文件占用另测 |
 | ENG-V06 / C09、安全 | 错误/导出含诱导路径和密钥；有依赖资源 | 导出、读文件、清理并重试旧 key | 敏感数据不出现；依赖保留/墓碑，旧 key 410；GET 不生成文件 | 固定恶意输入；回环访问保护需浏览器集成 |
+| ENG-V07 / D-P01—04、D02：新增入口事务 | 空库/规则目录、两个同key与不同key并发、原响应丢失、声明改名后DB前退出、旧0.2记录 | 经各新增路由提交/读取及恢复；注入后继/声明槽唯一性竞争；facts_only答复 | 同key同资源/原响应；null平台声明槽不重复；文件孤立不可消费；更正后继唯一、冲突无半事实；原任务零写/供应商发送0；旧hash/响应/标签不变，GET无初始化副作用；0.4已定位槽/未知同名独立series及旧歧义桶无误合并；根域可达；显式替换与原响应原子；版本头分流 | 临时文件DB/所有者桩/调用与写入计数；真实HTTP/浏览器另验 |
 
 ## 10. 实施任务与完成定义
 
@@ -139,10 +146,10 @@ FastAPI 提供响应后后台处理，但本设计的持久队列/恢复由应�
 
 | 任务/目标 | 依赖 | 组件/拟改文件 | 必须逻辑与接口 | 验收/DoD |
 |---|---|---|---|---|
-| ENG-T01 产品版本库 | B 共享契约 | game_app/repository.py；tests/product/test_repository.py | 固定版本/聚合快照/引用/迁移与显式 UnitOfWork | ENG-V03/05；失败回滚、旧版可读 |
+| ENG-T01 产品版本库 | B 共享契约及0.4/旧版本读取兼容 | game_app/repository.py；tests/product/test_repository.py | 固定版本/聚合快照/引用/迁移、已定位槽/未知位置头/旧歧义桶、根快照引用、显式UnitOfWork | ENG-V03/05/07的存储部分、B-DAT-14；失败回滚、旧字节/响应不改 |
 | ENG-T02 持久注册及执行器 | ENG-T01 | game_app/tasks.py、application.py；tests/product/test_tasks.py | register/cancel/resume、预算、原响应、单槽与短控制 | ENG-V01/02/05；未知调用计数可核对 |
 | ENG-T03 文件与恢复 | ENG-T01/02 | game_app/files.py；tests/product/test_files.py | FileOperation、hash、发布、重启与备份 | ENG-V04/05；故障窗口均不可假发布 |
-| ENG-T04 适配入口与分发 | ENG-T01—03、DEV-T04、IMP-T03、KNW-T03、REC-T03、PERF-T03、FBK-T03 | game_app/http.py、cli.py、pyproject.toml；tests/product/test_http.py | C5 路由、同源/用户作用域、脱敏查询/导出；固定依赖清单 | ENG-V01/06；用服务桩验证CLI/HTTP同业务语义，不等待完整页面 |
+| ENG-T04 适配入口与分发 | ENG-T01—03、DEV-T04、IMP-T03、KNW-T03、REC-T03、PERF-T03、FBK-T03 | game_app/http.py、cli.py、pyproject.toml；tests/product/test_http.py | C5及D-P路由、同源/用户作用域、局部类型GET、脱敏查询/导出；固定依赖清单 | ENG-V01/06/07；用服务桩验证CLI/HTTP同业务语义，不等待完整页面 |
 | ENG-T05 完整产品集成 | ENG-T04、UX-T03、VAL-T04 | http.py、cli.py、打包清单；tests/integration/ | 最终模块连接、静态资源本地分发、真实失败路径及部署诊断 | ENG-V01—06、UX-V01—08；明确未验证能力，不以桩通过代替真实兼容 |
 
 ## 11. C5 路由集成登记
@@ -151,6 +158,9 @@ FastAPI 提供响应后后台处理，但本设计的持久队列/恢复由应�
 
 | 路由 | 请求定义唯一归属 | 返回/所有者 |
 |---|---|---|
+| GET /api/games；POST /api/game-selections | 02 §5.1 GameCatalogQuery / GameSelectionRequest | GameChoicePage / ResourceResult；02公共身份、01构造上下文、07协调；无模型/探测 |
+| GET /api/installations；POST /api/installations | 01 §5.1 InstallationCatalogQuery / CreateInstallationRequest | InstallationChoicePage / ResourceResult；01；标签不当安装身份 |
+| GET /api/local-settings；POST /api/local-settings | 01 §5.2 installation_id查询 / RegisterLocalSettingRequest | LocalSettingChoice[] / ResourceResult；01；GET列当前头供明确复用/更正，POST只登记不采用 |
 | POST /api/device-scans；POST /api/context-declarations | shared DeviceScanInput、ContextDeclarationInput；01 字段白名单 | TaskAccepted / ResourceResult；01/07 |
 | POST /api/knowledge-tasks；POST /api/knowledge-imports | shared KnowledgeInput / KnowledgeImportInput | TaskAccepted；02/02a/07 |
 | POST /api/recommendations | shared RecommendationInput | TaskAccepted；03 |
@@ -162,11 +172,13 @@ FastAPI 提供响应后后台处理，但本设计的持久队列/恢复由应�
 | POST /api/feedback；POST /api/next-actions | shared FeedbackInput / NextActionInput | TaskAccepted；05 |
 | POST /api/comparisons；POST /api/outcomes | shared CompareInput / OutcomeInput | ResourceResult；04/05 |
 | POST /api/comparison-protocols | 04 CreateComparisonProtocolRequest（§4.2） | ResourceResult；04，创建即冻结，返回具体协议ID |
+| GET /api/metric-definitions；POST /api/test-protocols | 04 §4.4 MetricCatalogQuery / CreateTestProtocolRequest | MetricChoicePage / ResourceResult；04；TestProtocol与ComparisonProtocol分开 |
 | GET /api/files/{id}/log-inspection；POST /api/log-associations | file_id及source_schema查询参数 / 04 LogAssociationRequest（§4.3） | LogInspection / ResourceResult；04，只读预览/显式关联与必要闭合 |
 | POST /api/preferences；POST /api/target-acceptances | 05 PreferenceDeclarationInput / TargetAcceptanceInput | ResourceResult；05 |
 | GET /api/tasks/{id}；GET /api/information-requests/{id} | task_id / request_id，均 ID | TaskView / InformationRequest；07 |
 | POST /api/tasks/{id}/cancel；POST /api/tasks/{id}/resume | 空业务体 / ResumeTaskInput（parent 必须等于路由 ID） | ResourceResult / TaskAccepted；07 |
 | POST /api/information-responses | shared InformationResponseInput | ResourceResult；07+领域所有者 |
+| POST /api/information-amendments | 01 §5.3 CreateInformationAmendmentRequest | ResourceResult；01校验、07登记facts_only问题；不改源任务 |
 | POST /api/files；GET /api/files/{id} | 07 流式上传、后台文件登记 / file_id:ID | ResourceResult / 已发布授权文件；07 |
 | POST /api/exports；GET /api/history | 06 ExportInput / HistoryQuery | ResourceResult / HistoryPage；07+06 |
 | GET /api/resources/{entity_type}/{id}；GET /api/service-status | 类型登记表与可选修订 / 无参数 | 类型化视图 / ServiceStatus；07 |
@@ -174,3 +186,11 @@ FastAPI 提供响应后后台处理，但本设计的持久队列/恢复由应�
 上传 POST 的 key/hash 先基于暂存流计算内容哈希，再以原名（清洗后）、媒体类型和字节 hash 作规范输入；只计算一次暂存原件，不把上传临时路径放入 hash。用户中断未注册的上传可重传；已提交的同 key 同内容回同文件 ID，异内容 409。集合查询仅限当前用户可见对象，分页规则由 06 定义。
 
 comparison-protocols不接受客户端frozen_at或计算阈值；默认值按04规则参与规范hash，幂等命中先回原协议，不能因时间变化重新冻结。log-inspection为受权限保护的有界只读预览，不发布新对象；log-associations使用kind=import的FileOperation保存声明manifest，复核文件hash及会话/段/绑定修订后原子发布新artifact/必要历史事实与原响应。现有资源GET可按ID读取新协议及artifact，按固定revision读取段/绑定；两条POST均不发模型、不恢复终态任务。历史关联不要求客户端预先创建声明ID。
+
+新增目录GET只读本地数据/打包规则，空库/空目录为空页，不能借GET联网或创建默认Game/MetricDefinition。新增POST首次同步201，needs_choice也返回正常GameSelection及候选；完整局部字段只链接各所有者，不在本路由表复制。测试协议引用显式metric_registry_version纳入规范hash；按原request_schema_version处理旧key，不把0.4默认用于旧响应。短同步操作失败沿共享错误；供应商计数应为0。
+
+GET查询中可空参数的缺省由HTTP适配器映射为DTO显式null，limit缺省20；这只是查询字符串表示，不放宽POST的R字段/显式null规则。新局部持久记录的用户作用域由07从MutationContext保存至权限索引，Game的provisional/legacy引用仍须可见性检查，不能因entity_type已注册就公开其他用户声明。
+
+0.4变更请求使用`X-Product-Contract-Version: product-contract/0.4`；CLI用等价选项，06草稿随请求保存版本，不把版本塞入拒绝未知字段的业务JSON。权限/JSON基础解析后先按作用域读key：命中则按记录原request_schema_version验证原输入/hash，返回原状态/响应；显式头与记录版本不符409 IDEMPOTENCY_CONFLICT。无头且已有旧key时使用其已存版本；无头且无key记录时422 INPUT_VALIDATION_FAILED并引导明确版本，不能猜0.4。新0.4默认展开/身份消歧/替换字段进hash；无记录的旧版本请求不能安全消费时按data §12.2拒绝，无副作用。GET不要求版本头也不初始化目录。
+
+facts_only创建将根问题固定修订及直接源固定修订写references；根域校验与amends唯一索引同事务。读取根问题使用资源GET的revision参数，旧链无法恢复根时返回有定位的共享错误，不向源任务写维护事件。显式配置引用替换由01校验，07将其PlayerDeclaration/完整B/指针/原响应同事务写入，不能在目录登记事务顺带替换值。

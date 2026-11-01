@@ -1,6 +1,6 @@
 # 阶段 B3：共享错误、幂等与重试契约
 
-> 建议基线 `product-contract/0.2`；2026-11-01；未实现。读取兼容规则见 data §12。
+> 建议基线 `product-contract/0.4`；2026-11-01；D-P补全，未实现。读取兼容规则见 data §12。（独立审计修订；兼容见共享数据§12.2）
 > 对象字段见[data-contracts.md](./data-contracts.md)，合法转移与提交边界见[state-conventions.md](./state-conventions.md)。
 > HTTP 部分沿 Q1 的本地网页建议展开；CLI 复用错误码、资源引用和动作语义。完整路由和各操作超时参数在 C/07 定义。
 
@@ -70,11 +70,14 @@ GET 只查询已存在资源，不生成持久比较或导出文件；比较/导
 | RESOURCE_GONE / not_found | 410 | 资源受控清理且保留墓碑；旧键不复活结果 | none；view_saved_results/create_new_task |
 | IDEMPOTENCY_CONFLICT / conflict | 409 | 同作用域 key、不同规范请求 hash；不执行新输入 | refresh_then_new_submission；edit_input |
 | CURRENT_CONFIGURATION_CONFLICT / conflict | 409 | expected_current_applied_id 不等于当前；不创建采用版本/声明、不推进指针 | refresh_then_new_submission；review_configuration |
+| INSTALLATION_REVISION_CONFLICT / conflict | 409 | 选择已有安装时expected_installation_revision已旧；不保存选择/新上下文/声明，返回当前可见安装定位 | refresh_then_new_submission；view_saved_results/edit_input |
+| LOCAL_SETTING_CONFLICT / conflict | 409 | 更正父/显式复用ID已非当前头，已定位目标被另一series占用或处于旧目录歧义桶，或采用引用替换的旧值/单位不符、新头过时/缺明确映射；无半定义/声明/采用，返回当前/冲突定义引用。[]未知位置不按同名触发精确键冲突 | refresh_then_new_submission；view_saved_results/edit_input |
 | PREFERENCE_VERSION_CONFLICT / conflict | 409 | 偏好族 expected_current_id 已过时；不创建偏好版本/声明，返回当前 Preference 引用 | refresh_then_new_submission；view_saved_results/edit_input |
 | TARGET_ACCEPTANCE_CONFLICT / conflict | 409 | 同会话/目标的 supersedes_id 不是当前接受声明；不覆盖或新增冲突声明，返回当前 TargetAcceptance 引用 | refresh_then_new_submission；view_saved_results/edit_input |
 | BINDING_REVISION_CONFLICT / conflict | 409 | expected_segment_revision、expected_binding_revision、历史登记 segment_ref 或04日志关联 expected_session_revision 中相应修订旧；field_errors 标明具体维度，不登记历史配置、关联artifact或追加绑定；先前独立提交的历史事实仍保留 | refresh_then_new_submission；view_saved_results |
 | INFORMATION_REQUEST_VERSION_CONFLICT / conflict | 409 | 仅请求 version 旧，上下文仍有效；无状态变更 | refresh_then_new_submission；read_information_request |
-| INFORMATION_CONTEXT_CHANGED / conflict | 409 | 上下文已失效；必要时原子保存 superseded/替代问题或解除等待 | refresh_then_new_submission；read_information_request/read_task |
+| INFORMATION_REQUEST_STATE_CONFLICT / conflict | 409 | 向resolved/skipped/superseded旧问题直接答复，或对open/partial源创建更正；无新回答/问题，返回应读取的源/替代定位 | refresh_then_new_submission；read_information_request |
+| INFORMATION_CONTEXT_CHANGED / conflict | 409 | 上下文修订旧/已失效，或更正源已有后继/已superseded；必要维护写保持原子；facts_only不解除源任务等待、不写其输入，已有后继的纯冲突不写任何维护 | refresh_then_new_submission；read_information_request/read_task |
 | TASK_STATE_CONFLICT / conflict | 409 | 对不允许状态执行恢复/绑定等；终态取消另按幂等无操作返回当前终态 | none；read_task/view_saved_results |
 | ACTIVE_CAPTURE_EXISTS / conflict | 409 | 同会话已有 queued/running 采集，即使 key 不同也不另建 | none；read_task，返回已有 task 引用 |
 | REFERENCE_INVALID / dependency | 422 | 引用错类型/错游戏/错安装/不属于该包，依赖记录隔离，或恢复检查点不属于父任务/输入不兼容 | none；edit_input/view_saved_results |
@@ -127,6 +130,8 @@ hash 针对经校验规范化的外部业务请求；不针对本次重新构造
 报文、类型、访问校验失败且尚无业务写入时不消耗 key；纯并发前置冲突也不产生假任务。业务校验在事务内复核。INFORMATION_CONTEXT_CHANGED 如确实提交了 superseded/替代问题等维护事件，必须在同事务保存该 409 响应的幂等记录；同 key 重试返回原 409，不重复造替代问题。若没有提交任何变化，则可不登记 key；客户端更新内容后必须用新 key，不能借此偷改已注册提交。
 
 幂等记录首版不自动过期。清理资源时保留作用域、key、hash、原响应语义/墓碑与结果定位；不能随表清理把去重历史删掉。具体存储/压缩机制在 C/07 定义。
+
+D-P同步创建及0.4修订均遵守同一规则：选择/安装/条目/协议/更正在manifest就绪后同事务发布事实与原响应，不注册重任务、不发模型。identity_mode/reuse_local_setting_id及setting_ref_replacements属于业务内容进入hash；根定位/本次派生ID/时间由后台产生，不进入外部请求hash，但固定引用写manifest。distinct的不同key表示不同未知位置条目，同key只创建一次。0.1/0.2/0.3记录先按原request_schema_version查重/校验，不借0.4默认重新执行；版本头/旧草稿规则沿data §12.2。
 
 ## 5. 超时、重试与恢复矩阵
 
@@ -209,5 +214,6 @@ expected_revision/current_revision 为 null 是因为本操作按不可变 appli
 | B-ERR-09 / D03、D04：历史登记去重 | 当前 B，旧段 A 的登记已提交但响应丢失；另有过时 segment_ref | 原 key 重送历史登记，再以新 key 补绑；提交过时登记 | 原 key 返回同 A/声明，当前 B 不变；补绑独立去重；过时登记返回 BINDING_REVISION_CONFLICT，无部分写入 | 历史/版本夹具与临时 DB；不需游戏 |
 | B-ERR-10 / A06、D02：无检查点恢复边界 | interrupted 父任务 checkpoint=null；另有外来检查点和父任务未知调用 | 分别提交恢复，再重试原 key | 合法恢复返回同新 task/parent；外来检查点 REFERENCE_INVALID；未知调用仍适用 CALL_OUTCOME_UNKNOWN，不因 null 自动重发 | 调用桩/临时 DB；不需网络 |
 | B-ERR-11 / 偏好与目标并发 | 两页同偏好当前ID/同目标supersedes | 并发更正/撤回或接受/拒绝，再以原key重试 | 仅一方推进当前意向，另一方对应专用409；历史不覆盖，成功响应同key去重 | 声明夹具/临时DB；不需真实环境 |
+| B-ERR-12 / D-P入口、版本与幂等 | 四类新请求及旧0.2幂等记录；过时安装/旧条目/旧request，文件就绪后提交前退出 | 同key原内容重送、异内容重送、不同key并发后继；新服务读取旧响应 | 同key同ID/原状态，异内容409；专用冲突无半写/副作用；孤立manifest不可消费；旧hash/响应不变，facts_only不会隐式恢复源任务；0.4新字段改变hash，版本头错配409；旧原响应优先；未知定位auto非法422，错旧值/旧头409；根依据缺失不猜值 | 原请求/manifest/两客户端/临时DB；免网络 |
 
 静态检查须同时核对 data 的 MutationContext/IdempotencyRecord、state 的终态/未知窗口以及本篇 retry_policy。完整页面文案、错误到按钮的映射和逐操作接口验收在 C5/06/07/08 展开。

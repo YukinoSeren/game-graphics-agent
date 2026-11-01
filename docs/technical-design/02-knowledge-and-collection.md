@@ -1,6 +1,6 @@
 # 02 公共知识生命周期、覆盖与更新详细设计
 
-> 阶段 C2；2026-11-01；建议基线 `product-contract/0.2`；未实现产品知识服务。
+> 阶段 C2及D-P01补全；2026-11-01；建议基线 `product-contract/0.4`；未实现产品知识服务。（独立审计修订；兼容见共享数据§12.2）
 > 依据：[原始 02](../design/02-knowledge-and-collection.md)、[公共知识 v0.1](../../knowledge-intake-contract.md)、C01—C05/C08/C09、[共享数据 §3—4/8—10](./shared/data-contracts.md)、[02a](./02a-collector-integration.md)。
 
 ## 1. 职责与状态
@@ -84,6 +84,62 @@ ReuseDecision 为局部只读 DTO，字段全R：`package_id:ID?,mode:string,che
 }
 ```
 
+### 5.1 D-P01 空库游戏目录与选择
+
+以下为02拥有的局部DTO，全部字段R，问号为显式可空；不新增TaskType。公共Game字段仍由shared唯一定义，安装/上下文由01构造。所有查询仅用本地目录，不在GET联网、探测、登记对象或初始化游戏。
+
+| DTO | 字段 | 约束/用途 |
+|---|---|---|
+| GameCatalogQuery | query:string、cursor:string?、limit:int（D=20） | query可空字符串列目录；limit为1—100；游标绑定用户/查询及固定目录快照；无目录返回空页 |
+| GameChoice | game_id:ID、game_revision_id:ID、canonical_name:string、platform_scope:string[]、identity_status:GameIdentityStatus | 后台固定版本；provisional仅向声明用户展示；不是“已支持此游戏” |
+| GameChoicePage | choices:GameChoice[]、next_cursor:string? | 按规范展示名/固定ID稳定排序，分页截止点固定；不产生新GameContext |
+| GameSelectionRequest | raw_name:string、selected_game_revision_id:ID?、platform:string?、installation_id:ID?、expected_installation_revision:Revision? | raw_name非空白且原字保留；平台null保持未知；安装两字段同时null或同时非空；不得传game_id/来源/能力检查/路径 |
+| GameSelection（持久局部记录，含EntityHeader） | input:GameSelectionRequest、state:string、game_revision_id:ID?、game_context_id:ID?、candidate_revision_ids:ID[]、declaration_file_id:ID | state仅selected/needs_choice；selected两个ID均非空，needs_choice均null且候选至少两项；manifest保存原选择和后台判定依据 |
+
+接口：`list_games(GameCatalogQuery)->GameChoicePage`；`select_game(GameSelectionRequest,MutationContext)->ResourceResult`。先查同key原响应，再在事务外准备声明manifest，07按import文件发布流程提交。ResourceResult始终含GameSelection引用；selected还含具体Game版本与GameContext引用；needs_choice是正常201领域选择结果，非TaskState/HTTP错误。客户端读取GameSelection取得候选及上下文ID，不手填后台ID。
+
+目录每个Game.series_id仅列一个在查询截止点有效的可见版本，精确候选计数也先按series去重，不能把同一游戏的历史版本误算成同名歧义。模糊搜索只供展示，自动唯一匹配仍按下述verified精确规则；明确选中的旧可见版本保持固定，不隐式切最新。
+
+选择规则与空库算法：
+
+1. selected_game_revision_id非空：核对存在/可见/未撤回的具体版本，表示玩家明确选中该候选，不因模糊搜索排序代选。若带既有installation，01复核用户/同游戏及expected revision；跨游戏422，旧修订409，事务不创建半选择或新上下文。
+2. 未给selected ID：只用有证据的规范原名/有效别名作精确匹配，平台已给时也须相容；不按前缀/近似名合并。唯一verified匹配可选；两个以上候选保存needs_choice及固定候选列表，页面明确选后用新key提交。platform=null且候选跨平台不可区分时同样要求选择。
+3. 零匹配或只有未核验线索：按`(持久用户, NFC(raw_name).strip().casefold(), platform原值或null)`查声明身份槽。查找归一只用于该用户的声明槽，不改原话或请求hash，不证明别名等价。同一槽并发只产生一个provisional Game.series_id；已有槽取其固定当前版本，新的选择仍保存独立声明。Game.canonical_name保存首次明确名称；平台未给时platform_scope=[]及identity_checks=unknown；给出平台也只是user_provided，不升级verified。
+4. 01构造GameContext：game_id=所选series_id，game_revision_id固定，未选安装则installation_id=null；平台为玩家声明/未知，build/process保持未取得，adapter两字段null，各capability为not_run/unknown。不造DeviceSnapshot或默认GPU、FPS、路径。验证过的既有安装可建立带安装的新上下文。
+5. 文件就绪后短事务重查key、声明槽/身份候选和安装修订，原子保存必要Game版本、GameSelection、GameContext、引用及原响应。候选集合在准备期间变化则重新作确定性选择判断，不把歧义折叠为首项。全程无模型/搜索调用；原key重试不创建新ID，也不因后续身份核验改变原上下文。
+
+provisional输入允许knowledge任务按明确名称发现/归档来源；在02身份/平台检查闭合前不发布为已匹配KnowledgePackage，不复用未经证实的别名、同名其他游戏或其他用户声明。`resolve_game_identity`有可定位原始证据、同一游戏/平台检查pass后另建同series的verified版本，记录从选择manifest到来源的依据；两个既有series是否相同未经核验不合并。历史provisional版本、原选择与任务输入不回写；要使用新身份背景需显式新上下文/任务。旧格式Game的legacy_unverified视图也遵守新消费门槛，不倒改已保存历史结果。
+
+当前knowledge任务若取得足够身份/平台依据，可由07协调01以固定原GameContext作base_context另建已核验背景的GameContext，和新包/身份检查一起登记为本任务显式result_refs；只有证明仍同一series时可沿此路径，不更改TaskInputRevision或原选择。推荐等后继使用这些明确返回的新上下文/包ID，无需用户重搜或重发已完成供应商调用。证据不足则保留partial及具体缺口；若实为另一游戏，不自动跳series，返回候选供新选择。这样“新上下文”是新事实输出，不是回写原输入或偷偷读最新。
+
+安装未知并不阻止公共收集；要保存本机基线/会话时再走[01安装登记](./01-device-game-configuration.md#51-d-p01-本机安装登记与选择)。目录内容不由本次设计预置，首游戏Q2仍待确认。
+
+虚构空库输入（无后台ID、无平台/FPS关卡）：
+
+```json
+{
+  "raw_name": "示例游戏甲",
+  "selected_game_revision_id": null,
+  "platform": null,
+  "installation_id": null,
+  "expected_installation_revision": null
+}
+```
+
+完整selected返回形状示例，三个ID均为后台分配的虚构值；读取GameSelection.game_context_id后即可提交原KnowledgeInput：
+
+```json
+{
+  "refs":[
+    {"entity_type":"GameSelection","entity_id":"00000000000000000000000000000901"},
+    {"entity_type":"Game","entity_id":"00000000000000000000000000000902"},
+    {"entity_type":"GameContext","entity_id":"00000000000000000000000000000903"}
+  ]
+}
+```
+
+needs_choice响应只含GameSelection引用，其记录含候选而不含上下文；客户端选择明确候选后新提交，不能从该状态调用KnowledgeInput或伪建空上下文。
+
 ## 6. 检索、补查、停止与更新步骤
 
 首次在声明范围内分别发现官方版本/兼容资料、条件实测、配置取舍资料；GPU已知可进入查询，但不先要求目标FPS。canonical URL去重保留必要参数，hash相同建立相同捕获内容关系，不计独立支持。
@@ -123,12 +179,13 @@ DeepSeek Flash 是已确认模型方向，但模型别名、端点、thinking/ma
 | KNW-V03 / A02/入库边界 | accepted/隔离记录混合、未确认别名、区间FPS | 组包/跨源设置映射/推荐输入 | 仅依赖闭合成员可用；隔离只诊断；别名不猜合并，区间不变均值 | 固定JSON；免真实服务 |
 | KNW-V04 / C08：未读图缺口 | 文字已过，图片有关键条件/图例不清 | 禁用/启用图像适配器并尝试闭合 | 文字仍可用，图像无新依据不resolved，无长视频任务 | 图像输出桩；真实OCR/VLM需独立标注/预算 |
 | KNW-V05 / C09、更新传播 | 旧推荐依赖旧包，新增定向更新，模型返回名缺失 | 发布新包/通知重投/读取旧历史 | 03只追加一次needs_review；旧推荐/采用不改，returned_model=null，密钥不出现 | 通知/供应商桩；免付费 |
+| KNW-V06 / D-P01、C02：空库选择 | 无Game/上下文/模型配置；另有两个同名verified候选、一个其他用户provisional | GET空目录→仅原名POST选择→同key丢响应重试→无设备knowledge；同名显式选择；不同key并发同声明槽 | 空页不写库；同key同selection/context，声明槽单一series；未知平台不补默认；歧义不取首项；未核验不发布匹配包，不读其他用户声明；选择本身调用0，knowledge另按预算/桩计数 | 临时库/文件/身份与供应商桩；无网络，真实来源另验 |
 
 ## 10. 实施任务与 DoD
 
 | 任务/目标 | 依赖 | 拟建组件/文件 | 必须逻辑与接口 | 验收/完成定义 |
 |---|---|---|---|---|
-| KNW-T01 公共身份/固定包索引 | ENG-T01、B数据 | game_app/knowledge.py；tests/product/test_identity.py | Game/别名/IdentityMapping与用途级assess_reuse；独立于导入器 | KNW-V01/03；不依赖IMP-T02而形成循环 |
+| KNW-T01 公共身份/固定包索引 | ENG-T01、ENG-T03、B数据 | game_app/knowledge.py；tests/product/test_identity.py | Game/别名/IdentityMapping、list_games/select_game及声明槽与用途级assess_reuse；01上下文可用桩，文件发布必须使用已完成ENG-T03 | KNW-V01/03/06及声明改名后DB前故障；不反向依赖IMP-T02或DEV-T02 |
 | KNW-T02 覆盖与包发布 | KNW-T01、IMP-T03、ENG-T03 | knowledge.py；test_packages.py | CoverageEvaluator、依赖闭合、build_package、私人与公共隔离 | KNW-V02/03；声明范围及未知格可逐项核对 |
 | KNW-T03 自主补查与审计接入 | KNW-T02、ENG-T02、IMP-T02 | knowledge.py、collection.py及未来providers边界；test_collection_tasks.py | FollowupPlanner、CollectionSnapshotWriter/标准组、增益/预算/中断、新调用审计、模型标识 | KNW-V02/04/05；新记录经快照映射后入包，旧CLI保留，未知调用不重发 |
 | KNW-T04 更新影响与图像门禁 | KNW-T02/03、REC-T03消费接口 | knowledge.py；test_impacts.py | ImpactNotice去重、03复核事务、来源修订；图像mapper启用条件 | KNW-V04/05；只通知不写推荐内容，图像未验证不报完成 |

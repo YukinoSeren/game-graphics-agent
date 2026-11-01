@@ -1,0 +1,15 @@
+{
+  "fixture_id": "smoke-inputs",
+  "version": 1,
+  "schema_version": "product-contract/0.4",
+  "files": [
+    {
+      "relative_name": "inputs/context.json",
+      "byte_length": 75,
+      "sha256": "964148051fc61bbf195991cffcfce340171499dcac2d4afafb0ebc8bdb6e9c6c",
+      "media_type": "application/json"
+    }
+  ],
+  "annotation_method": "hand-authored synthetic values; not a real observation",
+  "known_limitations": ["no real game, device or provider involved"]
+}

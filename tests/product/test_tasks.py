@@ -9,6 +9,7 @@ import pytest
 
 from game_app.contracts.common import MutationContext
 from game_app.errors import ContractError, ErrorCode
+from game_app.files import FileService
 from game_app.tasks import HandlerOutcome, TaskService
 from tests.product.support.spies import SpyProvider
 
@@ -369,3 +370,47 @@ def test_running_task_cannot_be_resumed(repo_factory):
             _ctx("k-resume"),
         )
     assert caught.value.code is ErrorCode.TASK_STATE_CONFLICT
+
+
+def test_provider_response_is_published_as_a_managed_original(repo_factory, tmp_path):
+    repo = repo_factory()
+    files = FileService(repo, tmp_path / "managed")
+    service = TaskService(repo, provider=SpyProvider(), files=files)
+
+    def handler(ctx):
+        ctx.invoke_provider(payload={"prompt": "synthetic"})
+        return HandlerOutcome.completed()
+
+    service.handlers["knowledge"] = handler
+    accepted = service.register_task(_knowledge_input(model_calls=1), _ctx())
+    assert service.run_once().state.value == "completed"
+
+    call = _calls(repo, accepted.task_id)[0]
+    assert call["call_state"] == "succeeded"
+    assert call["response_file_id"]
+    original = files.read_managed_file(call["response_file_id"])
+    assert b"stub-model-1" in original
+
+
+def test_response_storage_failure_leaves_the_call_unknown(repo_factory, tmp_path, monkeypatch):
+    repo = repo_factory()
+    files = FileService(repo, tmp_path / "managed")
+    service = TaskService(repo, provider=SpyProvider(), files=files)
+
+    def storage_failure(*_args, **_kwargs):
+        raise OSError("simulated response disk failure")
+
+    monkeypatch.setattr(files, "store_artifact", storage_failure)
+
+    def handler(ctx):
+        ctx.invoke_provider(payload={"prompt": "synthetic"})
+        return HandlerOutcome.completed()
+
+    service.handlers["knowledge"] = handler
+    accepted = service.register_task(_knowledge_input(model_calls=1), _ctx())
+    outcome = service.run_once()
+    assert outcome.state.value == "partial"
+    call = _calls(repo, accepted.task_id)[0]
+    assert call["call_state"] == "outcome_unknown"
+    assert call["response_file_id"] is None
+    assert service.get_task(accepted.task_id).task.last_error_code == "CALL_OUTCOME_UNKNOWN"

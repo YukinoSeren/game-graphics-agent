@@ -10,14 +10,22 @@ from __future__ import annotations
 from typing import Any
 
 from game_app.contracts.common import Budget, MutationContext
+from game_app.files import FileService
 from game_app.repository import ProductRepository
 from game_app.tasks import TaskService
 
 
 class Application:
-    def __init__(self, repository: ProductRepository, *, provider: Any | None = None) -> None:
+    def __init__(
+        self,
+        repository: ProductRepository,
+        *,
+        provider: Any | None = None,
+        file_root: str | None = None,
+    ) -> None:
         self.repository = repository
-        self.tasks = TaskService(repository, provider=provider)
+        self.files = None if file_root is None else FileService(repository, file_root)
+        self.tasks = TaskService(repository, provider=provider, files=self.files)
 
     def register_task(
         self,

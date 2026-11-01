@@ -162,10 +162,12 @@ class TaskService:
         repository: ProductRepository,
         *,
         provider: Any | None = None,
+        files: Any | None = None,
         clock: Callable[[], str] = utc_now,
     ) -> None:
         self.repository = repository
         self.provider = provider or _NullProvider()
+        self.files = files
         self.clock = clock
         self.handlers: dict[str, Callable[[TaskContext], HandlerOutcome | None]] = {}
         self._lock = threading.Lock()
@@ -724,16 +726,36 @@ class TaskService:
                 )
             raise
 
+        response_file_id: str | None = None
+        if self.files is not None:
+            # The raw exchange is a managed original.  If it cannot be
+            # persisted, the call must stay unknown: the provider may have run.
+            try:
+                response_file_id = self.files.store_artifact(
+                    canonical_json({"request": request, "response": reply}),
+                    relative_name=f"calls/{call_id}.json",
+                    stable_key=f"call:{call_id}",
+                )
+            except Exception as error:  # noqa: BLE001 - storage failure, not provider failure
+                with self.repository.unit_of_work() as uow:
+                    uow.execute(
+                        "UPDATE external_calls SET call_state='outcome_unknown', finished_at=?,"
+                        " error_code='STORAGE_COMMIT_FAILED' WHERE call_id=?",
+                        (self.clock(), call_id),
+                    )
+                raise UnknownCall(call_id) from error
+
         with self.repository.unit_of_work() as uow:
             uow.execute(
                 "UPDATE external_calls SET call_state='succeeded', finished_at=?,"
-                " provider_request_id=?, returned_model=?, usage=?, billing_state='not_reported'"
-                " WHERE call_id=?",
+                " provider_request_id=?, returned_model=?, usage=?, response_file_id=?,"
+                " billing_state='not_reported' WHERE call_id=?",
                 (
                     self.clock(),
                     reply.get("provider_request_id"),
                     reply.get("returned_model"),
                     canonical_json(reply.get("usage") or {}).decode("utf-8"),
+                    response_file_id,
                     call_id,
                 ),
             )

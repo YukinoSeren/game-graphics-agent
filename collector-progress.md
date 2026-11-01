@@ -1,0 +1,23 @@
+# 原型执行记录 — plan: collector-implementation-plan.md
+
+- 已读取两份设计与研究产物；用户于本轮明确授权进入实现。
+- Ruling：当前目录无 Git 仓库，原地新增包，不创建 worktree 或提交；避免为了流程复制/移动用户资料，代价是本轮没有 Git 回滚历史。
+- Pre-flight：类型/Document → 校验/模型/流程；适配器 → 流程；流程 → 存储。共同输入统一使用 schema 中的类型，旧研究 JSON 不直接当作新模型输出。
+- 环境：Python 3.13 可通过 `py -3.13` 调用；`python` 指向 Windows 应用别名。pytest、requests、bs4、pydantic 已存在。
+- 搜索：本机 mcporter 的 Exa 搜索/读取可用。OpenAI 官方接口凭据探测 HTTP 401，未记录敏感信息；继续检查已有其他模型接口。
+- Task 1: complete — `tests/test_schema_reader.py` 先因模块缺失失败，随后 5/5 通过；类型、未知值、合并单元格与定位已覆盖。
+- Task 2: complete — `tests/test_validation.py` 先因模块缺失失败，随后 7/7 通过；引用/出处/数字/跨场景/硬件分支校验已覆盖。词面检查不等于独立语义核验。
+- Gemini 官方接口凭据探测 HTTP 400；已异步询问服务地址与模型名，继续实现，无密钥写入项目。
+- Task 3: complete — 适配器测试先因模块缺失失败，随后 5/5 通过；Exa argv、HTTP 错误脱敏、模型 JSON/用量、公开 HTML 读取。
+- Task 4: complete — 工作流 10/10；CLI/配置 4/4。修复初始化解包与失败来源重复重试。格式修复仅剥离 JSON 代码围栏，不改事实；更复杂错误保留原输出并补查。
+- 用户指定 DeepSeek V4 Flash；官方文档确认兼容名称路由至当前 Flash。实现保留请求名并记录实际返回名。2026-11-01 `--check-model` 通过，密钥未输出。
+- Task 5: in_progress — 真网页 seeded 冒烟已启动。全量测试首次发现用户注册表环境影响配置缺失测试，已添加测试隔离，不更改用户配置。
+- 真网页第1轮：DeepSeek 返回20199总token（按接口计量），存在单个闭括号遗漏及配置类型错误，未入库；保存于 runs/fh6-seeded-smoke-01。
+- 真网页第2轮：55条对象中旧校验产生整行/单元格及Markdown样式误报；修正后同一原始响应重校验50接受、5隔离。仍有错误引用、环境补写和条件改写，不能作为可用配置宣称。
+- 独立代码审查发现5项Important：跨列、无关证据关闭缺口、约束对象错绑、旧记录未重验、原名/指标单位错读。已逐项新增失败测试并修复；39/39测试通过。新约束重查旧记录并保存状态历史，无法确定的解决提议保持开放。
+- 进一步修复：公开文章 header 保留、输入表格显式行列编号、排除明确的方向盘指南、P0 来源修复不进行偏题搜索、每来源每轮共享一次重读、P2 未知不阻止声明范围完成、模型截断保留原文且禁止入库、慢模型调用前保存检查点。
+- Ruling：按“收集充分、可多等待”的偏好，DeepSeek 最终默认使用思考模式 high，最多48000输出token与300秒读取超时；代价是单次调用更慢且可能更多token。仍受整体调用预算控制。
+- Task 5 首轮交付验证：`py -3.13 -m pytest -q` 45/45通过。独立代码审查只读完成，五项Important已用RED→GREEN回归修复，无另行合并或发布。
+- 真网页最终运行 runs/fh6-final-seeded：read=2、model=1；接口实际返回 deepseek-flash；prompt_tokens=10002、completion_tokens=35131（含reasoning_tokens=23013）、total_tokens=45133，金额未计量。接受89条、隔离3条；partial_scope / unresolved_conflict。
+- 冻结样本回归：`scripts/compare_fh6_dot.py` 对24选定固定项得到24/24一致，另3项语义保留检查通过。测量引用仍不合法，故其数值正确也不解除隔离。结果见 runs/fh6-final-comparison。
+- 当前结论：程序原型已落地并完成首轮运行验证；完整真实资料验收尚未完成。不是四篇全量自动回归或独立准确率结论。

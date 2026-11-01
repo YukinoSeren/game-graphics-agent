@@ -1,0 +1,416 @@
+{
+  "extraction_sha256": "81934406A2AE80CFA94E150AA2413F66267EFA6299AF8F20A7B26413D3C7F072",
+  "gold_sha256": "F79D4E3C4EA11761F3B4349B494201708E88E902E634EAE6C4C7913327E0DC1F",
+  "fixed_checks": [
+    {
+      "field": "车辆细节",
+      "expected": "High",
+      "actual": "High",
+      "match": true
+    },
+    {
+      "field": "环境纹理",
+      "expected": "Extreme",
+      "actual": "Extreme",
+      "match": true
+    },
+    {
+      "field": "环境几何",
+      "expected": "High",
+      "actual": "High",
+      "match": true
+    },
+    {
+      "field": "车身反射",
+      "expected": "Extreme",
+      "actual": "Extreme",
+      "match": true
+    },
+    {
+      "field": "屏幕空间反射",
+      "expected": "High",
+      "actual": "High",
+      "match": true
+    },
+    {
+      "field": "光追反射",
+      "expected": "Off",
+      "actual": "Off",
+      "match": true
+    },
+    {
+      "field": "阴影",
+      "expected": "Ultra",
+      "actual": "Ultra",
+      "match": true
+    },
+    {
+      "field": "夜间阴影",
+      "expected": "Ultra",
+      "actual": "Ultra",
+      "match": true
+    },
+    {
+      "field": "屏幕空间全局光照",
+      "expected": "High",
+      "actual": "High",
+      "match": true
+    },
+    {
+      "field": "光追全局光照",
+      "expected": "Off",
+      "actual": "Off",
+      "match": true
+    },
+    {
+      "field": "着色器",
+      "expected": "High",
+      "actual": "High",
+      "match": true
+    },
+    {
+      "field": "音频",
+      "expected": "Ultra",
+      "actual": "Ultra",
+      "match": true
+    },
+    {
+      "field": "可变形地形",
+      "expected": "Extreme",
+      "actual": "Extreme",
+      "match": true
+    },
+    {
+      "field": "粒子效果",
+      "expected": "Ultra",
+      "actual": "Ultra",
+      "match": true
+    },
+    {
+      "field": "体积雾",
+      "expected": "High",
+      "actual": "High",
+      "match": true
+    },
+    {
+      "field": "镜头效果",
+      "expected": "Ultra",
+      "actual": "Ultra",
+      "match": true
+    },
+    {
+      "field": "运动模糊质量",
+      "expected": "Ultra",
+      "actual": "Ultra",
+      "match": true
+    },
+    {
+      "field": "运动模糊",
+      "expected": "Off",
+      "actual": "Off",
+      "match": true
+    },
+    {
+      "field": "Reflex",
+      "expected": "On + Boost",
+      "actual": "On + Boost",
+      "match": true
+    }
+  ],
+  "unexpected_settings": [],
+  "metric_checks": [
+    {
+      "record": "M1",
+      "metric": "average_fps",
+      "expected": 152,
+      "actual": 152,
+      "match": true
+    },
+    {
+      "record": "M1",
+      "metric": "one_percent_low",
+      "expected": 97,
+      "actual": 97,
+      "match": true
+    },
+    {
+      "record": "M1",
+      "metric": "point_one_percent_low",
+      "expected": 68,
+      "actual": 68,
+      "match": true
+    },
+    {
+      "record": "M2",
+      "metric": "average_fps",
+      "expected": 175,
+      "actual": 175,
+      "match": true
+    },
+    {
+      "record": "M2",
+      "metric": "one_percent_low",
+      "expected": 101,
+      "actual": 101,
+      "match": true
+    },
+    {
+      "record": "M2",
+      "metric": "point_one_percent_low",
+      "expected": 74,
+      "actual": 74,
+      "match": true
+    },
+    {
+      "record": "M3",
+      "metric": "average_fps",
+      "expected": 103,
+      "actual": 103,
+      "match": true
+    },
+    {
+      "record": "M3",
+      "metric": "one_percent_low",
+      "expected": 81,
+      "actual": 81,
+      "match": true
+    },
+    {
+      "record": "M3",
+      "metric": "point_one_percent_low",
+      "expected": 71,
+      "actual": 71,
+      "match": true
+    },
+    {
+      "record": "M4",
+      "metric": "average_fps",
+      "expected": 127,
+      "actual": 127,
+      "match": true
+    },
+    {
+      "record": "M4",
+      "metric": "one_percent_low",
+      "expected": 85,
+      "actual": 85,
+      "match": true
+    },
+    {
+      "record": "M4",
+      "metric": "point_one_percent_low",
+      "expected": 77,
+      "actual": 77,
+      "match": true
+    }
+  ],
+  "row_checks": [
+    {
+      "record": "M1",
+      "config_match": true,
+      "environment_match": true
+    },
+    {
+      "record": "M2",
+      "config_match": true,
+      "environment_match": true
+    },
+    {
+      "record": "M3",
+      "config_match": true,
+      "environment_match": true
+    },
+    {
+      "record": "M4",
+      "config_match": true,
+      "environment_match": true
+    }
+  ],
+  "policy_checks": [
+    {
+      "field": "anti_aliasing",
+      "match": true
+    },
+    {
+      "field": "upscaling",
+      "match": true
+    },
+    {
+      "field": "frame_generation",
+      "match": true
+    }
+  ],
+  "scope_checks": [
+    {
+      "field": "TS 性能 GPU",
+      "match": true
+    },
+    {
+      "field": "TS 性能分辨率",
+      "match": true
+    },
+    {
+      "field": "TS 视觉 GPU",
+      "match": true
+    },
+    {
+      "field": "TS 视觉分辨率／超分",
+      "match": true
+    },
+    {
+      "field": "WC CPU 条件",
+      "match": true
+    },
+    {
+      "field": "WC 逐项对比条件",
+      "match": true
+    }
+  ],
+  "unknown_checks": [
+    {
+      "environment": "WC_NIGHT",
+      "field": "resolution",
+      "actual": null,
+      "preserved_unknown": true
+    },
+    {
+      "environment": "WC_NIGHT",
+      "field": "anti_aliasing",
+      "actual": null,
+      "preserved_unknown": true
+    },
+    {
+      "environment": "WC_NIGHT",
+      "field": "upscaling",
+      "actual": null,
+      "preserved_unknown": true
+    },
+    {
+      "environment": "WC_NIGHT",
+      "field": "frame_generation",
+      "actual": null,
+      "preserved_unknown": true
+    },
+    {
+      "environment": "WC_NIGHT",
+      "field": "capture_tool",
+      "actual": null,
+      "preserved_unknown": true
+    },
+    {
+      "environment": "WC_NIGHT",
+      "field": "duration_seconds",
+      "actual": null,
+      "preserved_unknown": true
+    },
+    {
+      "environment": "WC_NIGHT",
+      "field": "repeat_count",
+      "actual": null,
+      "preserved_unknown": true
+    },
+    {
+      "environment": "WC_NIGHT",
+      "field": "driver_version",
+      "actual": null,
+      "preserved_unknown": true
+    },
+    {
+      "environment": "WC_NIGHT",
+      "field": "game_build",
+      "actual": null,
+      "preserved_unknown": true
+    },
+    {
+      "environment": "WC_DAY",
+      "field": "resolution",
+      "actual": null,
+      "preserved_unknown": true
+    },
+    {
+      "environment": "WC_DAY",
+      "field": "anti_aliasing",
+      "actual": null,
+      "preserved_unknown": true
+    },
+    {
+      "environment": "WC_DAY",
+      "field": "upscaling",
+      "actual": null,
+      "preserved_unknown": true
+    },
+    {
+      "environment": "WC_DAY",
+      "field": "frame_generation",
+      "actual": null,
+      "preserved_unknown": true
+    },
+    {
+      "environment": "WC_DAY",
+      "field": "capture_tool",
+      "actual": null,
+      "preserved_unknown": true
+    },
+    {
+      "environment": "WC_DAY",
+      "field": "duration_seconds",
+      "actual": null,
+      "preserved_unknown": true
+    },
+    {
+      "environment": "WC_DAY",
+      "field": "repeat_count",
+      "actual": null,
+      "preserved_unknown": true
+    },
+    {
+      "environment": "WC_DAY",
+      "field": "driver_version",
+      "actual": null,
+      "preserved_unknown": true
+    },
+    {
+      "environment": "WC_DAY",
+      "field": "game_build",
+      "actual": null,
+      "preserved_unknown": true
+    }
+  ],
+  "comparison_checks": [
+    {
+      "id": "WC_CMP1",
+      "same_environment": true,
+      "computed_percent": {
+        "average_fps": 15.13,
+        "one_percent_low": 4.12,
+        "point_one_percent_low": 8.82
+      },
+      "rounded_matches_source": {
+        "average_fps": true,
+        "one_percent_low": true,
+        "point_one_percent_low": true
+      }
+    },
+    {
+      "id": "WC_CMP2",
+      "same_environment": true,
+      "computed_percent": {
+        "average_fps": 23.3,
+        "one_percent_low": 4.94,
+        "point_one_percent_low": 8.45
+      },
+      "rounded_matches_source": {
+        "average_fps": true,
+        "one_percent_low": true,
+        "point_one_percent_low": true
+      }
+    }
+  ],
+  "reference_checks": {
+    "source_ids_valid": true,
+    "config_ids_valid": true,
+    "environment_ids_valid": true,
+    "comparison_ids_valid": true
+  },
+  "interpretation": "同一会话固定样本的一致性核对，不是独立泛化准确率"
+}

@@ -1,0 +1,419 @@
+{
+  "record_version": "1.0",
+  "run": {
+    "date": "2026-11-01",
+    "purpose": "两篇网页的工具辅助模型提取及与既有人工样本对照",
+    "extraction_method": "本会话模型根据重新获取的网页正文和表格文本整理",
+    "baseline_visible_in_conversation_history": true,
+    "independent_blind_test": false,
+    "standalone_extraction_program": false,
+    "raw_html_dom_verified": false,
+    "video_processed": false,
+    "note": "本文件在本轮打开人工样本正文对照前保存；历史上下文污染仍然存在。未知采用 null。中文设置名为暂译。"
+  },
+  "sources": [
+    {
+      "id": "TS",
+      "url": "https://www.techspot.com/article/3127-forza-horizon-6-optimization/",
+      "author": "Tim Schiesser",
+      "published_date": "2026-05-20",
+      "retrieved_date": "2026-11-01",
+      "locators": {
+        "recommendation": "TechSpot Optimized Settings > TechSpot Performance 表",
+        "environments": "正文开头、Global Illumination Quality 之前的测试系统说明"
+      }
+    },
+    {
+      "id": "WC",
+      "url": "https://wccftech.com/how-to/forza-horizon-6-pc-performance-analysis-tuning-guide/",
+      "author": "Sebastian Castellanos",
+      "published_date": "2026-05-24",
+      "retrieved_date": "2026-11-01",
+      "locators": {
+        "hardware": "CPU Benchmarks 开头设备清单；末尾优化比较引用 our test system",
+        "cpu_conditions": "CPU Benchmarks 中 1080p 与 DLSS Ultra Performance 的段落",
+        "per_setting_conditions": "A Deep Dive Into Forza Horizon 6's Graphics Settings 开头条件列表",
+        "scene_context": "Stuttering, Shader Compilation, CPU Behavior, And Benchmarking Notes 末段",
+        "non_rt": "Optimized Graphics Settings > 非光追比较表（Extreme / Optimized Non-RT）",
+        "rt": "Optimized Graphics Settings > 光追比较表（Extreme+RT / Optimized RT）"
+      }
+    }
+  ],
+  "recommendation": {
+    "id": "TS_PERFORMANCE",
+    "source_id": "TS",
+    "type": "author_recommendation",
+    "configuration_kind": "conditional_template",
+    "locator_key": "recommendation",
+    "source_table_fixed_fields_complete": true,
+    "runtime_configuration_complete": false,
+    "fixed_settings": [
+      {
+        "row": 1,
+        "setting": "车辆细节",
+        "value": "High"
+      },
+      {
+        "row": 2,
+        "setting": "环境纹理",
+        "value": "Extreme"
+      },
+      {
+        "row": 3,
+        "setting": "环境几何",
+        "value": "High"
+      },
+      {
+        "row": 4,
+        "setting": "车身反射",
+        "value": "Extreme"
+      },
+      {
+        "row": 5,
+        "setting": "屏幕空间反射",
+        "value": "High"
+      },
+      {
+        "row": 6,
+        "setting": "光追反射",
+        "value": "Off"
+      },
+      {
+        "row": 7,
+        "setting": "阴影",
+        "value": "Ultra"
+      },
+      {
+        "row": 8,
+        "setting": "夜间阴影",
+        "value": "Ultra"
+      },
+      {
+        "row": 9,
+        "setting": "屏幕空间全局光照",
+        "value": "High"
+      },
+      {
+        "row": 10,
+        "setting": "光追全局光照",
+        "value": "Off"
+      },
+      {
+        "row": 11,
+        "setting": "着色器",
+        "value": "High"
+      },
+      {
+        "row": 12,
+        "setting": "音频",
+        "value": "Ultra"
+      },
+      {
+        "row": 13,
+        "setting": "可变形地形",
+        "value": "Extreme"
+      },
+      {
+        "row": 14,
+        "setting": "粒子效果",
+        "value": "Ultra"
+      },
+      {
+        "row": 15,
+        "setting": "体积雾",
+        "value": "High"
+      },
+      {
+        "row": 16,
+        "setting": "镜头效果",
+        "value": "Ultra"
+      },
+      {
+        "row": 17,
+        "setting": "运动模糊质量",
+        "value": "Ultra"
+      },
+      {
+        "row": 18,
+        "setting": "运动模糊",
+        "value": "Off"
+      },
+      {
+        "row": 19,
+        "setting": "Reflex",
+        "value": "On + Boost"
+      }
+    ],
+    "conditional_policies": [
+      {
+        "id": "anti_aliasing",
+        "policy": "优先考虑所列抗锯齿技术，保留候选，不替玩家确定一种",
+        "candidates": [
+          "DLAA",
+          "FSR AA",
+          "XeSS AA"
+        ],
+        "selected_value": null
+      },
+      {
+        "id": "upscaling",
+        "policy": "可采用所列超分技术提高帧率，未给出唯一质量档",
+        "candidates": [
+          "DLSS",
+          "FSR 4.1",
+          "XeSS"
+        ],
+        "selected_value": null,
+        "quality_mode": null
+      },
+      {
+        "id": "frame_generation",
+        "policy": "基础帧率良好时考虑",
+        "selected_value": null,
+        "baseline_fps_threshold": null,
+        "multiplier": null
+      }
+    ],
+    "missing_fields": [
+      "游戏构建号",
+      "亮度",
+      "显示模式",
+      "帧率上限",
+      "最终抗锯齿技术",
+      "超分档位",
+      "帧生成状态"
+    ],
+    "measured_average_fps": null,
+    "author_target_gpu": null,
+    "note": "测试背景与作者推荐的适用范围分开；本次不抽取文章其他段落的 FPS 描述。"
+  },
+  "ts_environments": [
+    {
+      "id": "TS_PERF",
+      "source_id": "TS",
+      "locator_key": "environments",
+      "scope": "主要性能测试",
+      "gpu": "RTX 5060 Ti",
+      "vram_gb": 16,
+      "output_resolution_label": "1440p",
+      "native_rendering": true,
+      "anti_aliasing": null,
+      "cpu": "Ryzen 7 9800X3D",
+      "ram_gb": 32,
+      "ram_description": "DDR5-6000",
+      "game_build": null,
+      "driver_version": null
+    },
+    {
+      "id": "TS_VISUAL",
+      "source_id": "TS",
+      "locator_key": "environments",
+      "scope": "视觉对比",
+      "gpu": "RTX 5090",
+      "vram_gb": null,
+      "output_resolution_label": "4K",
+      "upscaling": "DLSS",
+      "upscaling_mode": "Quality",
+      "internal_render_resolution": null,
+      "note": "不根据显卡常识补写原文该处未给出的显存。"
+    }
+  ],
+  "wc_hardware": {
+    "id": "WC_HW",
+    "source_id": "WC",
+    "locator_key": "hardware",
+    "gpu": "RTX 4090",
+    "vram_gb": 24,
+    "cpu": "Core i7-14700K",
+    "ram_gb": 32,
+    "ram_description": "DDR5-7000 CL34",
+    "os": "Windows 11 25H2",
+    "driver_version": null,
+    "game_build": null,
+    "binding_to_result_tables": "依据末尾对同一测试系统的引用关联硬件；不据此继承其他章节全部运行条件"
+  },
+  "wc_contexts": [
+    {
+      "id": "WC_CPU",
+      "source_id": "WC",
+      "locator_key": "cpu_conditions",
+      "scope": "CPU 测试",
+      "resolution_label": "1080p",
+      "upscaling": "DLSS",
+      "upscaling_mode": "Ultra Performance",
+      "capture_tool": "CapFrameX"
+    },
+    {
+      "id": "WC_PER_SETTING",
+      "source_id": "WC",
+      "locator_key": "per_setting_conditions",
+      "scope": "逐项画面对比",
+      "resolution": "2560x1440",
+      "anti_aliasing": "TAA",
+      "native_rendering": true,
+      "sharpness": 0,
+      "motion_blur_policy": "多数对比关闭，不等于所有片段均关闭",
+      "base_preset": "Extreme",
+      "applies_automatically_to_final_result_tables": false
+    }
+  ],
+  "configurations": [
+    {
+      "id": "WC_EXTREME",
+      "source_id": "WC",
+      "kind": "preset_reference",
+      "label": "Extreme",
+      "expanded_settings": null
+    },
+    {
+      "id": "WC_OPT_NONRT",
+      "source_id": "WC",
+      "kind": "template_source_reference",
+      "label": "Optimized Non-RT",
+      "full_recipe_extracted_in_this_run": false,
+      "locator": "Optimized Graphics Settings > Non-RT 推荐表"
+    },
+    {
+      "id": "WC_EXTREME_RT",
+      "source_id": "WC",
+      "kind": "preset_reference",
+      "label": "Extreme+RT",
+      "expanded_settings": null
+    },
+    {
+      "id": "WC_OPT_RT",
+      "source_id": "WC",
+      "kind": "template_source_reference",
+      "label": "Optimized RT",
+      "full_recipe_extracted_in_this_run": false,
+      "locator": "Optimized Graphics Settings > RT 推荐表"
+    }
+  ],
+  "wc_result_environments": [
+    {
+      "id": "WC_NIGHT",
+      "source_id": "WC",
+      "hardware_id": "WC_HW",
+      "locator_keys": [
+        "scene_context",
+        "non_rt"
+      ],
+      "scene": "夜间比赛",
+      "resolution": null,
+      "anti_aliasing": null,
+      "upscaling": null,
+      "frame_generation": null,
+      "capture_tool": null,
+      "duration_seconds": null,
+      "repeat_count": null,
+      "driver_version": null,
+      "game_build": null,
+      "nearby_context_id": "WC_PER_SETTING",
+      "context_binding": "同文邻近章节条件保留作候选，不当作表级明确条件"
+    },
+    {
+      "id": "WC_DAY",
+      "source_id": "WC",
+      "hardware_id": "WC_HW",
+      "locator_keys": [
+        "scene_context",
+        "rt"
+      ],
+      "scene": "日间开放世界行驶",
+      "resolution": null,
+      "anti_aliasing": null,
+      "upscaling": null,
+      "frame_generation": null,
+      "capture_tool": null,
+      "duration_seconds": null,
+      "repeat_count": null,
+      "driver_version": null,
+      "game_build": null,
+      "nearby_context_id": "WC_PER_SETTING",
+      "context_binding": "同文邻近章节条件保留作候选，不当作表级明确条件"
+    }
+  ],
+  "measurements": [
+    {
+      "id": "WC_M1",
+      "source_id": "WC",
+      "locator_key": "non_rt",
+      "source_row": "Extreme",
+      "config_id": "WC_EXTREME",
+      "environment_id": "WC_NIGHT",
+      "average_fps": 152,
+      "one_percent_low": 97,
+      "point_one_percent_low": 68
+    },
+    {
+      "id": "WC_M2",
+      "source_id": "WC",
+      "locator_key": "non_rt",
+      "source_row": "Optimized Non-RT",
+      "config_id": "WC_OPT_NONRT",
+      "environment_id": "WC_NIGHT",
+      "average_fps": 175,
+      "one_percent_low": 101,
+      "point_one_percent_low": 74
+    },
+    {
+      "id": "WC_M3",
+      "source_id": "WC",
+      "locator_key": "rt",
+      "source_row": "Extreme+RT",
+      "config_id": "WC_EXTREME_RT",
+      "environment_id": "WC_DAY",
+      "average_fps": 103,
+      "one_percent_low": 81,
+      "point_one_percent_low": 71
+    },
+    {
+      "id": "WC_M4",
+      "source_id": "WC",
+      "locator_key": "rt",
+      "source_row": "Optimized RT",
+      "config_id": "WC_OPT_RT",
+      "environment_id": "WC_DAY",
+      "average_fps": 127,
+      "one_percent_low": 85,
+      "point_one_percent_low": 77
+    }
+  ],
+  "measurement_semantics": {
+    "origin": "source_author_measurement",
+    "extracted_from": "网页末尾原始表格的文本表示",
+    "low_metric_calculation_definition": null,
+    "raw_logs_obtained": false,
+    "independently_reproduced": false,
+    "binding_to_optimized_configuration": "source_reported_association_not_fully_reconstructed_run"
+  },
+  "comparisons": [
+    {
+      "id": "WC_CMP1",
+      "before": "WC_M1",
+      "after": "WC_M2",
+      "source_reported_improvement_percent": {
+        "average_fps": 15,
+        "one_percent_low": 4,
+        "point_one_percent_low": 9
+      },
+      "single_setting_causal_claim": false
+    },
+    {
+      "id": "WC_CMP2",
+      "before": "WC_M3",
+      "after": "WC_M4",
+      "source_reported_improvement_percent": {
+        "average_fps": 23,
+        "one_percent_low": 5,
+        "point_one_percent_low": 8
+      },
+      "single_setting_causal_claim": false
+    }
+  ],
+  "exclusions": {
+    "official_version_event": "本次仅处理两篇文字评测，人工样本中的官方变更不重新抽取",
+    "other_gpu_benchmark": "人工样本中 S4 的 M5 不在本次来源范围内",
+    "complete_game_menu": "本文推荐表不视为全量菜单定义"
+  }
+}

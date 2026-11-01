@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "game-knowledge-collector"
+version = "0.1.0"
+description = "Evidence-preserving PC game graphics knowledge collector"
+requires-python = ">=3.11"
+dependencies = ["requests>=2.32,<3", "beautifulsoup4>=4.12,<5", "pydantic>=2.10,<3"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+game-collector = "game_collector.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["game_collector*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+

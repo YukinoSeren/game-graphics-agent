@@ -37,7 +37,7 @@
 | PublicationStatus | staging / validated / published / rejected / tombstoned | 原件/成员/引用未齐不发布；详见 §8 |
 | CoverageStatus | covered / partially_covered / unknown / not_applicable | 每格保存操作范围及依据；不按记录数量归约 |
 | GapPriority / GapStatus | P0 / P1 / P2；open / resolved / stopped | Gap 的 P 级为知识补查优先级；不同于深化计划的问题优先级 |
-| RecommendationReadiness | actionable / provisional / blocked | 继承原始 03 §11；逐项到整体归约留 C3，但关键未知不得绕过 |
+| RecommendationReadiness | actionable / provisional / blocked | 继承原始 03 §11；逐项到整体归约见 C3/03 §6，关键未知不得绕过 |
 | RecommendationActionKind | set_value / keep_current / conditional_strategy / check_in_game / defer | keep_current 当前未知须保留未知；条件动作不能当已确定 fixed |
 | ReviewState | current / needs_review / superseded | current 只指尚无已登记复核要求，不代表完美/已测；与 readiness 独立 |
 | AppliedOrigin | baseline / recommendation / change_set / manual_edit / rollback | 合法关联见 §4；都只登记事实，不自动设置游戏 |
@@ -171,6 +171,8 @@ ImportSnapshot 的产品导入任务不是被导入的历史采集任务，两�
 
 创建活动段时同步建立 revision=1 的 ConfigurationBinding，effective_range 使用 BindingRange，end=null，不填预计结束时间；配置未知仍为 applied_id=null/unverified。结束或切段的同一事务校验段/绑定修订，保存已结束段快照及有实际结束点的新绑定修订（supersedes_revision 指旧绑定），不原地闭合旧绑定。切段还须保存新活动段与其开放初绑定；半开区间在边界衔接，不重叠。采集结果返回最终段/绑定定位，AnalyzeInput 显式选用闭合修订；以开放段或开放绑定分析返回 PRECONDITION_UNVERIFIED，不能自动改用最新修订或补造时长。
 
+04 §4.3的历史日志登记可由有依据的过去起止时间直接初始化ended会话/段及闭合初绑定（revision=1、supersedes_revision=null），同事务追加cause=historical_log_registered的初始session事件，不伪造本次采集的active过程。关联已有开放段时仍走上述结束/双修订守卫，并额外比较会话revision；已有闭合段不重写边界。声明、映射、新artifact、必要闭合事实及幂等响应原子发布；旧任务/原件/摘要/当前采用指针不改，分析须显式新建。
+
 ### 4.4 历史配置登记事务
 
 旧会话没有可引用的实际配置版本时，01 经 07 接收 HistoricalConfigurationInput，先登记过去事实，再由 04 显式补绑；若已有适用历史版本则可直接提交 BindConfigurationInput。
@@ -201,7 +203,9 @@ ImportSnapshot 的产品导入任务不是被导入的历史采集任务，两�
 | acceptance 非 accepted，effect=worse | worse | 不以继续叠加猜测掩盖反证 |
 | 其余组合 | inconclusive | 包括未测、证据不足、指标取舍未闭合；接受维度仍保留 |
 
-improved/worse 必须指声明范围、比较级别和证据，不能从一次很小数值差就判稳定改善。平均改善但尾部退步、只有一次样本或变化小于重复波动时，按原始 05 保留 inconclusive/限制，C4 再给完整判定表。没有基线只允许排查或先补原值，不产生假 ChangeSet。
+improved/worse 必须指声明范围、比较级别和证据，不能从一次很小数值差就判稳定改善。平均改善但尾部退步、只有一次样本或变化小于重复波动时，按原始 05 保留 inconclusive/限制，完整判定见下述 C4 细化规则。没有基线只允许排查或先补原值，不产生假 ChangeSet。
+
+C4 细化后的效果/重复波动规则以 [05 §7](../05-feedback-optimization.md#7-outcome重复波动与停止规则) 为准，兼容标签仍按本节归约；不是新的 TaskState。偏好/目标接受的当前视图与声明历史由05维护，每次更正/撤回比较当前版本并追加事实；冲突使用 error 的 PREFERENCE_VERSION_CONFLICT / TARGET_ACCEPTANCE_CONFLICT，旧推荐/会话输入不改写。
 
 ## 6. 任务注册、外部调用与重启
 

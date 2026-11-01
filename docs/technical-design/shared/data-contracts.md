@@ -234,6 +234,8 @@
 | RecommendationReviewEvent.recommendation_id / previous_state / next_state | ID / ReviewState / ReviewState，R | 追加事件由 03 写，状态守卫见 state；不改推荐内容 |
 | RecommendationReviewEvent.affected_refs / reason / new_package_id | KnowledgeRecordRef[] / string / ID?，R | 仅记录有依据的影响；新包关系未知时可 null 并说明 |
 
+TargetProposal 是包含 EntityHeader 的持久对象，作为推荐内容一并保存；TargetAcceptance.proposal_id 与 PlaySession.target_proposal_ref 指其 id，不能指列表位置或新生成的同值对象。目标接受、偏好声明的模块局部输入见 C4/05；通用错误码在 error 唯一定义。
+
 推荐侧替代差异不复用要求 base_applied_id 的 ChangeSet：玩家尚未采用时没有实际配置基线。采用后如需执行替代差异，应先以实际配置实例化新的 ChangeSet 并重新校验；不能假设当前配置等于主推荐。
 
 ### 5.2 实际采用与观测
@@ -298,6 +300,8 @@
 
 `TestProtocol` 为版本对象（04 所有），含 `game_id:ID,scenario:FieldValue<string>,conditions:RunConditions,controlled_variables:string[],metric_definition_ids:ID[],warmup_seconds:float?,sample_duration_seconds:float?,repeat_count:int?,note:string`（均 R）。时长非负、样本时长若有须>0、重复数若有须>=1；自然游玩或未规定项可 null，note 说明范围，不把原稿建议 60—120 秒/3 次写成通用充分性保证。该协议描述计划，实际 run_conditions 仍须逐轮核对；ComparisonProtocol 单独定义长帧比较口径。
 
+历史日志人工关联使用04 §4.3的局部请求，由后台构造TimeMapping与StreamSelection；不改变LogImportInput的旧载荷。既有段关联须核对会话/段/绑定修订，新增artifact不能改旧映射。独立历史日志可在有实际开始时间依据时直接登记ended的PlaySession/SessionSegment及闭合初绑定；created_at表示登记时间，started_at/ended_at表示有来源的过去事实。初始applied_id=null/unverified，后补配置另按历史登记/绑定守卫，不能从当前采用反推。声明manifest用artifact EvidenceRef追溯，未核验的用户对应关系不升为系统观测。
+
 ### 6.2 统计与比较
 
 | 对象/字段 | 类型与必填/默认 | 约束 |
@@ -317,6 +321,8 @@
 | PerformanceComparison.summary_ids / protocol_id | ID[2] / ID，R | 两个不同摘要；引用协议具体版本而非“当前默认” |
 | PerformanceComparison.level / per_metric / checks / limitations | ComparabilityLevel / MetricComparison[] / CheckResult[] / string[]，R | 一项不可比不隐藏其他观察；controlled 不等于统计显著或改善 |
 | MetricComparison | `{metric_definition_id:ID,status:CheckStatus,left:MetricValue?,right:MetricValue?,delta:MetricValue?,reason:string?}` | 全字段 R；未知或不可比时 delta=null 并说明，不能计算伪改善比例 |
+
+ComparisonProtocol的创建/默认展开/派生阈值计算与冻结由04 §4.2的CreateComparisonProtocolRequest定义，07只绑定路由。创建时保存不可变具体版本、后台frozen_at与固定基线/规则引用；修改需新协议，不改旧版本。探索性与冻结先后守卫用于新建比较，历史载荷/响应不改写；客户端不能自报冻结时刻或以exploratory=false代替时序检查。
 
 原始 04 简称 Session，在共享模型中统一为 PlaySession；公共来源的 Comparison 仍是旧采集关系类型，不能混同 PerformanceComparison。本地统计不新写入公共 Evidence 的 local_measurement origin；若未来公开化需另行授权/脱敏流程。
 
@@ -484,7 +490,7 @@ response_body 只含受控 ID/状态及错误包，不保存未经清洗的请�
 | B-DAT-03 / A04、D01 | 实际 A 含推荐外自定义值，C 只改一项，当前已被别处推进 | 合并差异并提交过期 expected_current | 无静默覆盖；409；成功路径完整保留未改项/未知与正确父链 | 内存领域夹具，后续用临时 DB；不需游戏 |
 | B-DAT-04 / D03、D04 | applied=null 的旧区段，之后确认当前配置 | 保存回答，再尝试把新当前值当过去依据绑定 | 会话可保存；无当时依据则不绑定；有历史依据则追加 binding_revision，旧摘要不变 | 时段与回答夹具；不需真实环境 |
 | B-DAT-05 / A09 | 旧 lower_bound 无严格性，另有区间 FPS 与 HDR 检测 | 导入并请求严格边界过滤 | 原载荷不变；严格性 unknown，过滤受限；区间不求均值、观察不变开关建议 | 旧 Schema 固定夹具；不需真实环境 |
-| B-DAT-06 / D05 | 两摘要使用不同绑定/阈值，另有零有效时长 | 建比较协议并校验输入 | 明确具体绑定/协议；零分母不除零；不能同口径重算则仅相应指标降级 | 人工时间序列；真实工具格式验证留 C3 |
+| B-DAT-06 / D05 | 两摘要使用不同绑定/阈值，另有零有效时长 | 建比较协议并校验输入 | 明确具体绑定/协议；零分母不除零；不能同口径重算则仅相应指标降级 | 人工时间序列；真实工具格式按 PERF-T01 另验 |
 | B-DAT-07 / A12、A13 | 无基线文字反馈；另有接受但未测和更快但拒绝 | 生成下一动作/Outcome | 无假 ChangeSet/回滚值；接受与效果字段独立，不假造实测变化 | 反馈/模型输出桩；不需真实环境 |
 | B-DAT-08 / A05 | 冻结导入缺文件或复制期间来源改变 | 校验 manifest 与引用，再请求发布 | 保留诊断原件，未发布，推荐不可用；不能导出伪成功包 | 临时文件与 DB；不需网络 |
 | B-DAT-09 / 历史一致性、D05 | 旧摘要已固定 segment_revision；随后更正场景/排除范围 | 保存新段修订，再读旧摘要并以旧段版本提交绑定 | 旧元数据与旧统计仍可复现；绑定提交冲突；新分析显式引用新段修订 | 版本/时间区间夹具；不需真实环境 |

@@ -70,7 +70,9 @@ GET 只查询已存在资源，不生成持久比较或导出文件；比较/导
 | RESOURCE_GONE / not_found | 410 | 资源受控清理且保留墓碑；旧键不复活结果 | none；view_saved_results/create_new_task |
 | IDEMPOTENCY_CONFLICT / conflict | 409 | 同作用域 key、不同规范请求 hash；不执行新输入 | refresh_then_new_submission；edit_input |
 | CURRENT_CONFIGURATION_CONFLICT / conflict | 409 | expected_current_applied_id 不等于当前；不创建采用版本/声明、不推进指针 | refresh_then_new_submission；review_configuration |
-| BINDING_REVISION_CONFLICT / conflict | 409 | expected_segment_revision、expected_binding_revision 或历史登记 segment_ref 中相应修订旧；field_errors 标明具体维度，不登记历史配置或追加绑定；先前独立提交的历史事实仍保留 | refresh_then_new_submission；view_saved_results |
+| PREFERENCE_VERSION_CONFLICT / conflict | 409 | 偏好族 expected_current_id 已过时；不创建偏好版本/声明，返回当前 Preference 引用 | refresh_then_new_submission；view_saved_results/edit_input |
+| TARGET_ACCEPTANCE_CONFLICT / conflict | 409 | 同会话/目标的 supersedes_id 不是当前接受声明；不覆盖或新增冲突声明，返回当前 TargetAcceptance 引用 | refresh_then_new_submission；view_saved_results/edit_input |
+| BINDING_REVISION_CONFLICT / conflict | 409 | expected_segment_revision、expected_binding_revision、历史登记 segment_ref 或04日志关联 expected_session_revision 中相应修订旧；field_errors 标明具体维度，不登记历史配置、关联artifact或追加绑定；先前独立提交的历史事实仍保留 | refresh_then_new_submission；view_saved_results |
 | INFORMATION_REQUEST_VERSION_CONFLICT / conflict | 409 | 仅请求 version 旧，上下文仍有效；无状态变更 | refresh_then_new_submission；read_information_request |
 | INFORMATION_CONTEXT_CHANGED / conflict | 409 | 上下文已失效；必要时原子保存 superseded/替代问题或解除等待 | refresh_then_new_submission；read_information_request/read_task |
 | TASK_STATE_CONFLICT / conflict | 409 | 对不允许状态执行恢复/绑定等；终态取消另按幂等无操作返回当前终态 | none；read_task/view_saved_results |
@@ -206,5 +208,6 @@ expected_revision/current_revision 为 null 是因为本操作按不可变 appli
 | B-ERR-08 / 领域与错误分离 | 任务产 blocked 推荐与 failed 任务各一例 | 查询两个已有任务，再查不存在 ID | 已有任务均 200 且保留不同领域/执行结果；不存在 404；不隐式重跑 | 任务夹具；不需真实环境 |
 | B-ERR-09 / D03、D04：历史登记去重 | 当前 B，旧段 A 的登记已提交但响应丢失；另有过时 segment_ref | 原 key 重送历史登记，再以新 key 补绑；提交过时登记 | 原 key 返回同 A/声明，当前 B 不变；补绑独立去重；过时登记返回 BINDING_REVISION_CONFLICT，无部分写入 | 历史/版本夹具与临时 DB；不需游戏 |
 | B-ERR-10 / A06、D02：无检查点恢复边界 | interrupted 父任务 checkpoint=null；另有外来检查点和父任务未知调用 | 分别提交恢复，再重试原 key | 合法恢复返回同新 task/parent；外来检查点 REFERENCE_INVALID；未知调用仍适用 CALL_OUTCOME_UNKNOWN，不因 null 自动重发 | 调用桩/临时 DB；不需网络 |
+| B-ERR-11 / 偏好与目标并发 | 两页同偏好当前ID/同目标supersedes | 并发更正/撤回或接受/拒绝，再以原key重试 | 仅一方推进当前意向，另一方对应专用409；历史不覆盖，成功响应同key去重 | 声明夹具/临时DB；不需真实环境 |
 
 静态检查须同时核对 data 的 MutationContext/IdempotencyRecord、state 的终态/未知窗口以及本篇 retry_policy。完整页面文案、错误到按钮的映射和逐操作接口验收在 C5/06/07/08 展开。

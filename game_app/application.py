@@ -20,11 +20,13 @@ class Application:
         self,
         repository: ProductRepository,
         *,
+        file_root: str,
         provider: Any | None = None,
-        file_root: str | None = None,
     ) -> None:
+        # A managed-file root is required: provider calls must persist their
+        # original response before a call may be recorded as succeeded.
         self.repository = repository
-        self.files = None if file_root is None else FileService(repository, file_root)
+        self.files = FileService(repository, file_root)
         self.tasks = TaskService(repository, provider=provider, files=self.files)
 
     def register_task(

@@ -144,6 +144,14 @@ class FileService:
             hooks.before_commit()
 
         with self.repository.unit_of_work() as uow:
+            # A concurrent submission of the same key may have committed while
+            # this one was staging: replay its response instead of re-running.
+            winner = self._replay_committed(
+                uow, user_scope_id, method, canonical_route, key,
+                request_schema_version, request_hash,
+            )
+            if winner is not None:
+                return winner
             # Re-verify inside the publishing transaction: a file that changed
             # between staging and commit must not become consumable.
             for entry, file_id in zip(operation.manifest.entries, operation.file_ids):
@@ -339,6 +347,9 @@ class FileService:
                         entries.append(_entry_for(
                             destination / relative, relative, _media_type(relative)
                         ))
+            # The manifest alone cannot prove completeness: every file the
+            # backed-up database publishes must exist and still match its hash.
+            entries.extend(self._verify_referenced_files(database_copy, destination))
         except OSError as error:
             raise ContractError(
                 ErrorCode.STORAGE_COMMIT_FAILED, "the backup could not be written"
@@ -349,6 +360,69 @@ class FileService:
             encoding="utf-8",
         )
         return destination
+
+    # -- internals ------------------------------------------------------------
+    def _replay_committed(
+        self,
+        uow: UnitOfWork,
+        user_scope_id: str,
+        method: str,
+        canonical_route: str,
+        key: str,
+        request_schema_version: str,
+        request_hash: str,
+    ) -> PublishResult | None:
+        record = uow.find_idempotency(user_scope_id, method, canonical_route, key)
+        if record is None:
+            return None
+        if record.lifecycle.value == "tombstoned":
+            raise ContractError(
+                ErrorCode.RESOURCE_GONE,
+                "this file submission was cleaned up; start a new logical submission",
+            )
+        if (
+            record.request_schema_version != request_schema_version
+            or record.request_hash != request_hash
+        ):
+            raise ContractError(
+                ErrorCode.IDEMPOTENCY_CONFLICT,
+                "the same key was already used for different file content or contract version",
+                field_errors=[FieldError(
+                    path="idempotency_key", code="conflict", message="different request hash",
+                )],
+            )
+        body = json.loads(record.response_body)
+        return PublishResult(
+            operation_id=body["operation_id"],
+            file_ids=list(body["file_ids"]),
+            refs=list(body["refs"]),
+            status_code=record.response_status,
+            body=body,
+        )
+
+    def _verify_referenced_files(
+        self, database_copy: Path, destination: Path
+    ) -> list[FileEntry]:
+        verified: list[FileEntry] = []
+        with sqlite3.connect(database_copy) as conn:
+            rows = conn.execute(
+                "SELECT id, payload FROM objects WHERE entity_type='ManagedFile'"
+            ).fetchall()
+        for file_id, payload in rows:
+            data = json.loads(payload)
+            if data.get("file_status") != PublicationStatus.published.value:
+                continue
+            entry = FileEntry.model_validate(data["manifest"])
+            copied = destination / data["relative_path"]
+            try:
+                _verify_file(copied, entry)
+            except ContractError as error:
+                raise ContractError(
+                    ErrorCode.STORAGE_COMMIT_FAILED,
+                    f"backup is incomplete: published file {file_id} is missing or changed",
+                ) from error
+            verified.append(_entry_for(copied, data["relative_path"], entry.media_type))
+        return verified
 
     # -- internals ------------------------------------------------------------
     def _replay(
@@ -463,7 +537,13 @@ class FileService:
         for name in sorted(material):
             data = material[name]
             path = staging / name
-            _write_private(path, data)
+            try:
+                _write_private(path, data)
+            except OSError as error:
+                raise ContractError(
+                    ErrorCode.STORAGE_COMMIT_FAILED,
+                    "staged files could not be written; nothing was published",
+                ) from error
             entries.append(FileEntry(
                 relative_name=name,
                 byte_length=len(data),
@@ -548,14 +628,7 @@ def _materialise(files: Mapping[str, bytes]) -> dict[str, bytes]:
         raise ContractError(ErrorCode.INPUT_VALIDATION_FAILED, "at least one file is required")
     material: dict[str, bytes] = {}
     for name, data in files.items():
-        pure = Path(name)
-        if (
-            not name
-            or pure.is_absolute()
-            or ".." in pure.parts
-            or "\\" in name
-            or name != pure.as_posix()
-        ):
+        if not _is_safe_relative_name(name):
             raise ContractError(
                 ErrorCode.INPUT_VALIDATION_FAILED,
                 "managed file names must be relative POSIX names inside the managed root",
@@ -565,6 +638,23 @@ def _materialise(files: Mapping[str, bytes]) -> dict[str, bytes]:
             raise ContractError(ErrorCode.INPUT_VALIDATION_FAILED, "file content must be bytes")
         material[name] = bytes(data)
     return material
+
+
+def _is_safe_relative_name(name: str) -> bool:
+    """Reject anything that could resolve outside the managed root.
+
+    ``Path("C:x.json")`` is not absolute on Windows but joins to a drive-relative
+    path, so a drive prefix or any colon is refused explicitly rather than
+    relying on ``is_absolute``.  Empty, ``.`` and ``..`` segments, backslashes
+    and non-normalised names are refused too.
+    """
+    if not isinstance(name, str) or not name or ":" in name or "\\" in name:
+        return False
+    pure = Path(name)
+    if pure.is_absolute() or pure.drive or pure.as_posix() != name:
+        return False
+    parts = name.split("/")
+    return all(part not in ("", ".", "..") for part in parts)
 
 
 def _write_private(path: Path, data: bytes) -> None:

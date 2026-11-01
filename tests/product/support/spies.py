@@ -28,6 +28,14 @@ class SpyProvider:
         if self.mode == "unknown":
             # Simulates "the request may have reached the provider".
             raise TimeoutError("simulated provider timeout")
+        if self.mode == "boom":
+            # A wrapper exception that proves nothing about delivery.
+            raise RuntimeError("simulated adapter wrapper failure")
+        if self.mode == "reject":
+            from game_app.tasks import ProviderRejected
+
+            # An explicit provider response proving the request did not run.
+            raise ProviderRejected("simulated provider rejection")
         return {
             "provider_request_id": f"stub-{self.sends}",
             "returned_model": "stub-model-1",

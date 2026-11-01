@@ -34,8 +34,19 @@ def _knowledge_input(game_context: str | None = None, *, model_calls: int = 2) -
     }
 
 
+def _invoke_model(ctx, prompt: str = "synthetic") -> dict:
+    return ctx.invoke_provider(
+        kind="model",
+        requested_model="stub-model",
+        prompt_version="prompt-v1",
+        output_schema_version="schema-v1",
+        payload={"prompt": prompt},
+    )
+
+
 def _service(repo, provider=None) -> TaskService:
-    return TaskService(repo, provider=provider or SpyProvider())
+    files = FileService(repo, repo.path.parent / "managed")
+    return TaskService(repo, provider=provider or SpyProvider(), files=files)
 
 
 def _task_row(repo, task_id: str):
@@ -244,7 +255,7 @@ def test_in_flight_and_budget_are_persisted_before_the_provider_call(repo_factor
     service = _service(repo, provider)
 
     def handler(ctx):
-        ctx.invoke_provider(payload={"prompt": "synthetic"})
+        _invoke_model(ctx)
         return HandlerOutcome.completed()
 
     service.handlers["knowledge"] = handler
@@ -263,7 +274,7 @@ def test_provider_timeout_records_unknown_without_retry(repo_factory):
     service = _service(repo, provider)
 
     def handler(ctx):
-        ctx.invoke_provider(payload={"prompt": "synthetic"})
+        _invoke_model(ctx)
         return HandlerOutcome.completed()
 
     service.handlers["knowledge"] = handler
@@ -305,7 +316,7 @@ def test_resume_does_not_resend_when_parent_has_unknown_call(repo_factory):
     service = _service(repo, provider)
 
     def handler(ctx):
-        ctx.invoke_provider(payload={"prompt": "synthetic"})
+        _invoke_model(ctx)
 
     service.handlers["knowledge"] = handler
     parent = service.register_task(_knowledge_input(model_calls=1), _ctx("k1"))
@@ -378,7 +389,7 @@ def test_provider_response_is_published_as_a_managed_original(repo_factory, tmp_
     service = TaskService(repo, provider=SpyProvider(), files=files)
 
     def handler(ctx):
-        ctx.invoke_provider(payload={"prompt": "synthetic"})
+        _invoke_model(ctx)
         return HandlerOutcome.completed()
 
     service.handlers["knowledge"] = handler
@@ -403,7 +414,7 @@ def test_response_storage_failure_leaves_the_call_unknown(repo_factory, tmp_path
     monkeypatch.setattr(files, "store_artifact", storage_failure)
 
     def handler(ctx):
-        ctx.invoke_provider(payload={"prompt": "synthetic"})
+        _invoke_model(ctx)
         return HandlerOutcome.completed()
 
     service.handlers["knowledge"] = handler
@@ -414,3 +425,189 @@ def test_response_storage_failure_leaves_the_call_unknown(repo_factory, tmp_path
     assert call["call_state"] == "outcome_unknown"
     assert call["response_file_id"] is None
     assert service.get_task(accepted.task_id).task.last_error_code == "CALL_OUTCOME_UNKNOWN"
+
+
+# --- review fix pass ---------------------------------------------------------
+
+
+def test_non_builtin_provider_error_is_unknown_and_blocks_resume(repo_factory):
+    """A wrapper exception after transmission must not be treated as known failure."""
+    repo = repo_factory()
+    provider = SpyProvider(mode="boom")
+    service = _service(repo, provider)
+
+    def handler(ctx):
+        _invoke_model(ctx)
+        return HandlerOutcome.completed()
+
+    service.handlers["knowledge"] = handler
+    parent = service.register_task(_knowledge_input(model_calls=1), _ctx("k1"))
+    assert service.run_once().state.value == "partial"
+
+    call = _calls(repo, parent.task_id)[0]
+    assert call["call_state"] == "outcome_unknown"
+    assert service.get_task(parent.task_id).task.last_error_code == "CALL_OUTCOME_UNKNOWN"
+
+    service.resume_task(
+        {"parent_task_id": parent.task_id, "checkpoint_id": None, "budget": {"max_model_calls": 2}},
+        _ctx("k-resume"),
+    )
+    assert service.run_once().state.value == "partial"
+    assert provider.sends == 1
+
+
+def test_explicit_provider_rejection_is_a_known_failure(repo_factory):
+    from game_app.tasks import ProviderRejected
+
+    repo = repo_factory()
+    provider = SpyProvider(mode="reject")
+    service = _service(repo, provider)
+
+    def handler(ctx):
+        _invoke_model(ctx)
+        return HandlerOutcome.completed()
+
+    service.handlers["knowledge"] = handler
+    parent = service.register_task(_knowledge_input(model_calls=1), _ctx("k1"))
+    outcome = service.run_once()
+
+    assert outcome.state.value == "failed"
+    assert _calls(repo, parent.task_id)[0]["call_state"] == "failed_known"
+    assert service.get_task(parent.task_id).task.last_error_code == "PROVIDER_FAILED"
+    assert ProviderRejected is not None
+    assert provider.sends == 1
+
+
+def test_model_calls_require_prompt_and_schema_versions(repo_factory):
+    repo = repo_factory()
+    provider = SpyProvider()
+    service = _service(repo, provider)
+
+    def handler(ctx):
+        ctx.invoke_provider(kind="model", payload={"prompt": "synthetic"})
+        return HandlerOutcome.completed()
+
+    service.handlers["knowledge"] = handler
+    accepted = service.register_task(_knowledge_input(model_calls=1), _ctx())
+    service.run_once()
+
+    assert provider.sends == 0
+    assert service.get_task(accepted.task_id).task.last_error_code == "INPUT_VALIDATION_FAILED"
+    with repo.unit_of_work() as uow:
+        assert uow.query("SELECT COUNT(*) AS n FROM external_calls")[0]["n"] == 0
+
+
+def test_model_call_audit_records_prompt_and_schema_versions(repo_factory):
+    repo = repo_factory()
+    service = _service(repo, SpyProvider())
+
+    def handler(ctx):
+        _invoke_model(ctx)
+        return HandlerOutcome.completed()
+
+    service.handlers["knowledge"] = handler
+    accepted = service.register_task(_knowledge_input(model_calls=1), _ctx())
+    assert service.run_once().state.value == "completed"
+
+    call = _calls(repo, accepted.task_id)[0]
+    assert call["requested_model"] == "stub-model"
+    assert call["prompt_version"] == "prompt-v1"
+    assert call["output_schema_version"] == "schema-v1"
+
+
+def test_provider_call_without_a_managed_file_store_is_refused(repo_factory):
+    repo = repo_factory()
+    provider = SpyProvider()
+    service = TaskService(repo, provider=provider)  # deliberately no FileService
+
+    def handler(ctx):
+        _invoke_model(ctx)
+        return HandlerOutcome.completed()
+
+    service.handlers["knowledge"] = handler
+    accepted = service.register_task(_knowledge_input(model_calls=1), _ctx())
+    service.run_once()
+
+    assert provider.sends == 0
+    assert service.get_task(accepted.task_id).task.last_error_code == "PRECONDITION_UNVERIFIED"
+    with repo.unit_of_work() as uow:
+        assert uow.query("SELECT COUNT(*) AS n FROM external_calls")[0]["n"] == 0
+
+
+def test_startup_interruption_records_the_process_exit_reason(repo_factory):
+    repo = repo_factory()
+    service = _service(repo)
+    accepted = service.register_task(_knowledge_input(), _ctx())
+    service.recover_on_startup()
+
+    task = service.get_task(accepted.task_id).task
+    assert task.state.value == "interrupted"
+    assert task.stop_reason is not None
+    assert task.stop_reason.kind == "execution"
+    assert task.stop_reason.code == "process_exit"
+
+
+def test_repeated_cancel_with_the_same_key_is_one_logical_submission(repo_factory):
+    repo = repo_factory()
+    service = _service(repo)
+    accepted = service.register_task(_knowledge_input(), _ctx())
+    first = service.cancel_task(accepted.task_id, _ctx("cancel-key"))
+    second = service.cancel_task(accepted.task_id, _ctx("cancel-key"))
+
+    assert first == second
+    with repo.unit_of_work() as uow:
+        events = uow.query(
+            "SELECT cause FROM task_events WHERE task_id=? ORDER BY sequence",
+            (accepted.task_id,),
+        )
+        revisions = uow.query(
+            "SELECT revision FROM tasks WHERE task_id=?", (accepted.task_id,)
+        )[0]["revision"]
+    assert [row["cause"] for row in events] == ["registered", "cancelled"]
+    assert revisions == 2
+    record = repo.find_idempotency(_uid(90), "POST", f"/api/tasks/{accepted.task_id}/cancel", "cancel-key")
+    assert record is not None and record.response_status == 200
+
+
+def test_cancel_retry_while_running_does_not_duplicate_the_control_event(repo_factory):
+    repo = repo_factory()
+    service = _service(repo)
+    accepted = service.register_task(_knowledge_input(), _ctx("k1"))
+    with repo.unit_of_work() as uow:
+        uow.execute(
+            "UPDATE tasks SET state='running', revision=2 WHERE task_id=?", (accepted.task_id,)
+        )
+        uow.execute(
+            "INSERT INTO task_events(task_id, sequence, input_revision, from_state, to_state,"
+            " cause, related_refs, active_elapsed_seconds, created_at)"
+            " VALUES(?, 2, 1, 'queued', 'running', 'started', '[]', 0, '2026-11-02T00:00:00+00:00')",
+            (accepted.task_id,),
+        )
+
+    service.cancel_task(accepted.task_id, _ctx("cancel-key"))
+    service.cancel_task(accepted.task_id, _ctx("cancel-key"))
+
+    with repo.unit_of_work() as uow:
+        causes = [
+            row["cause"] for row in uow.query(
+                "SELECT cause FROM task_events WHERE task_id=? ORDER BY sequence",
+                (accepted.task_id,),
+            )
+        ]
+        revision = uow.query(
+            "SELECT revision FROM tasks WHERE task_id=?", (accepted.task_id,)
+        )[0]["revision"]
+    assert causes.count("cancel_requested") == 1
+    assert revision == 3
+
+
+def test_same_cancel_key_with_a_different_task_conflicts(repo_factory):
+    repo = repo_factory()
+    service = _service(repo)
+    first = service.register_task(_knowledge_input(), _ctx("k1"))
+    second = service.register_task(_knowledge_input(_uid(2)), _ctx("k2"))
+    service.cancel_task(first.task_id, _ctx("cancel-key"))
+    # A cancel key is scoped to its canonical route, so another task's cancel
+    # with the same key is an independent submission and must still work.
+    service.cancel_task(second.task_id, _ctx("cancel-key"))
+    assert service.get_task(second.task_id).task.state.value == "cancelled"

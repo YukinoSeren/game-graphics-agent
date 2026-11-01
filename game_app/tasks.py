@@ -68,6 +68,14 @@ class BudgetExhausted(Exception):
     """The task cannot start another audited call within its budget."""
 
 
+class ProviderRejected(Exception):
+    """An explicit provider response proving the request did not execute.
+
+    Anything else raised out of a provider adapter is treated as unknown: after
+    ``in_flight`` there is no proof the request was not delivered.
+    """
+
+
 class UnknownCall(Exception):
     """The provider call may have been delivered; its outcome is unknown."""
 
@@ -147,9 +155,18 @@ class TaskContext:
         kind: str = "model",
         provider_name: str = "stub",
         payload: Mapping[str, Any] | None = None,
+        requested_model: str | None = None,
+        prompt_version: str | None = None,
+        output_schema_version: str | None = None,
     ) -> dict[str, Any]:
         return self.service._invoke(
-            self.task_id, kind=kind, provider_name=provider_name, payload=payload or {}
+            self.task_id,
+            kind=kind,
+            provider_name=provider_name,
+            payload=payload or {},
+            requested_model=requested_model,
+            prompt_version=prompt_version,
+            output_schema_version=output_schema_version,
         )
 
     def checkpoint(self, completed_steps: Sequence[str]) -> str:
@@ -266,13 +283,30 @@ class TaskService:
         )
 
     # -- control -----------------------------------------------------------
-    def cancel_task(self, task_id: str, context: MutationContext) -> ResourceResult:
+    def cancel_task(
+        self,
+        task_id: str,
+        context: MutationContext,
+        *,
+        request_schema_version: str = PRODUCT_CONTRACT_VERSION,
+        method: str = "POST",
+    ) -> ResourceResult:
+        route = f"/api/tasks/{task_id}/cancel"
+        request_hash = _control_hash(request_schema_version, method, route)
         with self.repository.unit_of_work() as uow:
+            replayed = self._replay_control(
+                uow, context, method, route, request_schema_version, request_hash
+            )
+            if replayed is not None:
+                return replayed
             row = self._task_row(uow, task_id)
             reference = ObjectRef(entity_type="TaskRun", entity_id=task_id)
             state = TaskState(row["state"])
             if state in TERMINAL_TASK_STATES:
-                return ResourceResult(refs=[reference])
+                result = ResourceResult(refs=[reference])
+                self._record_control(uow, context, method, route, request_schema_version,
+                                     request_hash, result)
+                return result
             now = self.clock()
             revision = row["revision"] + 1
             if state is TaskState.running:
@@ -281,7 +315,8 @@ class TaskService:
                     (revision, now, task_id),
                 )
                 self._append_event(
-                    uow, task_id, revision, row["current_input_revision"],
+                    uow, task_id, self._next_sequence(uow, task_id),
+                    row["current_input_revision"],
                     state, state, "cancel_requested",
                     active_elapsed=row["active_elapsed_seconds"],
                 )
@@ -293,11 +328,15 @@ class TaskService:
                     (revision, stop.model_dump_json(), now, task_id),
                 )
                 self._append_event(
-                    uow, task_id, revision, row["current_input_revision"],
+                    uow, task_id, self._next_sequence(uow, task_id),
+                    row["current_input_revision"],
                     state, TaskState.cancelled, "cancelled",
                     active_elapsed=row["active_elapsed_seconds"],
                 )
-            return ResourceResult(refs=[reference])
+            result = ResourceResult(refs=[reference])
+            self._record_control(uow, context, method, route, request_schema_version,
+                                 request_hash, result)
+            return result
 
     # -- startup recovery ---------------------------------------------------
     def recover_on_startup(self) -> list[str]:
@@ -315,11 +354,13 @@ class TaskService:
                 "SELECT * FROM tasks WHERE state IN ('queued', 'running')"
                 " ORDER BY created_at, rowid"
             )
+            stop = TaskStopReason(kind="execution", code="process_exit")
             for row in rows:
                 revision = row["revision"] + 1
                 uow.execute(
-                    "UPDATE tasks SET state='interrupted', revision=?, updated_at=? WHERE task_id=?",
-                    (revision, now, row["task_id"]),
+                    "UPDATE tasks SET state='interrupted', stop_reason=?, revision=?,"
+                    " updated_at=? WHERE task_id=?",
+                    (stop.model_dump_json(), revision, now, row["task_id"]),
                 )
                 self._append_event(
                     uow, row["task_id"], revision, row["current_input_revision"],
@@ -527,6 +568,14 @@ class TaskService:
                 error_code=ErrorCode.CALL_OUTCOME_UNKNOWN.value,
             )
             return RunOutcome(task_id=task_id, state=state)
+        except ProviderRejected:
+            state = self._finish(
+                task_id,
+                TaskState.failed,
+                stop_reason=TaskStopReason(kind="execution", code="provider_error"),
+                error_code=ErrorCode.PROVIDER_FAILED.value,
+            )
+            return RunOutcome(task_id=task_id, state=state)
         except BudgetExhausted:
             state = self._finish(
                 task_id,
@@ -662,11 +711,30 @@ class TaskService:
         kind: str,
         provider_name: str,
         payload: Mapping[str, Any],
+        requested_model: str | None = None,
+        prompt_version: str | None = None,
+        output_schema_version: str | None = None,
     ) -> dict[str, Any]:
         if kind not in _COUNTER_LIMITS:
             raise ContractError(
                 ErrorCode.INPUT_VALIDATION_FAILED,
                 f"unknown external call kind: {kind}",
+            )
+        if kind == "model" and not (prompt_version and output_schema_version):
+            raise ContractError(
+                ErrorCode.INPUT_VALIDATION_FAILED,
+                "model calls must record the prompt and output schema versions",
+                field_errors=[
+                    FieldError(path="prompt_version", code="required", message="missing"),
+                    FieldError(path="output_schema_version", code="required", message="missing"),
+                ],
+            )
+        if self.files is None:
+            # Without a managed-file store the original response could not be
+            # saved, and in_flight->succeeded requires a saved original.
+            raise ContractError(
+                ErrorCode.PRECONDITION_UNVERIFIED,
+                "provider calls require a managed file store for the original response",
             )
         call_id = new_id()
         request = {
@@ -693,9 +761,12 @@ class TaskService:
                 " provider, requested_model, returned_model, prompt_version, output_schema_version,"
                 " input_hash, intent_saved_at, sent_at, finished_at, provider_request_id,"
                 " response_file_id, usage, billing_state, error_code)"
-                " VALUES(?, ?, ?, ?, 'prepared', ?, NULL, NULL, NULL, NULL, ?, ?, NULL, NULL,"
+                " VALUES(?, ?, ?, ?, 'prepared', ?, ?, NULL, ?, ?, ?, ?, NULL, NULL,"
                 " NULL, NULL, NULL, 'not_reported', NULL)",
-                (call_id, task_id, row["current_input_revision"], kind, provider_name, input_hash, now),
+                (
+                    call_id, task_id, row["current_input_revision"], kind, provider_name,
+                    requested_model, prompt_version, output_schema_version, input_hash, now,
+                ),
             )
             updated = counters.model_copy(update={kind: getattr(counters, kind) + 1})
             uow.execute(
@@ -709,15 +780,8 @@ class TaskService:
 
         try:
             reply = self.provider.send(request)
-        except (TimeoutError, ConnectionError) as error:
-            with self.repository.unit_of_work() as uow:
-                uow.execute(
-                    "UPDATE external_calls SET call_state='outcome_unknown', finished_at=?,"
-                    " error_code='CALL_OUTCOME_UNKNOWN' WHERE call_id=?",
-                    (self.clock(), call_id),
-                )
-            raise UnknownCall(call_id) from error
-        except Exception as error:
+        except ProviderRejected as error:
+            # Only an explicit provider rejection proves the request did not run.
             with self.repository.unit_of_work() as uow:
                 uow.execute(
                     "UPDATE external_calls SET call_state='failed_known', finished_at=?,"
@@ -725,25 +789,32 @@ class TaskService:
                     (self.clock(), call_id),
                 )
             raise
-
-        response_file_id: str | None = None
-        if self.files is not None:
-            # The raw exchange is a managed original.  If it cannot be
-            # persisted, the call must stay unknown: the provider may have run.
-            try:
-                response_file_id = self.files.store_artifact(
-                    canonical_json({"request": request, "response": reply}),
-                    relative_name=f"calls/{call_id}.json",
-                    stable_key=f"call:{call_id}",
+        except BaseException as error:
+            # After in_flight there is no proof the request was not delivered.
+            with self.repository.unit_of_work() as uow:
+                uow.execute(
+                    "UPDATE external_calls SET call_state='outcome_unknown', finished_at=?,"
+                    " error_code='CALL_OUTCOME_UNKNOWN' WHERE call_id=?",
+                    (self.clock(), call_id),
                 )
-            except Exception as error:  # noqa: BLE001 - storage failure, not provider failure
-                with self.repository.unit_of_work() as uow:
-                    uow.execute(
-                        "UPDATE external_calls SET call_state='outcome_unknown', finished_at=?,"
-                        " error_code='STORAGE_COMMIT_FAILED' WHERE call_id=?",
-                        (self.clock(), call_id),
-                    )
-                raise UnknownCall(call_id) from error
+            raise UnknownCall(call_id) from error
+
+        # The raw exchange is a managed original.  If it cannot be persisted,
+        # the call must stay unknown: the provider may already have run.
+        try:
+            response_file_id: str | None = self.files.store_artifact(
+                canonical_json({"request": request, "response": reply}),
+                relative_name=f"calls/{call_id}.json",
+                stable_key=f"call:{call_id}",
+            )
+        except Exception as error:  # noqa: BLE001 - storage failure, not provider failure
+            with self.repository.unit_of_work() as uow:
+                uow.execute(
+                    "UPDATE external_calls SET call_state='outcome_unknown', finished_at=?,"
+                    " error_code='STORAGE_COMMIT_FAILED' WHERE call_id=?",
+                    (self.clock(), call_id),
+                )
+            raise UnknownCall(call_id) from error
 
         with self.repository.unit_of_work() as uow:
             uow.execute(
@@ -866,6 +937,75 @@ class TaskService:
             current = parent[0]["parent_id"] if parent else None
         return False
 
+    def _replay_control(
+        self,
+        uow: UnitOfWork,
+        context: MutationContext,
+        method: str,
+        route: str,
+        request_schema_version: str,
+        request_hash: str,
+    ) -> ResourceResult | None:
+        existing = uow.find_idempotency(
+            context.user_scope_id, method, route, context.idempotency_key
+        )
+        if existing is None:
+            return None
+        self._assert_replayable(existing, request_schema_version, request_hash)
+        return ResourceResult.model_validate(json.loads(existing.response_body))
+
+    def _record_control(
+        self,
+        uow: UnitOfWork,
+        context: MutationContext,
+        method: str,
+        route: str,
+        request_schema_version: str,
+        request_hash: str,
+        result: ResourceResult,
+    ) -> None:
+        uow.insert_idempotency(
+            user_scope_id=context.user_scope_id,
+            method=method,
+            canonical_route=route,
+            key=context.idempotency_key,
+            request_schema_version=request_schema_version,
+            request_hash=request_hash,
+            response_status=200,
+            response_body=canonical_json(result.model_dump(mode="json")),
+            result_refs=[ref.model_dump(mode="json") for ref in result.refs],
+        )
+
+    def _assert_replayable(
+        self,
+        existing: Any,
+        request_schema_version: str,
+        request_hash: str,
+    ) -> None:
+        if existing.lifecycle.value == "tombstoned":
+            raise ContractError(
+                ErrorCode.RESOURCE_GONE,
+                "this submission was cleaned up; start a new logical submission",
+            )
+        if existing.request_schema_version != request_schema_version:
+            raise ContractError(
+                ErrorCode.IDEMPOTENCY_CONFLICT,
+                "this key is registered under another contract version",
+                field_errors=[FieldError(
+                    path="X-Product-Contract-Version", code="conflict",
+                    message=f"registered as {existing.request_schema_version}",
+                )],
+            )
+        if existing.request_hash != request_hash:
+            raise ContractError(
+                ErrorCode.IDEMPOTENCY_CONFLICT,
+                "the same key was already used with different business content",
+                field_errors=[FieldError(
+                    path="idempotency_key", code="conflict",
+                    message="different request hash",
+                )],
+            )
+
     def _replay_if_registered(
         self,
         uow: UnitOfWork,
@@ -924,6 +1064,14 @@ def _validate_task_input(task_input: Any) -> Any:
                 for item in error.errors()
             ],
         ) from error
+
+
+def _control_hash(schema_version: str, method: str, route: str) -> str:
+    return hashlib.sha256(canonical_json({
+        "schema_version": schema_version,
+        "method": method,
+        "route": route,
+    })).hexdigest()
 
 
 def _request_hash(

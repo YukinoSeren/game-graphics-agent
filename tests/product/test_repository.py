@@ -339,3 +339,20 @@ def test_snapshots_require_expected_revision_and_keep_history(tmp_path):
     assert repo.get_snapshot("InformationRequest", entity, 1) == {"state": "open"}
     assert repo.get_snapshot("InformationRequest", entity, 2) == {"state": "resolved"}
     assert repo.get_head("InformationRequest", entity) == 2
+
+
+def test_duplicate_references_are_rejected_by_the_database(tmp_path):
+    repo = _repo(tmp_path)
+    game = _header(_uid(1), _uid(100), 1)
+    child = _header(_uid(2), _uid(200), 1)
+    target = ObjectRef(entity_type="Game", entity_id=game.id)
+    with repo.unit_of_work() as uow:
+        uow.insert_versioned("Game", game)
+        uow.insert_versioned("GameContext", child)
+        uow.insert_reference(child.id, "game", target)
+    with pytest.raises(ContractError):
+        with repo.unit_of_work() as uow:
+            uow.insert_reference(child.id, "game", target)
+    # A different relation to the same target remains legal.
+    with repo.unit_of_work() as uow:
+        uow.insert_reference(child.id, "mirror", target)

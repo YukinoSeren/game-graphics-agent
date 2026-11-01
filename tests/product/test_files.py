@@ -287,3 +287,89 @@ def test_backup_refuses_an_existing_destination(tmp_path):
     with pytest.raises(ContractError) as caught:
         service.backup(destination)
     assert caught.value.code is ErrorCode.STORAGE_COMMIT_FAILED
+
+
+# --- review fix pass ---------------------------------------------------------
+
+def test_windows_drive_prefixed_names_cannot_escape_the_managed_root(tmp_path):
+    repo = ProductRepository(tmp_path / "product.sqlite3")
+    repo.migrate()
+    service = FileService(repo, tmp_path / "managed")
+    for name in ("C:payload.json", "C:/payload.json", "C:\\payload.json"):
+        with pytest.raises(ContractError) as caught:
+            _publish(service, key=f"key-{len(name)}-{name[2]}", files={name: b"escape"})
+        assert caught.value.code is ErrorCode.INPUT_VALIDATION_FAILED
+    assert not (tmp_path / "payload.json").exists()
+
+
+def test_path_names_that_are_not_real_files_are_rejected(tmp_path):
+    repo = ProductRepository(tmp_path / "product.sqlite3")
+    repo.migrate()
+    service = FileService(repo, tmp_path / "managed")
+    for name in (".", "inputs/", "inputs//one.json"):
+        with pytest.raises(ContractError) as caught:
+            _publish(service, key=f"key-{name}", files={name: b"x"})
+        assert caught.value.code is ErrorCode.INPUT_VALIDATION_FAILED
+
+
+def test_staging_write_failure_uses_a_stable_storage_code(tmp_path, monkeypatch):
+    import game_app.files as files_module
+
+    repo = ProductRepository(tmp_path / "product.sqlite3")
+    repo.migrate()
+    service = FileService(repo, tmp_path / "managed")
+
+    def disk_full(_path, _data):
+        raise OSError("simulated disk full while staging")
+
+    monkeypatch.setattr(files_module, "_write_private", disk_full)
+    with pytest.raises(ContractError) as caught:
+        _publish(service)
+    assert caught.value.code is ErrorCode.STORAGE_COMMIT_FAILED
+
+
+def test_concurrent_first_publish_replays_the_committed_response(tmp_path):
+    import threading
+
+    repo = ProductRepository(tmp_path / "product.sqlite3")
+    repo.migrate()
+    service = FileService(repo, tmp_path / "managed")
+    writer_calls: list[str] = []
+
+    def writer(uow, operation, managed):
+        writer_calls.append(operation.operation_id)
+        return []
+
+    barrier = threading.Barrier(2)
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    def submit():
+        try:
+            barrier.wait(timeout=5)
+            results.append(_publish(service, writer=writer))
+        except BaseException as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=submit) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+
+    assert not errors
+    assert len({tuple(result.file_ids) for result in results}) == 1
+    assert len({result.operation_id for result in results}) == 1
+    assert len(writer_calls) == 1
+
+
+def test_backup_refuses_when_a_published_file_is_missing(tmp_path):
+    repo = ProductRepository(tmp_path / "product.sqlite3")
+    repo.migrate()
+    service = FileService(repo, tmp_path / "managed")
+    published = _publish(service)
+    (_objects_dir(service) / published.file_ids[0]).unlink()
+
+    with pytest.raises(ContractError) as caught:
+        service.backup(tmp_path / "backups" / "001")
+    assert caught.value.code is ErrorCode.STORAGE_COMMIT_FAILED

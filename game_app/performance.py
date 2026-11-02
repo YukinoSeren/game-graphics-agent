@@ -11,7 +11,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable, Mapping, Sequence
 from uuid import UUID, uuid5
@@ -45,7 +44,6 @@ from game_app.contracts.performance import (
     CreateTestProtocolRequest,
     EndSessionRequest,
     EndSegmentRequest,
-    ExistingLogTarget,
     HistoricalLogTarget,
     LogAssociationRequest,
     LogInspection,
@@ -1663,9 +1661,6 @@ class PerformanceService:
                     uow, segment, updated, session,
                     cause="segment_closed_for_log_association",
                 )
-            session_id = session.id
-            segment_id = segment.id
-
         artifact = CaptureArtifact(
             id=ids["artifact"],
             schema_version=PRODUCT_CONTRACT_VERSION,

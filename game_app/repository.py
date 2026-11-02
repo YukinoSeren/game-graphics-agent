@@ -23,6 +23,7 @@ from game_app.contracts.device import LocalSettingDefinition
 from game_app.contracts.enums import (
     ENTITY_TYPES,
     IdempotencyLifecycle,
+    StateDimension,
     TaskState,
 )
 from game_app.contracts.primitives import (
@@ -1202,6 +1203,68 @@ class UnitOfWork:
                     message=f"duplicate {record_type} record {local_record_id!r}",
                 )],
             ) from error
+
+    # -- domain events ------------------------------------------------------
+    def record_domain_event(
+        self,
+        *,
+        target_type: str,
+        target_id: str,
+        dimension: str,
+        next_state: str,
+        cause: str,
+        sequence: int = 1,
+        previous_state: str | None = None,
+        related_refs: Sequence[Any] = (),
+        created_at: str | None = None,
+    ) -> None:
+        """Append one real state event; an object born in a state has no previous.
+
+        Callers must not fabricate an intermediate state.  ``sequence=1`` with
+        ``previous_state=None`` is the only shape a creation event may take.
+        """
+        _require_type(target_type)
+        _require_id(target_id, "target_id")
+        try:
+            StateDimension(dimension)
+        except ValueError as error:
+            raise ContractError(
+                ErrorCode.INPUT_VALIDATION_FAILED,
+                f"unregistered state dimension: {dimension}",
+                field_errors=[FieldError(path="dimension", code="enum", message="unregistered")],
+            ) from error
+        if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
+            raise ContractError(
+                ErrorCode.INPUT_VALIDATION_FAILED, "a domain event sequence is at least 1"
+            )
+        if not isinstance(next_state, str) or not next_state:
+            raise ContractError(
+                ErrorCode.INPUT_VALIDATION_FAILED, "a domain event needs a next state"
+            )
+        if not isinstance(cause, str) or not cause:
+            raise ContractError(
+                ErrorCode.INPUT_VALIDATION_FAILED, "a domain event needs a cause"
+            )
+        refs = [
+            ref.model_dump(mode="json") if isinstance(ref, ObjectRef) else dict(ref)
+            for ref in related_refs
+        ]
+        self.connection.execute(
+            "INSERT INTO domain_events(target_type, target_id, dimension, sequence,"
+            " previous_state, next_state, cause, related_refs, created_at)"
+            " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                target_type,
+                target_id,
+                dimension,
+                sequence,
+                previous_state,
+                next_state,
+                cause,
+                canonical_json(refs).decode("utf-8"),
+                created_at or utc_now(),
+            ),
+        )
 
     # -- current applied pointer --------------------------------------------
     def current_applied(self, user_scope_id: str, installation_id: str) -> Any | None:

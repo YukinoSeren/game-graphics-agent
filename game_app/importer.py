@@ -1697,6 +1697,30 @@ class ImportPublisher:
                 self.clock(),
             ),
         )
+        # The snapshot is born in its final state: one creation event with no
+        # previous state.  No staging row is invented for the audit log.
+        related = [
+            ObjectRef(entity_type="ManagedFile", entity_id=declaration_file_id),
+            *(
+                ObjectRef(entity_type="ManagedFile", entity_id=file_id)
+                for file_id in frozen_file_ids
+            ),
+        ]
+        uow.record_domain_event(
+            target_type="ImportSnapshot",
+            target_id=snapshot_id,
+            dimension="publication",
+            sequence=1,
+            previous_state=None,
+            next_state=status.value,
+            cause=(
+                "import_published"
+                if status is PublicationStatus.published
+                else "import_rejected"
+            ),
+            related_refs=related,
+            created_at=self.clock(),
+        )
         return self._refs(uow, snapshot_id)
 
     # -- result reconstruction ---------------------------------------------
@@ -1848,9 +1872,11 @@ class ImportService:
                 ErrorCode.INPUT_VALIDATION_FAILED,
                 "the knowledge import handler received another task type",
             )
+        context.phase("extract")
         frozen = frozen_group_from_file_ids(
             self.files, task_input.file_ids, self.registry
         )
+        context.phase("validate")
         result = self.publisher.publish(
             frozen=frozen,
             game_context_id=task_input.game_context_id,

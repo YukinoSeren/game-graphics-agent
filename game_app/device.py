@@ -153,12 +153,14 @@ class DeviceService:
                     )],
                 )
 
+        context.phase("acquire")
         readings = self._read(paths)
         snapshot_id = new_id()
         artifacts = self._store_originals(snapshot_id, readings)
         snapshot, gpus_by_index, field_values = self._assemble(
             snapshot_id, paths, readings, artifacts
         )
+        context.phase("validate")
         request = self._plan_questions(
             context, task_input, snapshot, readings, gpus_by_index, field_values,
             stored_context,

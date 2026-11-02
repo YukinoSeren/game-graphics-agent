@@ -56,6 +56,11 @@ _BLOCKING_CALL_STATES = {
     ExternalCallState.in_flight.value,
     ExternalCallState.outcome_unknown.value,
 }
+# The phase vocabulary is owned by 07 §5; a handler never invents a new key.
+PHASES = frozenset({
+    "acquire", "collect", "extract", "validate",
+    "decide", "capture", "analyze", "finalize",
+})
 
 
 class _SuspendExecution(Exception):
@@ -192,6 +197,10 @@ class TaskContext:
     def checkpoint(self, completed_steps: Sequence[str]) -> str:
         return self.service.record_checkpoint(self.task_id, completed_steps)
 
+    def phase(self, key: str) -> None:
+        """Record a real phase the handler entered (from_state == to_state)."""
+        self.service._record_phase(self.task_id, key)
+
 
 class TaskService:
     def __init__(
@@ -280,7 +289,7 @@ class TaskService:
     def _view(self, uow: UnitOfWork, row: Any) -> TaskViewResult:
         task = self._task_from_row(row)
         events = uow.query(
-            "SELECT created_at, related_refs FROM task_events WHERE task_id=?"
+            "SELECT created_at, cause, related_refs FROM task_events WHERE task_id=?"
             " ORDER BY sequence",
             (task.id,),
         )
@@ -314,7 +323,7 @@ class TaskService:
             error=_error_envelope(task.last_error_code, task.id),
             result_refs=task.result_refs,
             progress=TaskProgress(
-                phase=_phase_for(task.state),
+                phase=_phase_for(task.state, events),
                 last_activity_at=events[-1]["created_at"] if events else None,
                 completed_steps=completed_steps,
             ),
@@ -662,7 +671,17 @@ class TaskService:
             )
             return RunOutcome(task_id=task_id, state=state)
 
-        handler = self.handlers.get(task_type.value) or (lambda ctx: HandlerOutcome.completed())
+        handler = self.handlers.get(task_type.value)
+        if handler is None:
+            # A missing handler is a wiring defect, never a business success.
+            # It must not masquerade as a completed task with no facts.
+            state = self._finish(
+                task_id,
+                TaskState.failed,
+                stop_reason=TaskStopReason(kind="execution", code="validation_failed"),
+                error_code=ErrorCode.INTERNAL_ERROR.value,
+            )
+            return RunOutcome(task_id=task_id, state=state)
         context = TaskContext(self, task_id)
         # Only calls that a *checkpoint inherited from the parent* already
         # completed may be reused; calls made during this run never are.
@@ -1046,6 +1065,27 @@ class TaskService:
         )[0]
         return int(row["last"]) + 1
 
+    def _record_phase(self, task_id: str, key: str) -> None:
+        if key not in PHASES:
+            raise ContractError(
+                ErrorCode.INPUT_VALIDATION_FAILED,
+                f"unregistered task phase: {key}",
+                field_errors=[FieldError(path="phase", code="enum", message="unregistered phase")],
+            )
+        with self.repository.unit_of_work() as uow:
+            row = self._task_row(uow, task_id)
+            state = TaskState(row["state"])
+            self._append_event(
+                uow,
+                task_id,
+                self._next_sequence(uow, task_id),
+                row["current_input_revision"],
+                state,
+                state,
+                f"phase:{key}",
+                active_elapsed=row["active_elapsed_seconds"],
+            )
+
     def _append_event(
         self,
         uow: UnitOfWork,
@@ -1358,7 +1398,14 @@ def _request_hash(
     })).hexdigest()
 
 
-def _phase_for(state: TaskState) -> str:
+def _phase_for(state: TaskState, events: Sequence[Any] = ()) -> str:
+    # The most recent real phase wins; otherwise fall back to the coarse state.
+    for event in reversed(list(events)):
+        cause = event["cause"]
+        if isinstance(cause, str) and cause.startswith("phase:"):
+            key = cause[len("phase:"):]
+            if key in PHASES:
+                return key
     if state is TaskState.queued:
         return "queued"
     if state is TaskState.waiting_input:

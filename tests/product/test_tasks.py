@@ -104,6 +104,7 @@ def test_retry_after_commit_returns_original_acceptance_and_current_state(repo_f
     repo = repo_factory()
     service = _service(repo)
     first = service.register_task(_knowledge_input(), _ctx())
+    service.handlers["knowledge"] = lambda ctx: HandlerOutcome.completed()
     outcome = service.run_once()
     assert outcome is not None and outcome.state.value == "completed"
 
@@ -777,3 +778,59 @@ def test_task_view_lists_a_question_returned_with_a_partial_result(repo_factory)
 
     view = service.get_task(accepted.task_id)
     assert view.task.information_request_ids == [_uid(703)]
+
+
+# --- 2D-A: phase events ------------------------------------------------------
+
+
+def test_a_phase_event_changes_the_reported_phase(repo_factory):
+    repo = repo_factory()
+    service = _service(repo)
+
+    def handler(ctx):
+        ctx.phase("validate")
+        return HandlerOutcome.completed()
+
+    service.handlers["knowledge"] = handler
+    accepted = service.register_task(_knowledge_input(), _ctx())
+    assert service.run_once().state.value == "completed"
+
+    view = service.get_task(accepted.task_id)
+    assert view.progress.phase == "validate"
+    with repo.unit_of_work() as uow:
+        causes = [
+            row["cause"] for row in uow.query(
+                "SELECT cause FROM task_events WHERE task_id=? ORDER BY sequence",
+                (accepted.task_id,),
+            )
+        ]
+    assert "phase:validate" in causes
+
+
+def test_without_a_phase_event_the_state_fallback_is_unchanged(repo_factory):
+    repo = repo_factory()
+    service = _service(repo)
+    accepted = service.register_task(_knowledge_input(), _ctx())
+    assert service.get_task(accepted.task_id).progress.phase == "queued"
+
+    service.handlers["knowledge"] = lambda ctx: HandlerOutcome.completed()
+    assert service.run_once().state.value == "completed"
+    assert service.get_task(accepted.task_id).progress.phase == "terminal"
+
+
+def test_phase_requires_a_registered_key(repo_factory):
+    repo = repo_factory()
+    service = _service(repo)
+
+    def handler(ctx):
+        ctx.phase("not-a-phase")
+        return HandlerOutcome.completed()
+
+    service.handlers["knowledge"] = handler
+    accepted = service.register_task(_knowledge_input(), _ctx())
+    outcome = service.run_once()
+
+    assert outcome.state.value == "failed"
+    assert service.get_task(accepted.task_id).task.last_error_code == "INPUT_VALIDATION_FAILED"
+    with repo.unit_of_work() as uow:
+        assert uow.query("SELECT COUNT(*) AS n FROM task_events WHERE cause LIKE 'phase:%'")[0]["n"] == 0

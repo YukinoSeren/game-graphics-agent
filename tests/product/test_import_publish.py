@@ -792,3 +792,99 @@ def test_knowledge_import_task_runs_without_a_provider(tmp_path):
     assert _count(repository, "ImportSnapshot") == 1
     with repository.unit_of_work() as uow:
         assert uow.query("SELECT COUNT(*) AS n FROM external_calls")[0]["n"] == 0
+
+
+# --- 2D-A: honest creation events and the losing submission's file ----------
+
+
+def _creation_events(repository, snapshot_id):
+    with repository.unit_of_work() as uow:
+        return uow.query(
+            "SELECT * FROM domain_events WHERE target_type='ImportSnapshot'"
+            " AND target_id=? ORDER BY sequence",
+            (snapshot_id,),
+        )
+
+
+def test_publishing_writes_one_creation_event_with_its_originals(tmp_path):
+    files, repository = _service(tmp_path)
+    context_id = _stored_context(repository)
+    group = _freeze(files, tmp_path, "event", _run_files(
+        records=[_record("cfg-0001", "configurations", {"name": "P", "settings": []})],
+    ))
+
+    result = _publish(_publisher(repository, files), group, key="k-1", context_id=context_id)
+
+    events = _creation_events(repository, result.snapshot_id)
+    assert len(events) == 1
+    event = events[0]
+    assert event["dimension"] == "publication"
+    assert event["sequence"] == 1
+    assert event["previous_state"] is None
+    assert event["next_state"] == result.status.value
+    assert event["cause"] == "import_published"
+    related = {ref["entity_id"] for ref in json.loads(event["related_refs"])}
+    assert result.declaration_file_id in related
+    assert set(group.file_ids.values()) <= related
+
+
+def test_a_rejected_import_writes_a_rejected_creation_event(tmp_path):
+    files, repository = _service(tmp_path)
+    context_id = _stored_context(repository)
+    members = _run_files(records=[])
+    members["records.json"] = b"not json at all\n"
+    group = _group(files, members, name="event-rejected")
+
+    result = _publish(_publisher(repository, files), group, key="k-1", context_id=context_id)
+
+    assert result.status is PublicationStatus.rejected
+    events = _creation_events(repository, result.snapshot_id)
+    assert len(events) == 1
+    assert events[0]["previous_state"] is None
+    assert events[0]["next_state"] == "rejected"
+    assert events[0]["cause"] == "import_rejected"
+    related = {ref["entity_id"] for ref in json.loads(events[0]["related_refs"])}
+    assert result.declaration_file_id in related
+    assert set(group.file_ids.values()) <= related
+
+
+def test_a_losing_concurrent_submission_declaration_is_locatable(tmp_path):
+    """Minor 15: the loser's declaration file is reachable via file_operations."""
+    files, repository = _service(tmp_path)
+    context_id = _stored_context(repository)
+    group = _freeze(files, tmp_path, "loser", _run_files(
+        records=[_record("cfg-0001", "configurations", {"name": "P", "settings": []})],
+    ))
+    publisher = _publisher(repository, files)
+    staged = threading.Event()
+    release = threading.Event()
+    first_result: list[ImportPublishResult] = []
+
+    def hold_before_commit():
+        staged.set()
+        assert release.wait(timeout=10)
+
+    def first_submission():
+        first_result.append(_publish(
+            publisher, group, key="k-first", context_id=context_id,
+            hooks=PublishHooks(before_commit=hold_before_commit),
+        ))
+
+    worker = threading.Thread(target=first_submission)
+    worker.start()
+    assert staged.wait(timeout=10)
+    # The second submission commits while the first waits before its commit.
+    second = _publish(publisher, group, key="k-second", context_id=context_id)
+    release.set()
+    worker.join(timeout=20)
+
+    assert len(first_result) == 1
+    assert first_result[0].snapshot_id == second.snapshot_id
+    assert _count(repository, "ImportSnapshot") == 1
+
+    loser = files.get_operation_by_key(
+        SCOPE, "POST", "/internal/knowledge-import-publish", "k-first"
+    )
+    assert loser is not None
+    assert loser.phase == "committed"
+    assert files.read_managed_file(loser.file_ids[0])

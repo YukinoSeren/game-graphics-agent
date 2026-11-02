@@ -335,7 +335,7 @@ class IdentityService:
     ) -> None:
         if request.installation_id is None:
             return
-        stored = uow.find_object("GameInstallation", request.installation_id)
+        stored = uow.latest_for_series("GameInstallation", request.installation_id)
         if stored is None:
             raise ContractError(
                 ErrorCode.REFERENCE_INVALID,

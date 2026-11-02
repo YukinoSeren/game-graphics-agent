@@ -1,19 +1,20 @@
-"""Game context and device contracts.
+"""Installation, local-catalog, context and device contracts (01).
 
 ``GameContext`` is defined here because 02's selection flow produces it; DEV-T02
-adds installation handling and DEV-T01 adds ``DeviceSnapshot``.  Fields follow
-``shared/data-contracts.md`` §3.2.
+adds installation registration and the local setting directory, DEV-T01 adds
+``DeviceSnapshot``.  Fields follow ``shared/data-contracts.md`` §3.2 and §4.3.
 """
 
 from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import field_validator, model_validator
 
-from game_app.contracts.common import CheckResult, FieldValue, Provenance
+from game_app.contracts.common import CheckResult, EvidenceRef, FieldValue, Provenance
 from game_app.contracts.primitives import (
     ID,
+    NonNegativeInt,
     Revision,
     Scalar,
     StrictModel,
@@ -140,4 +141,172 @@ __all__ = [
     "DisplayContext",
     "GpuSnapshot",
     "DeviceSnapshot",
+    "GameInstallation",
+    "InstallationCatalogQuery",
+    "InstallationChoice",
+    "InstallationChoicePage",
+    "CreateInstallationRequest",
+    "InstallationRegistration",
+    "LocalSettingDefinition",
+    "RegisterLocalSettingRequest",
+    "LocalSettingRegistration",
+    "LocalSettingChoice",
 ]
+
+
+# -- D-P01 installation registration -----------------------------------------
+
+class GameInstallation(StrictModel):
+    """One local installation; a second store or directory is another series.
+
+    ``series_id`` is the stable installation id.  Revisions are separate
+    objects in the same series, so an old context keeps a readable reference.
+    """
+
+    id: ID
+    schema_version: str
+    created_at: Timestamp
+    created_by_task_id: ID | None
+    series_id: ID
+    version: Revision
+    revision: Revision
+    user_scope_id: ID
+    game_id: ID
+    origin: Literal["system_probe", "user_provided"]
+    platform: FieldValue[str]
+    private_path_ref: ID | None
+
+    @model_validator(mode="after")
+    def revision_matches_version(self) -> "GameInstallation":
+        if self.revision != self.version:
+            raise ValueError("installation revision and object version are the same value")
+        return self
+
+
+class InstallationCatalogQuery(StrictModel):
+    game_id: ID
+    cursor: str | None
+    limit: NonNegativeInt = 20
+
+    @field_validator("limit")
+    @classmethod
+    def bounded(cls, value: int) -> int:
+        if not 1 <= value <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        return value
+
+
+class InstallationChoice(StrictModel):
+    installation_id: ID
+    revision: Revision
+    display_label: str
+    game_context_id: ID
+
+
+class InstallationChoicePage(StrictModel):
+    choices: list[InstallationChoice]
+    next_cursor: str | None
+
+
+class CreateInstallationRequest(StrictModel):
+    game_context_id: ID
+    display_label: str | None
+
+    @field_validator("display_label")
+    @classmethod
+    def label_is_not_blank(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("a display label is either null or non-blank")
+        return value
+
+
+class InstallationRegistration(StrictModel):
+    id: ID
+    schema_version: str
+    created_at: Timestamp
+    created_by_task_id: ID | None
+    input: CreateInstallationRequest
+    installation_id: ID
+    game_context_id: ID
+    declaration_file_id: ID
+
+
+# -- D-P02 local setting directory -------------------------------------------
+
+class LocalSettingDefinition(StrictModel):
+    """Versioned local catalog entry; it names a menu entry, never a value."""
+
+    id: ID
+    schema_version: str
+    created_at: Timestamp
+    created_by_task_id: ID | None
+    series_id: ID
+    version: Revision
+    parent_definition_id: ID | None
+    installation_id: ID
+    namespace: str
+    raw_name: str
+    menu_path: list[str]
+    evidence_refs: list[EvidenceRef]
+
+    @field_validator("raw_name")
+    @classmethod
+    def name_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("raw_name must not be blank")
+        return value
+
+    @field_validator("menu_path")
+    @classmethod
+    def path_parts_are_text(cls, value: list[str]) -> list[str]:
+        if any(not isinstance(part, str) or not part for part in value):
+            raise ValueError("menu_path holds non-empty strings")
+        return value
+
+
+class RegisterLocalSettingRequest(StrictModel):
+    installation_id: ID
+    raw_name: str
+    menu_path: list[str]
+    identity_mode: Literal["auto", "reuse", "distinct"]
+    reuse_local_setting_id: ID | None
+    supersedes_local_setting_id: ID | None
+    raw_text: str
+
+    @field_validator("raw_name")
+    @classmethod
+    def name_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("raw_name must not be blank")
+        return value
+
+    @field_validator("menu_path")
+    @classmethod
+    def path_parts_are_text(cls, value: list[str]) -> list[str]:
+        if any(not isinstance(part, str) or not part for part in value):
+            raise ValueError("menu_path holds non-empty strings")
+        return value
+
+
+class LocalSettingRegistration(StrictModel):
+    id: ID
+    schema_version: str
+    created_at: Timestamp
+    created_by_task_id: ID | None
+    input: RegisterLocalSettingRequest
+    definition_id: ID
+    declaration_file_id: ID
+
+
+class LocalSettingChoice(StrictModel):
+    definition_id: ID
+    series_id: ID
+    raw_name: str
+    menu_path: list[str]
+    location_known: bool
+
+    @model_validator(mode="after")
+    def location_flag_is_derived(self) -> "LocalSettingChoice":
+        if self.location_known != bool(self.menu_path):
+            raise ValueError("location_known is exactly whether a menu path is known")
+        return self

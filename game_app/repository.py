@@ -19,17 +19,14 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 from pydantic import BaseModel, ValidationError
 
+from game_app.contracts.device import LocalSettingDefinition
 from game_app.contracts.enums import (
     ENTITY_TYPES,
     IdempotencyLifecycle,
     TaskState,
 )
 from game_app.contracts.primitives import (
-    ID,
     ObjectRef,
-    Revision,
-    StrictModel,
-    Timestamp,
     new_id,
     utc_now,
 )
@@ -794,10 +791,11 @@ class UnitOfWork:
                     details=empty_details(),
                 )
 
-        payload = _LocalSettingRecord(
+        payload = LocalSettingDefinition(
             id=local_setting_id,
             schema_version="product-contract/0.4",
             created_at=utc_now(),
+            created_by_task_id=None,
             series_id=series_id,
             version=version,
             parent_definition_id=parent_definition_id,
@@ -1162,22 +1160,6 @@ class UnitOfWork:
                 ErrorCode.INPUT_VALIDATION_FAILED,
                 "this metric rule is already registered",
             ) from error
-
-
-class _LocalSettingRecord(StrictModel):
-    """Minimal LocalSettingDefinition payload until DEV-T02 owns the full DTO."""
-
-    id: ID
-    schema_version: str
-    created_at: Timestamp
-    series_id: ID
-    version: Revision
-    parent_definition_id: ID | None
-    installation_id: ID
-    namespace: str
-    raw_name: str
-    menu_path: list[str]
-    evidence_refs: list[dict[str, Any]]
 
 
 __all__ = [

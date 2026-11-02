@@ -286,6 +286,7 @@ def test_conflict_selection_resolves_the_value_and_keeps_old_evidence(tmp_path):
         series_id=_uid(601),
         version=1,
         device_series_id=_uid(602),
+        user_scope_id=USER,
         captured_at=utc_now(),
         gpus=[],
         selected_gpu_id=None,
@@ -340,8 +341,13 @@ def test_conflict_selection_resolves_the_value_and_keeps_old_evidence(tmp_path):
         uow.insert_versioned("DeviceSnapshot", snapshot)
         uow.insert_object("InformationRequest", request)
 
-    _answer(answers, request, answers={"device_form": "Laptop"},
+    _answer(answers, request, answers={"device_form": "ignored raw text"},
             selections={"device_form": 1})
+
+    response = _last_response(repository)
+    assert response["answers"]["device_form"] == "ignored raw text"
+    # The normalised value is the selected candidate, not the submitted text.
+    assert response["answered_values"] == {"device_form": "Laptop"}
 
     updated = _request(repository, request.id)
     field = updated.fields[0]
@@ -545,6 +551,10 @@ def test_answering_a_field_keeps_the_failed_attempt_history(tmp_path):
 
     after = _latest_snapshot(repository, before.series_id)
     assert after.device_form.value == "Desktop PC"
+    # The derived snapshot cites the response that produced the value.
+    assert after.device_form.attempts[-1].information_response_id == _last_response(
+        repository
+    )["id"]
     # The failed probe attempt is history: the answer appends to it.
     statuses = [attempt.status for attempt in after.device_form.attempts]
     assert statuses[0] is AcquisitionStatus.failed
@@ -888,3 +898,221 @@ def test_an_old_chain_without_a_root_snapshot_is_refused(tmp_path):
     assert caught.value.code is ErrorCode.PRECONDITION_UNVERIFIED
     with repository.unit_of_work() as uow:
         assert len(uow.iter_objects("InformationAmendment")) == 0
+
+
+# --- 2D-B: answers are consumed by a rerun -----------------------------------
+
+
+def _requeue(repository, task_id):
+    """Test-only scheduler nudge: put the same task back in the claim slot."""
+    with repository.unit_of_work() as uow:
+        row = uow.query("SELECT revision FROM tasks WHERE task_id=?", (task_id,))[0]
+        uow.execute(
+            "UPDATE tasks SET state='queued', revision=?, updated_at=? WHERE task_id=?",
+            (row["revision"] + 1, utc_now(), task_id),
+        )
+
+
+def _request_count(repository, task_id):
+    with repository.unit_of_work() as uow:
+        return sum(
+            1 for stored in uow.iter_objects("InformationRequest")
+            if stored.payload.get("source_task_id") == task_id
+            and stored.payload.get("continuation_mode") == "source_task"
+        )
+
+
+def _latest_source_request(repository, task_id):
+    with repository.unit_of_work() as uow:
+        rows = uow.query(
+            "SELECT id FROM objects WHERE entity_type='InformationRequest'"
+            " ORDER BY created_at DESC, rowid DESC"
+        )
+        for row in rows:
+            stored = uow.find_object("InformationRequest", row["id"])
+            if stored is None:
+                continue
+            request = InformationRequest.model_validate_json(stored.payload_bytes)
+            if (
+                request.source_task_id != task_id
+                or request.continuation_mode is not InformationContinuationMode.source_task
+            ):
+                continue
+            head = uow.get_head("InformationRequest", request.id)
+            if head is not None:
+                request = InformationRequest.model_validate_json(
+                    canonical_json(uow.get_snapshot("InformationRequest", request.id, head))
+                )
+            return request
+    return None
+
+
+def _last_response(repository):
+    with repository.unit_of_work() as uow:
+        return uow.iter_objects("InformationResponse")[-1].payload
+
+
+def test_answering_a_critical_field_lets_a_rerun_complete_without_reprobing(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU"}, failures={"device_form": "PROBE_FAILED"})
+    repository, files, device, tasks, answers, _ = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "device_form"])
+    tasks.run_once()
+    request = _request(repository, _request_ids(repository, accepted.task_id)[0])
+    _answer(answers, request, answers={"device_form": "Desktop PC"})
+    assert _task_row(repository, accepted.task_id)["state"] == "queued"
+    probe.calls.clear()
+
+    outcome = tasks.run_once()
+
+    assert outcome.state.value == "completed"
+    assert probe.calls == [["cpu"]]  # the answered path is not probed again
+    assert _request_count(repository, accepted.task_id) == 1
+    snapshot = _latest_snapshot(repository, _snapshot(repository, request).series_id)
+    assert snapshot.device_form.value == "Desktop PC"
+    assert any(
+        attempt.information_response_id for attempt in snapshot.device_form.attempts
+    )
+
+
+def test_a_partial_answer_without_cause_ref_is_consumed_on_a_rerun(tmp_path):
+    probe = StubProbe(
+        values={"cpu": "Example CPU"},
+        failures={
+            "gpus.0.raw_name": "PROBE_FAILED",
+            "device_form": "PROBE_FAILED",
+            "memory_bytes": "PROBE_FAILED",
+        },
+    )
+    repository, files, device, tasks, answers, _ = _env(tmp_path, probe)
+    accepted = _scan(
+        tasks, ["cpu", "gpus.0.raw_name", "device_form", "memory_bytes"]
+    )
+    tasks.run_once()
+    request = _request(repository, _request_ids(repository, accepted.task_id)[0])
+    _answer(answers, request, answers={"memory_bytes": 17179869184})
+    # The critical fields are still open, so the answer wrote no cause_ref and
+    # the task was not woken.
+    assert _task_row(repository, accepted.task_id)["state"] == "waiting_input"
+    probe.calls.clear()
+
+    _requeue(repository, accepted.task_id)
+    tasks.run_once()
+
+    assert probe.calls and "memory_bytes" not in probe.calls[0]
+    newest = _latest_source_request(repository, accepted.task_id)
+    assert {field.field_path for field in newest.fields} == {
+        "gpus.0.raw_name", "device_form",
+    }
+    snapshot = _latest_snapshot(repository, _snapshot(repository, request).series_id)
+    assert snapshot.memory_bytes.value == 17179869184
+
+
+def test_a_rerun_with_no_progress_does_not_ask_again(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU"}, failures={"device_form": "PROBE_FAILED"})
+    repository, files, device, tasks, answers, _ = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "device_form"])
+    tasks.run_once()
+    before = _request_count(repository, accepted.task_id)
+
+    _requeue(repository, accepted.task_id)
+    outcome = tasks.run_once()
+
+    assert outcome.state.value == "failed"
+    row = _task_row(repository, accepted.task_id)
+    assert row["last_error_code"] == "PRECONDITION_UNVERIFIED"
+    assert json.loads(row["stop_reason"]) == {
+        "kind": "execution", "code": "input_unresolved",
+    }
+    assert _request_count(repository, accepted.task_id) == before
+
+
+def test_the_response_states_what_it_answered_and_what_stayed_unresolved(tmp_path):
+    probe = StubProbe(
+        values={"cpu": "Example CPU"},
+        failures={"device_form": "PROBE_FAILED", "memory_bytes": "PROBE_FAILED"},
+    )
+    repository, files, device, tasks, answers, _ = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "device_form", "memory_bytes"])
+    tasks.run_once()
+    request = _request(repository, _request_ids(repository, accepted.task_id)[0])
+
+    _answer(
+        answers, request,
+        answers={"device_form": "Desktop PC", "memory_bytes": "16 GB"},
+    )
+
+    response = _last_response(repository)
+    assert response["answered_fields"] == ["device_form"]
+    assert response["unresolved_fields"] == ["memory_bytes"]
+    assert response["answered_values"] == {"device_form": "Desktop PC"}
+    # The player's words stay in answers; they never become a known value.
+    assert response["answers"]["memory_bytes"] == "16 GB"
+    assert set(response["answered_fields"]) & set(response["unresolved_fields"]) == set()
+
+
+def test_a_later_unresolved_answer_withdraws_the_earlier_value(tmp_path):
+    probe = StubProbe(
+        values={"cpu": "Example CPU"},
+        failures={"device_form": "PROBE_FAILED", "memory_bytes": "PROBE_FAILED"},
+    )
+    repository, files, device, tasks, answers, _ = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "device_form", "memory_bytes"])
+    tasks.run_once()
+    request = _request(repository, _request_ids(repository, accepted.task_id)[0])
+    _answer(answers, request, answers={"device_form": "Desktop PC"}, key="answer-1")
+    updated = _request(repository, request.id)
+    _answer(
+        answers, updated,
+        answers={"device_form": 123, "memory_bytes": 17179869184},
+        key="answer-2",
+    )
+
+    from game_app.tasks import TaskContext
+
+    answered = TaskContext(tasks, accepted.task_id).answered_values
+    assert "device_form" not in answered
+    assert answered["memory_bytes"].value == 17179869184
+
+    tasks.run_once()
+    newest = _latest_source_request(repository, accepted.task_id)
+    assert {field.field_path for field in newest.fields} == {"device_form"}
+
+
+def test_a_facts_only_answer_does_not_associate_with_the_source_task(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU"},
+                      failures={"gpus.0.raw_name": "PROBE_FAILED",
+                                "gpus.0.vram_bytes": "PROBE_FAILED"})
+    repository, files, device, tasks, answers, amendments = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "gpus.0.raw_name", "gpus.0.vram_bytes"])
+    tasks.run_once()
+    request = _request(repository, _request_ids(repository, accepted.task_id)[0])
+    _answer(
+        answers, request,
+        answers={"gpus.0.raw_name": "Synthetic GPU", "gpus.0.vram_bytes": 8},
+        key="answer-root",
+    )
+    resolved = _request(repository, request.id)
+    with repository.unit_of_work() as uow:
+        before = uow.query(
+            "SELECT COUNT(*) AS n FROM task_responses WHERE task_id=?", (accepted.task_id,)
+        )[0]["n"]
+    assert before == 1
+
+    amendment = amendments.create_information_amendment(
+        {
+            "source_request_id": resolved.id,
+            "expected_request_version": resolved.version,
+            "expected_context_revision": resolved.expected_context_revision,
+            "field_paths": ["gpus.0.raw_name"],
+            "reason": "clarify the GPU name",
+        },
+        _ctx("amend-task-response"),
+    )
+    new_request = _request(repository, amendment.refs[1].entity_id)
+    _answer(answers, new_request, answers={"gpus.0.raw_name": "Other GPU"}, key="answer-2")
+
+    with repository.unit_of_work() as uow:
+        after = uow.query(
+            "SELECT COUNT(*) AS n FROM task_responses WHERE task_id=?", (accepted.task_id,)
+        )[0]["n"]
+    assert after == before

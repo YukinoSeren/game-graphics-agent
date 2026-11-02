@@ -11,6 +11,7 @@ from game_app.adoption import AdoptionService
 from game_app.contracts.enums import (
     ActivationState,
     AppliedOrigin,
+    CheckStatus,
     ConfigurationRegistrationKind,
     ValueState,
 )
@@ -582,7 +583,7 @@ def test_two_definitions_from_one_series_are_refused_for_any_origin(tmp_path):
 
     assert caught.value.code is ErrorCode.LOCAL_SETTING_CONFLICT
     assert _count(repository, "AppliedConfiguration") == 0
-    assert service.get_current_applied(USER, installation_id) == (None, 0)
+    assert service.get_current_applied(USER, installation_id) == (None, None)
 
 
 def _store_imported_record(
@@ -851,7 +852,7 @@ def test_an_adoption_with_nothing_confirmed_is_refused(tmp_path):
 
     assert caught.value.code is ErrorCode.INPUT_VALIDATION_FAILED
     assert _count(repository, "AppliedConfiguration") == 0
-    assert service.get_current_applied(USER, installation_id) == (None, 0)
+    assert service.get_current_applied(USER, installation_id) == (None, None)
 
 
 def test_a_preset_only_adoption_is_legal(tmp_path):
@@ -960,3 +961,65 @@ def test_lost_response_after_commit_replays_the_same_ids(tmp_path):
     assert replayed.refs[1].entity_id == service.get_current_applied(
         USER, installation_id
     )[0]
+
+
+# --- 2D-B: snapshot ownership and unverified activation ---------------------
+
+
+def test_a_foreign_device_snapshot_cannot_be_adopted(tmp_path):
+    repository, files, installation_id, context_id, _device_id = setup(tmp_path)
+    foreign_id = store_raw(
+        repository, "DeviceSnapshot",
+        {"id": uid(104), "user_scope_id": "b" * 32},
+    )
+    definitions = Definitions(repository, installation_id)
+    definition, _ = definitions.new("甲")
+    service = _service(repository, files)
+
+    with pytest.raises(ContractError) as caught:
+        _adopt(
+            service,
+            adopt_request(
+                installation_id, context_id, foreign_id,
+                declared_settings=[declaration(definition, value=1)],
+            ),
+        )
+
+    assert caught.value.code is ErrorCode.RESOURCE_NOT_FOUND
+    assert _count(repository, "AppliedConfiguration") == 0
+    assert _count(repository, "ManagedFile") == 0
+
+
+def test_a_claimed_active_confirmation_stays_unverified_at_the_aggregate(tmp_path):
+    repository, files, installation_id, context_id, device_id = setup(tmp_path)
+    definitions = Definitions(repository, installation_id)
+    definition, _ = definitions.new("甲")
+    service = _service(repository, files)
+
+    result = _adopt(
+        service,
+        adopt_request(
+            installation_id, context_id, device_id,
+            declared_settings=[declaration(
+                definition, value=3, activation="active_confirmed",
+            )],
+        ),
+    )
+
+    applied = service.get_applied(result.refs[1].entity_id)
+    # The single setting keeps the player's declaration; the aggregate does not
+    # turn an unverified claim into confirmed activation.
+    assert applied.settings[0].activation_state is ActivationState.active_confirmed
+    assert applied.activation_state is ActivationState.unknown
+    check = next(item for item in applied.checks if item.check_id == "applied.activation")
+    assert check.status is CheckStatus.unknown
+
+
+def test_get_current_applied_without_a_pointer_returns_two_nones(tmp_path):
+    repository, files, installation_id, _context_id, _device_id = setup(tmp_path)
+    service = _service(repository, files)
+
+    applied_id, revision = service.get_current_applied(USER, installation_id)
+
+    assert applied_id is None
+    assert revision is None

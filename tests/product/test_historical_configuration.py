@@ -234,7 +234,7 @@ def test_two_historical_registrations_are_separate_families(tmp_path):
     right = service.get_applied(second.refs[1].entity_id)
     assert left.series_id != right.series_id
     assert left.version == right.version == 1
-    assert service.get_current_applied(USER, installation_id) == (None, 0)
+    assert service.get_current_applied(USER, installation_id) == (None, None)
 
 
 def test_artifact_evidence_hash_must_match_the_managed_file(tmp_path):

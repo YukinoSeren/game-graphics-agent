@@ -75,7 +75,10 @@ def setup(tmp_path: Path):
         "installation_id": installation_id,
         "game_id": GAME_ID,
     })
-    device_id = store_raw(repository, "DeviceSnapshot", {"id": uid(103)})
+    device_id = store_raw(repository, "DeviceSnapshot", {
+        "id": uid(103),
+        "user_scope_id": USER,
+    })
     return repository, files, installation_id, context_id, device_id
 
 

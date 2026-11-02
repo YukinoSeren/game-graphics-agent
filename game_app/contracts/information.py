@@ -120,10 +120,30 @@ class InformationResponse(StrictModel):
     skipped_fields: list[str]
     raw_text: str
     conflict_selections: dict[str, int]
+    answered_fields: list[str]
+    unresolved_fields: list[str]
+    answered_values: dict[str, Scalar]
     submitted_at: Timestamp
     result_refs: list[ObjectRef]
     post_request_version: Revision
     post_context_revision: Revision
+
+    @model_validator(mode="after")
+    def answered_shape(self) -> "InformationResponse":
+        """The three background fields describe this response, not a projection."""
+        if len(set(self.answered_fields)) != len(self.answered_fields):
+            raise ValueError("a response answers each field once")
+        if len(set(self.unresolved_fields)) != len(self.unresolved_fields):
+            raise ValueError("a response leaves each field unresolved once")
+        if set(self.answered_fields) & set(self.unresolved_fields):
+            raise ValueError("a field is answered or unresolved, never both")
+        if set(self.answered_values) != set(self.answered_fields):
+            raise ValueError("answered_values has exactly the answered fields")
+        if set(self.answered_fields) & set(self.skipped_fields):
+            raise ValueError("a skipped field is not an answered field")
+        if set(self.unresolved_fields) & set(self.skipped_fields):
+            raise ValueError("a skipped field is not an unresolved field")
+        return self
 
 
 class CreateInformationAmendmentRequest(StrictModel):

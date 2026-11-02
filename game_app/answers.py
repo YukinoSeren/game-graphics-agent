@@ -61,14 +61,45 @@ ANSWER_ROUTE = "/api/information-responses"
 AMENDMENT_ROUTE = "/api/information-amendments"
 ANSWER_RULE_VERSION = "information-answer/0.4"
 
-_TEXT_PATHS = frozenset({"cpu", "os_version", "device_form"})
-_INT_PATHS = frozenset({
-    "memory_bytes",
-    "display.desktop_resolution.width",
-    "display.desktop_resolution.height",
-})
-_FLOAT_PATHS = frozenset({"display.refresh_hz"})
 _GPU_PATH = re.compile(r"^gpus\.(\d+)\.(raw_name|vram_bytes|driver_version)$")
+
+
+def _normalize_text(value: Scalar) -> Scalar | None:
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
+def _normalize_positive_int(value: Scalar) -> Scalar | None:
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
+def _normalize_positive_float(value: Scalar) -> Scalar | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)) and value > 0:
+        return float(value)
+    return None
+
+
+# Adding a normalisable field is one registry entry.  An unregistered path is
+# never guessed: it stays unresolved.
+_FIELD_NORMALIZERS: dict[str, Callable[[Scalar], Scalar | None]] = {
+    "cpu": _normalize_text,
+    "os_version": _normalize_text,
+    "device_form": _normalize_text,
+    "memory_bytes": _normalize_positive_int,
+    "display.desktop_resolution.width": _normalize_positive_int,
+    "display.desktop_resolution.height": _normalize_positive_int,
+    "display.refresh_hz": _normalize_positive_float,
+}
+_GPU_NORMALIZERS: dict[str, Callable[[Scalar], Scalar | None]] = {
+    "raw_name": _normalize_text,
+    "driver_version": _normalize_text,
+    "vram_bytes": _normalize_positive_int,
+}
 
 
 @dataclass(frozen=True)
@@ -264,6 +295,19 @@ class AnswerService:
                 response_input, request, response_id=response_id, now=now, prior_ref=prior_ref
             )
             derived = self._derive_snapshot(uow, request, plan, response_id, now)
+            answered_fields = [
+                field.field_path for field in plan.fields
+                if field.answer_state is AnswerState.answered
+            ]
+            unresolved_fields = [
+                field.field_path for field in plan.fields
+                if field.answer_state is AnswerState.unresolved
+            ]
+            answered_values = {
+                field.field_path: field.value.value
+                for field in plan.fields
+                if field.answer_state is AnswerState.answered
+            }
 
             result_refs: list[ObjectRef] = [
                 ObjectRef(entity_type="InformationResponse", entity_id=response_id),
@@ -283,6 +327,9 @@ class AnswerService:
                 skipped_fields=list(response_input.skipped_fields),
                 raw_text=response_input.raw_text,
                 conflict_selections=dict(response_input.conflict_selections),
+                answered_fields=answered_fields,
+                unresolved_fields=unresolved_fields,
+                answered_values=answered_values,
                 submitted_at=now,
                 result_refs=[
                     ref for ref in result_refs
@@ -292,6 +339,19 @@ class AnswerService:
                 post_context_revision=request.expected_context_revision + 1,
             )
             uow.insert_object("InformationResponse", response)
+            if request.continuation_mode is InformationContinuationMode.source_task:
+                # A partial answer may wake nothing, so the durable link is the
+                # task_responses projection, not the input's cause_ref.
+                sequence = int(uow.query(
+                    "SELECT COALESCE(MAX(sequence), 0) AS last FROM task_responses"
+                    " WHERE task_id=?",
+                    (request.source_task_id,),
+                )[0]["last"]) + 1
+                uow.execute(
+                    "INSERT INTO task_responses(task_id, sequence, response_id,"
+                    " request_id, created_at) VALUES(?, ?, ?, ?, ?)",
+                    (request.source_task_id, sequence, response_id, request.id, now),
+                )
             if derived is not None:
                 uow.insert_versioned("DeviceSnapshot", derived)
                 uow.insert_reference(response_id, "derived_snapshot", ObjectRef(
@@ -461,14 +521,25 @@ class AnswerService:
                 "the question's device snapshot no longer exists",
             )
         old = DeviceSnapshot.model_validate_json(stored.payload_bytes)
-        answers = {
+        owner = uow.query(
+            "SELECT user_scope_id FROM tasks WHERE task_id=?",
+            (request.source_task_id,),
+        )
+        if not owner or old.user_scope_id != owner[0]["user_scope_id"]:
+            # The question's series must belong to the task owner; a foreign
+            # series is never merged into this user's facts.
+            raise ContractError(
+                ErrorCode.PRECONDITION_UNVERIFIED,
+                "the device snapshot belongs to another user",
+            )
+        values = {
             field.field_path: field.value
             for field in plan.fields
-            if field.answer_state is AnswerState.answered
+            if field.answer_state in (AnswerState.answered, AnswerState.unresolved)
         }
-        if not answers:
+        if not values:
             return None
-        return _apply_device_values(old, answers, now)
+        return _apply_device_values(old, values, now)
 
 
 class AmendmentService:
@@ -801,24 +872,14 @@ def _unknown_field() -> FieldValue:
 
 def _normalize(path: str, value: Scalar) -> Scalar | None:
     """Return the typed value, or None when the answer cannot be interpreted."""
-    gpu = _GPU_PATH.match(path)
-    if path in _TEXT_PATHS or (gpu is not None and gpu.group(2) in (
-        "raw_name", "driver_version",
-    )):
-        if isinstance(value, str) and value.strip():
-            return value
+    normalizer = _FIELD_NORMALIZERS.get(path)
+    if normalizer is None:
+        gpu = _GPU_PATH.match(path)
+        if gpu is not None:
+            normalizer = _GPU_NORMALIZERS.get(gpu.group(2))
+    if normalizer is None:
         return None
-    if path in _INT_PATHS or (gpu is not None and gpu.group(2) == "vram_bytes"):
-        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-            return value
-        return None
-    if path in _FLOAT_PATHS:
-        if isinstance(value, bool):
-            return None
-        if isinstance(value, (int, float)) and value > 0:
-            return float(value)
-        return None
-    return None
+    return normalizer(value)
 
 
 def _local_evidence(response_id: str, path: str) -> EvidenceRef:
@@ -1015,9 +1076,9 @@ def _apply_device_values(
         index, attribute = int(match.group(1)), match.group(2)
         existing = gpus.get(index)
         if existing is None:
-            if attribute != "raw_name":
+            if attribute != "raw_name" or value.value_state is not ValueState.known:
                 # Without a known name there is no adapter member to attach the
-                # other attributes to; the answer still stays in the response.
+                # other attributes to; an unresolved name does not create one.
                 continue
             gpus[index] = GpuSnapshot(
                 id=new_id(),

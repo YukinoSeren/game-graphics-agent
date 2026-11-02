@@ -12,7 +12,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 from uuid import UUID, uuid5
 
 from game_app.contracts.common import (
@@ -54,8 +54,8 @@ from game_app.contracts.enums import (
 )
 from game_app.contracts.information import InformationRequest, RequestedField
 from game_app.contracts.knowledge import Game
-from game_app.contracts.primitives import ObjectRef, VersionRef, new_id, utc_now
-from game_app.contracts.tasks import DeviceScanInput, DomainResult
+from game_app.contracts.primitives import ObjectRef, Scalar, VersionRef, new_id, utc_now
+from game_app.contracts.tasks import DeviceScanInput, DomainResult, TaskStopReason
 from game_app.errors import ContractError, ErrorCode, FieldError, empty_details
 from game_app.files import FileService, PublishHooks
 from game_app.repository import ProductRepository, UnitOfWork, canonical_json
@@ -153,21 +153,53 @@ class DeviceService:
                     )],
                 )
 
+        answered = context.answered_values
+        user_scope_id = context.user_scope_id
+        latest_request = self._latest_source_request(context.task_id)
+        skipped = self._skipped_paths(latest_request)
+        handled = set(answered) | skipped
+        scope_key = self._scope_key(task_input, stored_context)
+        slot = self._read_slot(user_scope_id, scope_key)
+        series_id = slot[0] if slot is not None else new_id()
+        device_series_id = slot[1] if slot is not None else new_id()
+        baseline = self._latest_snapshot(series_id) if slot is not None else None
+        probe_paths = [path for path in paths if path not in handled]
+
         context.phase("acquire")
-        readings = self._read(paths)
+        readings = self._read(probe_paths)
         snapshot_id = new_id()
         artifacts = self._store_originals(snapshot_id, readings)
-        snapshot, gpus_by_index, field_values = self._assemble(
-            snapshot_id, paths, readings, artifacts
+        snapshot, gpus_by_index = self._assemble(
+            snapshot_id,
+            paths,
+            readings,
+            artifacts,
+            baseline=baseline,
+            answered=answered,
+            series_id=series_id,
+            device_series_id=device_series_id,
+            user_scope_id=user_scope_id,
         )
         context.phase("validate")
-        request = self._plan_questions(
-            context, task_input, snapshot, readings, gpus_by_index, field_values,
-            stored_context,
+
+        unknown_paths = [
+            path for path in paths
+            if path not in handled
+            and not self._is_known(snapshot, path, gpus_by_index)
+        ]
+        no_progress = self._no_progress(
+            latest_request, unknown_paths, answered, skipped
+        )
+        request = None if no_progress else self._plan_questions(
+            context, task_input, snapshot, unknown_paths, stored_context
         )
         # The snapshot and the question about it are one fact: a consumer must
-        # never see a snapshot whose failures were not asked about.
+        # never see a snapshot whose failures were not asked about.  The slot is
+        # maintained in the same transaction as the snapshot it names.
         with self.repository.unit_of_work() as uow:
+            self._ensure_slot(
+                uow, user_scope_id, scope_key, series_id, device_series_id
+            )
             uow.insert_versioned("DeviceSnapshot", snapshot)
             if request is not None:
                 uow.insert_object("InformationRequest", request)
@@ -178,11 +210,17 @@ class DeviceService:
                 ObjectRef(entity_type="InformationRequest", entity_id=request.id)
             )
 
-        critical_unknown = [
-            path for path in paths
-            if is_critical(path)
-            and not self._is_known(snapshot, path, gpus_by_index, field_values)
-        ]
+        if no_progress:
+            # Re-asking the same field set without a new answer only traps the
+            # player; the task ends instead of creating an identical question.
+            return HandlerOutcome(
+                state=TaskState.failed,
+                stop_reason=TaskStopReason(kind="execution", code="input_unresolved"),
+                error_code=ErrorCode.PRECONDITION_UNVERIFIED.value,
+                result_refs=result_refs,
+            )
+
+        critical_unknown = [path for path in unknown_paths if is_critical(path)]
         if critical_unknown and request is not None:
             # The player must answer before device matching can proceed; the
             # snapshot and question are already durable.
@@ -192,7 +230,7 @@ class DeviceService:
 
         known = [
             path for path in paths
-            if self._is_known(snapshot, path, gpus_by_index, field_values)
+            if self._is_known(snapshot, path, gpus_by_index)
         ]
         if not known:
             code = "unavailable"
@@ -212,6 +250,129 @@ class DeviceService:
                 checks=list(snapshot.checks),
             ),
             result_refs=result_refs,
+        )
+
+    # -- device series, answers and progress guards -------------------------
+    @staticmethod
+    def _scope_key(task_input: DeviceScanInput, stored_context: Any) -> str:
+        if task_input.game_context_id is not None:
+            installation_id = (
+                None if stored_context is None
+                else stored_context.payload.get("installation_id")
+            )
+            if installation_id is not None:
+                return f"installation:{installation_id}"
+            return f"context:{task_input.game_context_id}"
+        return "user"
+
+    def _read_slot(
+        self, user_scope_id: str, scope_key: str
+    ) -> tuple[str, str] | None:
+        with self.repository.unit_of_work() as uow:
+            rows = uow.query(
+                "SELECT series_id, device_series_id FROM device_series_slots"
+                " WHERE user_scope_id=? AND scope_key=?",
+                (user_scope_id, scope_key),
+            )
+        if not rows:
+            return None
+        return rows[0]["series_id"], rows[0]["device_series_id"]
+
+    @staticmethod
+    def _ensure_slot(
+        uow: UnitOfWork,
+        user_scope_id: str,
+        scope_key: str,
+        series_id: str,
+        device_series_id: str,
+    ) -> None:
+        rows = uow.query(
+            "SELECT series_id, device_series_id FROM device_series_slots"
+            " WHERE user_scope_id=? AND scope_key=?",
+            (user_scope_id, scope_key),
+        )
+        if rows:
+            if (
+                rows[0]["series_id"] != series_id
+                or rows[0]["device_series_id"] != device_series_id
+            ):
+                raise ContractError(
+                    ErrorCode.PRECONDITION_UNVERIFIED,
+                    "the device series changed while this scan ran; run the scan again",
+                )
+            return
+        uow.execute(
+            "INSERT INTO device_series_slots(user_scope_id, scope_key, series_id,"
+            " device_series_id, created_at) VALUES(?, ?, ?, ?, ?)",
+            (user_scope_id, scope_key, series_id, device_series_id, utc_now()),
+        )
+
+    def _latest_snapshot(self, series_id: str) -> DeviceSnapshot | None:
+        with self.repository.unit_of_work() as uow:
+            stored = uow.latest_for_series("DeviceSnapshot", series_id)
+        return (
+            None if stored is None
+            else DeviceSnapshot.model_validate_json(stored.payload_bytes)
+        )
+
+    def _latest_source_request(self, task_id: str) -> InformationRequest | None:
+        with self.repository.unit_of_work() as uow:
+            rows = uow.query(
+                "SELECT id FROM objects WHERE entity_type='InformationRequest'"
+                " ORDER BY created_at DESC, rowid DESC"
+            )
+            for row in rows:
+                stored = uow.find_object("InformationRequest", row["id"])
+                if stored is None:
+                    continue
+                request = InformationRequest.model_validate_json(stored.payload_bytes)
+                if (
+                    request.source_task_id != task_id
+                    or request.continuation_mode
+                    is not InformationContinuationMode.source_task
+                ):
+                    continue
+                head = uow.get_head("InformationRequest", request.id)
+                if head is not None:
+                    request = InformationRequest.model_validate_json(
+                        canonical_json(
+                            uow.get_snapshot("InformationRequest", request.id, head)
+                        )
+                    )
+                return request
+        return None
+
+    @staticmethod
+    def _skipped_paths(request: InformationRequest | None) -> set[str]:
+        if request is None:
+            return set()
+        return {
+            field.field_path for field in request.fields
+            if field.answer_state is AnswerState.skipped
+        }
+
+    @staticmethod
+    def _no_progress(
+        latest_request: InformationRequest | None,
+        unknown_paths: Sequence[str],
+        answered: Mapping[str, Any],
+        skipped: set[str],
+    ) -> bool:
+        if latest_request is None:
+            return False
+        latest_asked = {field.field_path for field in latest_request.fields}
+        latest_answered = {
+            field.field_path for field in latest_request.fields
+            if field.answer_state is AnswerState.answered
+        }
+        latest_skipped = {
+            field.field_path for field in latest_request.fields
+            if field.answer_state is AnswerState.skipped
+        }
+        return (
+            set(unknown_paths) == latest_asked
+            and set(answered) == latest_answered
+            and skipped == latest_skipped
         )
 
     # -- validation ---------------------------------------------------------
@@ -283,17 +444,55 @@ class DeviceService:
         paths: Sequence[str],
         readings: Sequence[ProbeReading],
         originals: dict[str, Any],
-    ) -> tuple[DeviceSnapshot, dict[int, GpuSnapshot], dict[str, FieldValue]]:
+        *,
+        baseline: DeviceSnapshot | None,
+        answered: Mapping[str, Any],
+        series_id: str,
+        device_series_id: str,
+        user_scope_id: str,
+    ) -> tuple[DeviceSnapshot, dict[int, GpuSnapshot]]:
         by_path = {reading.field_path: reading for reading in readings}
         captured = utc_now()
-        # Every probed path keeps its own value state: a composite such as the
-        # desktop resolution must not decide whether its halves were obtained.
-        field_values: dict[str, FieldValue] = {}
+        requested = set(paths)
+        baseline_gpus = {
+            gpu.probe_index: gpu for gpu in (baseline.gpus if baseline else [])
+        }
+
+        def previous_value(path: str) -> FieldValue | None:
+            if baseline is None:
+                return None
+            if path in ("cpu", "memory_bytes", "os_version", "device_form"):
+                return getattr(baseline, path)
+            if path == "display.refresh_hz":
+                return baseline.display.refresh_hz
+            if path in (
+                "display.desktop_resolution.width",
+                "display.desktop_resolution.height",
+            ):
+                axis = path.rsplit(".", 1)[1]
+                return baseline.display.desktop_resolution_axes.get(axis)
+            match = _GPU_PATH.match(path)
+            if match is not None:
+                gpu = baseline_gpus.get(int(match.group(1)))
+                return None if gpu is None else getattr(gpu, match.group(2))
+            return None
 
         def value_for(path: str, parser) -> FieldValue:
-            value = self._field_value(path, by_path.get(path), originals.get(path), parser)
-            field_values[path] = value
-            return value
+            previous = previous_value(path)
+            if path in answered:
+                answer = answered[path]
+                new = _answered_value(answer, path, captured)
+                if previous is not None and any(
+                    attempt.information_response_id == answer.response_id
+                    for attempt in previous.attempts
+                ):
+                    # The derived snapshot already recorded this exact answer.
+                    return previous
+                return _merge_history(new, previous)
+            new = self._field_value(
+                path, by_path.get(path), originals.get(path), parser
+            )
+            return _merge_probe(new, previous)
 
         gpu_indices = sorted({
             int(_GPU_PATH.match(path).group(1))
@@ -305,27 +504,64 @@ class DeviceService:
         # gpus.1.* must never be answered by the list's first entry.
         gpus_by_index: dict[int, GpuSnapshot] = {}
         for index in gpu_indices:
-            raw_name = value_for(f"gpus.{index}.raw_name", _parse_text)
-            if raw_name.value_state is not ValueState.known:
+            baseline_gpu = baseline_gpus.get(index)
+
+            def gpu_attribute(name: str, parser) -> FieldValue:
+                path = f"gpus.{index}.{name}"
+                if path in requested:
+                    return value_for(path, parser)
+                if baseline_gpu is not None:
+                    return getattr(baseline_gpu, name)
+                return _unknown_field()
+
+            raw_name = gpu_attribute("raw_name", _parse_text)
+            vram = gpu_attribute("vram_bytes", _parse_positive_int)
+            driver = gpu_attribute("driver_version", _parse_text)
+            if raw_name.value_state is ValueState.known:
+                gpu = GpuSnapshot(
+                    id=baseline_gpu.id if baseline_gpu is not None else new_id(),
+                    probe_index=index,
+                    raw_name=raw_name,
+                    vram_bytes=vram,
+                    driver_version=driver,
+                )
+            elif baseline_gpu is not None:
+                # A failed re-read keeps the adapter member and records the
+                # failed attempt; the name is not silently renamed.
+                gpu = baseline_gpu.model_copy(update={
+                    "raw_name": raw_name,
+                    "vram_bytes": vram,
+                    "driver_version": driver,
+                })
+            else:
                 # No adapter member is registered without a known name; the
                 # failure stays visible in checks and questions.
                 continue
-            gpu = GpuSnapshot(
-                id=new_id(),
-                probe_index=index,
-                raw_name=raw_name,
-                vram_bytes=value_for(f"gpus.{index}.vram_bytes", _parse_positive_int),
-                driver_version=value_for(f"gpus.{index}.driver_version", _parse_text),
-            )
             gpus.append(gpu)
             gpus_by_index[index] = gpu
 
-        width = value_for("display.desktop_resolution.width", _parse_positive_int)
-        height = value_for("display.desktop_resolution.height", _parse_positive_int)
+        def axis_value(axis: str) -> FieldValue:
+            path = f"display.desktop_resolution.{axis}"
+            if path in requested:
+                return value_for(path, _parse_positive_int)
+            if baseline is not None:
+                return baseline.display.desktop_resolution_axes.get(
+                    axis, _unknown_field()
+                )
+            return _unknown_field()
+
+        width = axis_value("width")
+        height = axis_value("height")
         axes: dict[str, FieldValue[int]] = {}
-        if "display.desktop_resolution.width" in paths:
+        if "display.desktop_resolution.width" in requested or (
+            baseline is not None
+            and "width" in baseline.display.desktop_resolution_axes
+        ):
             axes["width"] = width
-        if "display.desktop_resolution.height" in paths:
+        if "display.desktop_resolution.height" in requested or (
+            baseline is not None
+            and "height" in baseline.display.desktop_resolution_axes
+        ):
             axes["height"] = height
         if (
             width.value_state is ValueState.known
@@ -350,11 +586,34 @@ class DeviceService:
                 else AcquisitionStatus.not_attempted,
             )
 
-        checks = [
-            self._probe_check(path, by_path.get(path), originals.get(path))
-            for path in paths
-        ]
-        if not gpu_indices:
+        probed = set(by_path)
+        checks: list[CheckResult] = []
+        if baseline is not None:
+            checks = [
+                check for check in baseline.checks
+                if check.check_id not in {f"probe.{path}" for path in probed}
+            ]
+        for path in sorted(probed):
+            checks.append(
+                self._probe_check(path, by_path.get(path), originals.get(path))
+            )
+        for path in sorted(answered):
+            if path in requested and not any(
+                check.check_id == f"probe.{path}" for check in checks
+            ):
+                checks.append(CheckResult(
+                    check_id=f"probe.{path}",
+                    definition_version="probe-checks/0.4",
+                    status=CheckStatus.not_run,
+                    input_refs=[],
+                    evidence_refs=[],
+                    checked_at=None,
+                    method="player answer",
+                    note="not probed; the player supplied this value",
+                ))
+        if gpu_indices:
+            checks = [check for check in checks if check.check_id != "probe.gpus"]
+        elif not any(check.check_id == "probe.gpus" for check in checks):
             # An empty GPU list must never read as "this machine has no GPU":
             # record that the group was not examined in this scan.
             checks.append(CheckResult(
@@ -367,29 +626,49 @@ class DeviceService:
                 method="controlled probe",
                 note="no GPU field was requested; the empty list is not a finding",
             ))
+        def scalar_value(path: str, parser) -> FieldValue:
+            if path in requested:
+                return value_for(path, parser)
+            if baseline is not None:
+                return getattr(baseline, path)
+            return _unknown_field()
+
+        selected_gpu_id = None
+        if baseline is not None and baseline.selected_gpu_id is not None:
+            if baseline.selected_gpu_id in {gpu.id for gpu in gpus}:
+                selected_gpu_id = baseline.selected_gpu_id
+
         return DeviceSnapshot(
             id=snapshot_id,
             schema_version=PRODUCT_CONTRACT_VERSION,
             created_at=captured,
             created_by_task_id=None,
-            series_id=new_id(),
-            version=1,
-            device_series_id=new_id(),
+            series_id=series_id,
+            version=baseline.version + 1 if baseline is not None else 1,
+            device_series_id=device_series_id,
+            user_scope_id=user_scope_id,
             captured_at=captured,
             gpus=gpus,
-            selected_gpu_id=None,
-            cpu=value_for("cpu", _parse_text),
-            memory_bytes=value_for("memory_bytes", _parse_positive_int),
-            device_form=value_for("device_form", _parse_text),
-            os_version=value_for("os_version", _parse_text),
+            selected_gpu_id=selected_gpu_id,
+            cpu=scalar_value("cpu", _parse_text),
+            memory_bytes=scalar_value("memory_bytes", _parse_positive_int),
+            device_form=scalar_value("device_form", _parse_text),
+            os_version=scalar_value("os_version", _parse_text),
             display=DisplayContext(
                 desktop_resolution=resolution,
                 desktop_resolution_axes=axes,
-                refresh_hz=value_for("display.refresh_hz", _parse_positive_float),
+                refresh_hz=(
+                    value_for("display.refresh_hz", _parse_positive_float)
+                    if "display.refresh_hz" in requested
+                    else (
+                        baseline.display.refresh_hz
+                        if baseline is not None else _unknown_field()
+                    )
+                ),
             ),
-            power_context={},
+            power_context=dict(baseline.power_context) if baseline is not None else {},
             checks=checks,
-        ), gpus_by_index, field_values
+        ), gpus_by_index
 
     def _field_value(self, path: str, reading, original, parser) -> FieldValue:
         if reading is None:
@@ -486,18 +765,9 @@ class DeviceService:
         context: TaskContext,
         task_input: DeviceScanInput,
         snapshot: DeviceSnapshot,
-        readings: Sequence[ProbeReading],
-        gpus_by_index: dict[int, GpuSnapshot],
-        field_values: dict[str, FieldValue],
+        unknown_paths: Sequence[str],
         stored_context: Any,
     ) -> InformationRequest | None:
-        unknown_paths = [
-            reading.field_path
-            for reading in readings
-            if not self._is_known(
-                snapshot, reading.field_path, gpus_by_index, field_values
-            )
-        ]
         if not unknown_paths:
             return None
         fields = [
@@ -554,18 +824,19 @@ class DeviceService:
         snapshot: DeviceSnapshot,
         path: str,
         gpus_by_index: dict[int, GpuSnapshot],
-        field_values: dict[str, FieldValue],
     ) -> bool:
         if path in ("cpu", "memory_bytes", "os_version", "device_form"):
             return getattr(snapshot, path).value_state is ValueState.known
         if path in (
             "display.desktop_resolution.width",
             "display.desktop_resolution.height",
-            "display.refresh_hz",
         ):
-            # Each axis is judged on its own probe result, not on the composite.
-            value = field_values.get(path)
+            # Each axis is judged on its own value, not on the composite.
+            axis = path.rsplit(".", 1)[1]
+            value = snapshot.display.desktop_resolution_axes.get(axis)
             return value is not None and value.value_state is ValueState.known
+        if path == "display.refresh_hz":
+            return snapshot.display.refresh_hz.value_state is ValueState.known
         match = _GPU_PATH.match(path)
         if match is not None:
             index, attribute = int(match.group(1)), match.group(2)
@@ -1389,6 +1660,69 @@ def _unknown_context_check(check_id: str) -> CheckResult:
 def _display_label(label: str | None, installation_id: str) -> str:
     """A null label is generated for display only; it never identifies an install."""
     return label if label is not None else f"本机记录 {installation_id[:8]}"
+
+
+def _unknown_field() -> FieldValue:
+    return FieldValue(
+        value_state=ValueState.unknown,
+        value=None,
+        unknown_reason="not_provided",
+        acquisition_status=AcquisitionStatus.not_attempted,
+    )
+
+
+def _merge_history(new: FieldValue, previous: FieldValue | None) -> FieldValue:
+    if previous is None:
+        return new
+    return new.model_copy(update={
+        "provenance": [*previous.provenance, *new.provenance],
+        "attempts": [*previous.attempts, *new.attempts],
+    })
+
+
+def _merge_probe(new: FieldValue, previous: FieldValue | None) -> FieldValue:
+    if previous is None:
+        return new
+    if (
+        previous.value_state is ValueState.known
+        and new.value_state is ValueState.unknown
+        and new.acquisition_status is AcquisitionStatus.failed
+    ):
+        # A failed re-read does not disprove a value already known; keep it and
+        # record the failure as one more attempt.
+        return previous.model_copy(update={
+            "provenance": [*previous.provenance, *new.provenance],
+            "attempts": [*previous.attempts, *new.attempts],
+        })
+    return _merge_history(new, previous)
+
+
+def _answered_value(answer: Any, path: str, now: str) -> FieldValue:
+    """A stored answer is known, and cites the exact response that produced it."""
+    return FieldValue[Scalar](
+        value_state=ValueState.known,
+        value=answer.value,
+        acquisition_status=AcquisitionStatus.succeeded,
+        provenance=[Provenance(
+            method=AcquisitionMethod.user_provided,
+            observed_at=None,
+            recorded_at=now,
+            evidence_refs=[EvidenceRef(
+                kind="local",
+                entity_type="InformationResponse",
+                entity_id=answer.response_id,
+                field_path=path,
+            )],
+            note="player answer",
+        )],
+        attempts=[AcquisitionAttempt(
+            id=new_id(),
+            method=AcquisitionMethod.user_provided,
+            status=AcquisitionStatus.succeeded,
+            attempted_at=now,
+            information_response_id=answer.response_id,
+        )],
+    )
 
 
 def _parse_text(text: str | None) -> str | None:

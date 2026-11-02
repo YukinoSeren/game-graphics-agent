@@ -84,11 +84,12 @@ class AdoptionService:
     # -- reads --------------------------------------------------------------
     def get_current_applied(
         self, user_scope_id: str, installation_id: str
-    ) -> tuple[str | None, int]:
+    ) -> tuple[str | None, int | None]:
         with self.repository.unit_of_work() as uow:
             row = uow.current_applied(user_scope_id, installation_id)
         if row is None:
-            return None, 0
+            # No pointer is not a revision zero: both halves are absent.
+            return None, None
         return row["applied_id"], int(row["revision"])
 
     def get_applied(self, applied_id: str) -> AppliedConfiguration:
@@ -165,7 +166,7 @@ class AdoptionService:
     ) -> list[ObjectRef]:
         installation = self._installation(uow, request.installation_id, user_scope_id)
         self._context(uow, request.game_context_id, installation)
-        self._device_snapshot(uow, request.device_snapshot_id)
+        self._device_snapshot(uow, request.device_snapshot_id, user_scope_id)
         self._validate_links(request)
 
         pointer = uow.current_applied(user_scope_id, installation["series_id"])
@@ -241,6 +242,12 @@ class AdoptionService:
                     "applied.source",
                     CheckStatus.not_run,
                     "a player declaration is not a program observation and no game file was written",
+                ),
+                _check(
+                    "applied.activation",
+                    CheckStatus.unknown,
+                    "no verifiable activation source exists; a player claim is not"
+                    " confirmed activation",
                 ),
                 *merge_checks,
             ],
@@ -334,7 +341,7 @@ class AdoptionService:
     ) -> list[ObjectRef]:
         installation = self._installation(uow, request.installation_id, user_scope_id)
         self._context(uow, request.game_context_id, installation)
-        self._device_snapshot(uow, request.device_snapshot_id)
+        self._device_snapshot(uow, request.device_snapshot_id, user_scope_id)
         # A historical record must not be a way to smuggle in today's state.
         self._evidence_problems(uow, request.evidence_refs)
         segment_check = self._segment_check(uow, request)
@@ -389,6 +396,12 @@ class AdoptionService:
                     "applied.source",
                     CheckStatus.not_run,
                     "a historical registration records a past declaration, not an observation",
+                ),
+                _check(
+                    "applied.activation",
+                    CheckStatus.unknown,
+                    "no verifiable activation source exists; a player claim is not"
+                    " confirmed activation",
                 ),
                 _check(
                     "applied.period",
@@ -508,7 +521,7 @@ class AdoptionService:
                 uow, request.installation_id, user_scope_id
             )
             self._context(uow, request.game_context_id, installation)
-            self._device_snapshot(uow, request.device_snapshot_id)
+            self._device_snapshot(uow, request.device_snapshot_id, user_scope_id)
             for declaration in request.declared_settings:
                 self._setting_ref(uow, declaration.setting_ref, installation["series_id"])
             if isinstance(request, HistoricalConfigurationInput):
@@ -897,15 +910,14 @@ class AdoptionService:
             )
         return stored
 
-    def _device_snapshot(self, uow: UnitOfWork, snapshot_id: str) -> StoredObject:
+    def _device_snapshot(
+        self, uow: UnitOfWork, snapshot_id: str, user_scope_id: str
+    ) -> StoredObject:
         stored = uow.find_object("DeviceSnapshot", snapshot_id)
-        if stored is None:
+        if stored is None or stored.payload.get("user_scope_id") != user_scope_id:
+            # Another user's snapshot is indistinguishable from a missing one.
             raise ContractError(
-                ErrorCode.REFERENCE_INVALID,
-                "the referenced device snapshot does not exist",
-                field_errors=[FieldError(
-                    path="device_snapshot_id", code="reference", message="unknown snapshot",
-                )],
+                ErrorCode.RESOURCE_NOT_FOUND, "the device snapshot is not available"
             )
         return stored
 
@@ -1190,10 +1202,25 @@ def _confirm(
 def _reduce_activation(
     settings: Sequence[ConfirmedSetting], claimed: ActivationState
 ) -> ActivationState:
-    """State §2 reduction over the declared settings of this configuration."""
-    states = [setting.activation_state for setting in settings]
+    """State §2 reduction; an unverified ``active_confirmed`` is unknown here.
+
+    This slice has no activation source (``SettingDeclaration.observation_id``
+    is a reserved entry point that is not consumed), so every claimed active
+    state is reduced to unknown at the aggregate level.  The single setting
+    keeps the player's declaration.
+    """
+    states = [
+        ActivationState.unknown
+        if setting.activation_state is ActivationState.active_confirmed
+        else setting.activation_state
+        for setting in settings
+    ]
     if not states:
-        return claimed
+        return (
+            ActivationState.unknown
+            if claimed is ActivationState.active_confirmed
+            else claimed
+        )
     if ActivationState.conflicting in states:
         return ActivationState.conflicting
     if ActivationState.restart_pending in states:

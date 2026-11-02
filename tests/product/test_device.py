@@ -9,10 +9,11 @@ from game_app.contracts.common import MutationContext
 from game_app.contracts.device import DeviceSnapshot
 from game_app.contracts.enums import AcquisitionStatus, CheckStatus, ValueState
 from game_app.contracts.information import InformationRequest
+from game_app.contracts.primitives import utc_now
 from game_app.device import DeviceService, ProbeReading
 from game_app.errors import ContractError, ErrorCode
 from game_app.files import FileService
-from game_app.repository import ProductRepository
+from game_app.repository import ProductRepository, canonical_json
 from game_app.tasks import TaskService
 from tests.product.support.spies import SpyProvider
 
@@ -527,3 +528,87 @@ def test_a_failed_question_write_does_not_leave_an_orphan_snapshot(tmp_path, mon
             "SELECT COUNT(*) AS n FROM objects WHERE entity_type='DeviceSnapshot'"
         )[0]["n"]
     assert snapshots == 0
+
+
+# --- 2D-B: stable device series and snapshot ownership ----------------------
+
+
+def _context_stub(repo, *, installation_id=None):
+    context_id = _uid(720)
+    with repo.unit_of_work() as uow:
+        uow.insert_object_bytes(
+            "GameContext",
+            schema_version="product-contract/0.4",
+            raw=canonical_json({
+                "id": context_id,
+                "series_id": context_id,
+                "version": 1,
+                "installation_id": installation_id,
+            }),
+            object_id=context_id,
+            series_id=context_id,
+            version=1,
+        )
+    return context_id
+
+
+def _two_scans(repo, tasks, *, game_context_id):
+    first = _scan(tasks, ["cpu"], key="scan-a", game_context_id=game_context_id)
+    assert tasks.run_once().state.value == "completed"
+    second = _scan(tasks, ["cpu"], key="scan-b", game_context_id=game_context_id)
+    assert tasks.run_once().state.value == "completed"
+    return _snapshot(repo, first.task_id), _snapshot(repo, second.task_id)
+
+
+def _slot(repo):
+    with repo.unit_of_work() as uow:
+        rows = uow.query("SELECT * FROM device_series_slots")
+    assert len(rows) == 1
+    return rows[0]
+
+
+def test_repeated_scans_share_one_device_series_and_increment_the_version(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU"})
+    repo, files, device, tasks = _env(tmp_path, probe)
+    context_id = _context_stub(repo, installation_id=_uid(721))
+
+    left, right = _two_scans(repo, tasks, game_context_id=context_id)
+
+    assert left.series_id == right.series_id
+    assert left.device_series_id == right.device_series_id
+    assert (left.version, right.version) == (1, 2)
+    slot = _slot(repo)
+    assert slot["scope_key"] == f"installation:{_uid(721)}"
+    assert slot["series_id"] == left.series_id
+    assert slot["device_series_id"] == left.device_series_id
+
+
+def test_a_context_without_an_installation_uses_the_context_slot(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU"})
+    repo, files, device, tasks = _env(tmp_path, probe)
+    context_id = _context_stub(repo)
+
+    left, right = _two_scans(repo, tasks, game_context_id=context_id)
+
+    assert left.series_id == right.series_id
+    assert _slot(repo)["scope_key"] == f"context:{context_id}"
+
+
+def test_scans_without_a_context_use_the_user_slot(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU"})
+    repo, files, device, tasks = _env(tmp_path, probe)
+
+    left, right = _two_scans(repo, tasks, game_context_id=None)
+
+    assert left.series_id == right.series_id
+    assert _slot(repo)["scope_key"] == "user"
+
+
+def test_a_snapshot_records_the_task_owner(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU"})
+    repo, files, device, tasks = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu"])
+    tasks.run_once()
+
+    snapshot = _snapshot(repo, accepted.task_id)
+    assert snapshot.user_scope_id == _uid(90)

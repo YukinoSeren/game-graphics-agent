@@ -29,7 +29,8 @@ from game_app.contracts.enums import (
     TaskState,
     TaskType,
 )
-from game_app.contracts.primitives import ObjectRef, new_id, utc_now
+from game_app.contracts.primitives import ObjectRef, Scalar, new_id, utc_now
+from game_app.contracts.information import InformationResponse
 from game_app.contracts.tasks import (
     DomainResult,
     ResumeTaskInput,
@@ -128,6 +129,15 @@ class TaskProgress:
 
 
 @dataclass(frozen=True)
+class AnsweredValue:
+    """One normalised answer, with the response that produced it."""
+
+    value: Scalar
+    response_id: str
+    field_path: str
+
+
+@dataclass(frozen=True)
 class TaskViewResult:
     task: TaskRun
     error: ErrorEnvelope | None
@@ -162,6 +172,15 @@ class TaskContext:
     def user_scope_id(self) -> str:
         """The persisted owner of this task; a handler never trusts an argument."""
         return self.service._load_user_scope(self.task_id)
+
+    @property
+    def answered_values(self) -> dict[str, AnsweredValue]:
+        """Merge this task's answers by sequence; a later unresolved withdraws.
+
+        The merge is over ``task_responses``, not ``cause_ref``: a partial answer
+        that did not close every critical field still wakes a later run.
+        """
+        return self.service._answered_values(self.task_id)
 
     def suspend(
         self,
@@ -1058,6 +1077,30 @@ class TaskService:
         with self.repository.unit_of_work() as uow:
             return str(self._task_row(uow, task_id)["user_scope_id"])
 
+    def _answered_values(self, task_id: str) -> dict[str, AnsweredValue]:
+        merged: dict[str, AnsweredValue] = {}
+        with self.repository.unit_of_work() as uow:
+            rows = uow.query(
+                "SELECT response_id FROM task_responses WHERE task_id=? ORDER BY sequence",
+                (task_id,),
+            )
+            for row in rows:
+                stored = uow.find_object("InformationResponse", row["response_id"])
+                if stored is None:
+                    continue
+                response = InformationResponse.model_validate_json(stored.payload_bytes)
+                for path, value in response.answered_values.items():
+                    merged[path] = AnsweredValue(
+                        value=value,
+                        response_id=response.id,
+                        field_path=path,
+                    )
+                # A later "cannot be normalised" negates an earlier value; a
+                # stale value must not masquerade as a current fact.
+                for path in response.unresolved_fields:
+                    merged.pop(path, None)
+        return merged
+
     def _next_sequence(self, uow: UnitOfWork, task_id: str) -> int:
         row = uow.query(
             "SELECT COALESCE(MAX(sequence), 0) AS last FROM task_events WHERE task_id=?",
@@ -1416,6 +1459,7 @@ def _phase_for(state: TaskState, events: Sequence[Any] = ()) -> str:
 
 
 __all__ = [
+    "AnsweredValue",
     "BudgetExhausted",
     "HandlerOutcome",
     "RunOutcome",

@@ -123,6 +123,7 @@ class DeviceSnapshot(StrictModel):
     series_id: ID
     version: Revision
     device_series_id: ID
+    user_scope_id: ID
     captured_at: Timestamp
     gpus: list[GpuSnapshot]
     selected_gpu_id: ID | None

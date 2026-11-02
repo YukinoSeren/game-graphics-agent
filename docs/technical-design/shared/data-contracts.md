@@ -113,6 +113,7 @@
 | GameAlias | `{name:string, platform:string?, evidence_refs:EvidenceRef[], status:CheckStatus}` | 全字段 R；有通过依据才生效，未知候选仅展示 |
 | IdentityMapping.id / legacy_namespace / legacy_value | ID / string / LegacyID，R | namespace 含采集运行或研究文件指纹；不能只按 legacy_value 全局唯一 |
 | IdentityMapping.target_game_id / checks | ID? / CheckResult[]，R | null 表示尚未确认映射，只能暂存；确认生成新映射记录 |
+| IdentityMapping.declared_by_user_scope_id | ID?，D=null | 玩家为某次采集运行显式声明游戏时写入声明者作用域；null 表示公共（如已验证）映射，任何用户可用。非null 映射只允许声明者本人用于导入，他人使用按 RESOURCE_NOT_FOUND 处理；声明不是外部验证，check 必须注明 |
 
 所有`game_id`指Game的稳定`series_id`，0.3允许明确标记的provisional声明身份，不能把它称已核验规范身份；需要冻结名称/平台/身份状态时另存`game_revision_id=Game.id`。不能因别名/身份核验的新版本使历史安装变成另一个游戏，也不能只从稳定ID读最新元数据替代历史。
 
@@ -139,6 +140,7 @@ D-P01首次名称登记、目录查询和选择响应由[02 §5.1](../02-knowled
 | BuildIdentifier | `{scheme:string, raw_value:string, platform:string, provenance:Provenance[]}` | 全字段 R；scheme 如 platform_build/file_version/player_report，仅说明标识来源，不编造版本序 |
 | ProcessIdentity | `{pid:int, started_at:Timestamp?, executable_path_ref:ID?, provenance:Provenance[]}` | 全字段 R；PID>0；启动时间未知不得标为已可靠绑定，避免 PID 重用误连 |
 | DeviceSnapshot（版本对象）.device_series_id / captured_at | ID / Timestamp，R | 区分设备身份与某次快照；用户后补新建快照，不改历史 |
+| DeviceSnapshot.user_scope_id | ID，R | 快照归属的持久用户，由产生它的任务所有者写入；采用/回答只接受本人快照，他人快照按 RESOURCE_NOT_FOUND 处理。同一用户同一设备序列（按安装/上下文/用户槽）的重跑沿用 series_id 与 device_series_id，version 递增 |
 | DeviceSnapshot.gpus / selected_gpu_id | GpuSnapshot[] / ID?，R | 全部适配器；未确定当前游戏 GPU 时 selected_gpu_id=null |
 | DeviceSnapshot.cpu / memory_bytes | FieldValue<string> / FieldValue<int>，R | 正内存字节；未知不填 0 |
 | DeviceSnapshot.device_form / os_version | FieldValue<string> / FieldValue<string>，R | 台式/笔记本来源不明保留未知 |
@@ -398,6 +400,7 @@ TaskType 的输入是带 `kind` 的 TaskInput 联合类型，见 §9；禁止通
 | InformationResponse.answers / skipped_fields / raw_text | map<string,Scalar> / string[] / string，R | 两集合不能交叉、字段必须属于请求；自然语言归一不可靠时保留原话，字段仍 unresolved |
 | InformationResponse.conflict_selections / submitted_at | map<string,int> / Timestamp，R | 无冲突选项可空映射；索引对应该问题候选依据；submitted_at 后台登记 |
 | InformationResponse.result_refs / post_request_version / post_context_revision | ObjectRef[] / Revision / Revision，后台生成 | 回答/结果快照/请求修订原子；仅source_task且源任务非终态按守卫更新任务输入修订，facts_only禁止源任务写；部分回答使用post版本继续 |
+| InformationResponse.answered_fields / unresolved_fields / answered_values | string[] / string[] / map<string,Scalar>，后台生成，R | 描述本次响应自己的归一结果，不是请求投影的累积；answered_values[path] 是归一后的值（冲突选择取被选中候选），未归一原话只进 unresolved_fields，跳过路径不出现；三者互不交叉且 answered_values 的键等于 answered_fields |
 
 InformationResponse 的记录不可变；InformationRequest 是由回答/替代事件形成的投影。问题终态后补、关键项已明确跳过的继续规则见 state §7；领域字段更改仍由所属模块校验。
 

@@ -61,8 +61,10 @@ sequenceDiagram
 |---|---|---|
 | immutable_objects | id 主键；entity_type、schema_version、JSON payload；版本对象另建 unique(type,series_id,version) | 只 INSERT；类型/JSON关系由所有者核验，实体依赖写 references |
 | aggregate_heads / aggregate_snapshots | unique(type,id) / unique(type,id,revision)，request 的 version 映射 revision 列 | 更新头用 expected revision；每修订完整快照；状态事件同事务 |
-| domain_events | unique(target_type,target_id,dimension,sequence)；专用事件保留具体类型 | 追加；相关引用固定 ID/修订，不读取最新内容替代 |
+| domain_events | unique(target_type,target_id,dimension,sequence)；专用事件保留具体类型 | 追加；相关引用固定 ID/修订，不读取最新内容替代；只记录实际发生的状态，创建事件用 previous_state=null |
 | tasks / task_inputs / external_calls | task id；unique(task_id,input_revision)；按 state/创建次序索引 | calls 与原件独立于检查点，恢复查询全部父链审计 |
+| task_responses | unique(task_id,sequence)；response_id 唯一 | 回答与源任务的持久关联投影，只记录 source_task 响应；facts_only 不写。重跑任务按 sequence 升序合并回答，后到覆盖先到，后续 unresolved 删除先前值 |
+| device_series_slots | unique(user_scope_id,scope_key)；scope_key 取 installation:<id>/context:<id>/user | 设备序列槽投影，只由 DeviceService 在写快照的同一事务内维护；首次建槽，后续沿用 series_id/device_series_id 并递增 version |
 | current_applied / current_applied_events | unique(user_scope_id,installation_id)；事件 unique(scope,installation,pointer_revision) | 指针只接收本事务新 current_adoption ID；historical_record 不触碰 |
 | bindings | unique(segment_id,binding_revision)，关联段快照 | 开放与闭合绑定均追加，不 UPDATE 旧 effective_range |
 | idempotency | unique(scope,method,canonical_route,key)；存 hash/schema/原响应/墓碑 | 业务事务内登记，不自动过期 |

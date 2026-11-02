@@ -73,6 +73,8 @@ ImportedRecord.payload 保留原类型JSON，upstream_envelope 保存原 row 的
 
 `map_references(snapshot_id:ID)->ImportValidation` 仅针对 staging，局部返回 `accepted_record_ids:ID[],diagnostic_record_ids:ID[],checks:CheckResult[]`，全 R；不能跳过发布事务直接交推荐。导入后02 `build_package` 决定声明范围，不保证自动产生 actionable 推荐。解析/复制建议任务上限 120 秒为初值；大文件分块哈希并检查取消，无网络重试；存储错误可原 key 重试，显式修复需改变映射版本/上下文/输入指纹。
 
+导入前玩家可先为本次采集运行声明游戏映射：`declare_import_identity(run_id,legacy_game_id,game_revision_id)` 写入 `legacy_namespace="collector_run:<run_id>"` 的 IdentityMapping，target 为 Game.series_id，`declared_by_user_scope_id` 为声明者，check 为 `identity.declared`（pass，注明非外部验证）。provisional 游戏只能由声明者本人声明，verified 公开，legacy_unverified 拒绝；同一 `(namespace, legacy_value)` 已指向另一游戏时拒绝且不覆盖。映射缺失时导入仍为 retained_only；使用他人声明的映射按 RESOURCE_NOT_FOUND 处理。`sources.json` 的内联 `document` 只映射 `content_hash`/`truncated`/`retrieval_method` 到 SourceRevision，`document_file_id` 保持 null，不为内联文档另写受管理文件。
+
 ```json
 {
   "kind": "knowledge_import",

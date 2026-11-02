@@ -30,6 +30,8 @@
 
 ContextDeclarationInput.fields 只接受上述上下文标量路径、[04登记的运行条件路径](./04-performance.md#4-数据时钟与局部输入)及适配器登记的受控路径线索，不用于批量游戏设置采用；采用值使用 SettingDeclaration。字段用途/required_for 同时写 InformationRequest，避免“所有字段都必填”。GPU扫描失败时 gpus=[] 只表示本次未登记任何适配器成员，必须同时记录失败/未覆盖检查，不据此断言机器没有GPU；不造一个虚构GPU填列表。
 
+DeviceSnapshot 带 `user_scope_id`（持久任务所有者），采用与回答只接受本人快照。同一用户的重复扫描按槽投影沿用同一设备序列：有安装绑定时 `installation:<id>`，否则 `context:<id>`，两者皆无时 `user`；首次建槽，后续读取槽并令 version=该序列最新版本+1。已存回答只叠加到本次请求字段域，已答路径不再探测或提问；新问题字段集合与最近一条 source_task 请求相同且没有新增回答时不再建问题，任务以 input_unresolved 结束。
+
 ## 3. 组件与获取流程
 
 `ProbeAdapter` 只执行打包的查询参数，返回原始文本/结构及退出状态；`SnapshotAssembler` 做单位/类型/来源包装；`ContextResolver` 与02协调公共身份；`ConfigurationReader` 按已核验游戏适配器读取；`AdoptionService` 处理声明/合并；`QuestionPlanner` 汇集获取失败及冲突，交07管理生命周期。未来建议文件为 `game_app/device.py` 与 `game_app/adapters/windows_probe.py`、`game_app/adapters/games/`。

@@ -8,3 +8,7 @@
 
 # Preserve the original bytes and published SHA256 of frozen research artifacts.
 fh6-* -text
+
+# Product fixtures are hashed byte for byte by VAL-T01; a checkout that rewrote
+# their line endings would invalidate every recorded sha256.
+tests/fixtures/**/*.csv -text

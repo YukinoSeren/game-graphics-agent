@@ -501,7 +501,9 @@ def test_assess_reuse_follows_up_when_scope_coverage_is_missing(identity):
             gaps=(_gap("settings.quality"),),
         ))
     selected = _select(
-        identity, _request("部分覆盖的游戏", selected_game_revision_id=game.id), "selection-key"
+        identity,
+        _request("部分覆盖的游戏", selected_game_revision_id=game.id, platform="steam"),
+        "selection-key",
     )
 
     decision = identity.assess_reuse(
@@ -524,7 +526,9 @@ def test_assess_reuse_reuses_a_fully_covered_package(identity):
             cells=(_cell("settings.menu", "covered"), _cell("settings.quality", "not_applicable")),
         ))
     selected = _select(
-        identity, _request("完整覆盖的游戏", selected_game_revision_id=game.id), "selection-key"
+        identity,
+        _request("完整覆盖的游戏", selected_game_revision_id=game.id, platform="steam"),
+        "selection-key",
     )
 
     decision = identity.assess_reuse(
@@ -547,7 +551,9 @@ def test_assess_reuse_ignores_cells_for_other_operation_scopes(identity):
             cells=(_cell("settings.menu", "covered"), _cell("target.fps", "unknown", OTHER_SCOPE)),
         ))
     selected = _select(
-        identity, _request("多用途的游戏", selected_game_revision_id=game.id), "selection-key"
+        identity,
+        _request("多用途的游戏", selected_game_revision_id=game.id, platform="steam"),
+        "selection-key",
     )
 
     decision = identity.assess_reuse(
@@ -588,3 +594,135 @@ def test_collection_result_is_not_inferred_from_coverage(identity):
     assert package.stop_reason is None
     assert package.collection_execution_ref is None
     assert CollectionResult.completed_scope.value == "completed_scope"
+
+
+# --- review fix pass ---------------------------------------------------------
+
+def test_explicit_package_from_another_game_is_never_reused(identity):
+    game_a = _game(1, 101, "游戏甲")
+    game_b = _game(2, 201, "游戏乙")
+    with identity.repository.unit_of_work() as uow:
+        uow.insert_versioned("Game", game_a)
+        uow.insert_versioned("Game", game_b)
+        uow.insert_versioned("KnowledgePackage", _package(
+            3, game=game_b, cells=(_cell("settings.menu", "covered"),),
+        ))
+    selected = _select(
+        identity, _request("游戏甲", selected_game_revision_id=game_a.id, platform="steam"),
+        "selection-key",
+    )
+
+    decision = identity.assess_reuse(
+        game_context_id=selected.refs[2].entity_id,
+        device_snapshot_id=None,
+        package_id=_uid(3),
+        operation_scope=SCOPE,
+    )
+    assert decision.mode == "discover"
+    assert decision.package_id is None
+    assert any(check.status is CheckStatus.fail for check in decision.checks)
+
+
+def test_an_older_published_version_stays_reusable(identity):
+    game = _game(1, 101, "版本游戏")
+    old = _package(2, game=game, cells=(_cell("settings.menu", "covered"),), version=1)
+    newer = _package(3, game=game, cells=(_cell("settings.menu", "unknown"),), version=2,
+                     status=PublicationStatus.validated)
+    newer = newer.model_copy(update={"series_id": old.series_id, "parent_package_id": old.id})
+    with identity.repository.unit_of_work() as uow:
+        uow.insert_versioned("Game", game)
+        uow.insert_versioned("KnowledgePackage", old)
+        uow.insert_versioned("KnowledgePackage", newer)
+    selected = _select(
+        identity, _request("版本游戏", selected_game_revision_id=game.id, platform="steam"),
+        "selection-key",
+    )
+
+    explicit = identity.assess_reuse(
+        game_context_id=selected.refs[2].entity_id,
+        device_snapshot_id=None,
+        package_id=old.id,
+        operation_scope=SCOPE,
+    )
+    assert explicit.mode == "reuse"
+    assert explicit.package_id == old.id
+
+    automatic = identity.assess_reuse(
+        game_context_id=selected.refs[2].entity_id,
+        device_snapshot_id=None,
+        package_id=None,
+        operation_scope=SCOPE,
+    )
+    assert automatic.mode == "reuse"
+    assert automatic.package_id == old.id
+
+
+def test_unknown_platform_never_reports_reuse(identity):
+    game = _game(1, 101, "平台未知的游戏")
+    with identity.repository.unit_of_work() as uow:
+        uow.insert_versioned("Game", game)
+        uow.insert_versioned("KnowledgePackage", _package(
+            2, game=game, platforms=("epic",), cells=(_cell("settings.menu", "covered"),),
+        ))
+    selected = _select(
+        identity, _request("平台未知的游戏", selected_game_revision_id=game.id), "selection-key"
+    )
+
+    decision = identity.assess_reuse(
+        game_context_id=selected.refs[2].entity_id,
+        device_snapshot_id=None,
+        package_id=None,
+        operation_scope=SCOPE,
+    )
+    assert decision.mode != "reuse"
+    platform_check = next(c for c in decision.checks if c.check_id == "package.platform")
+    assert platform_check.status is CheckStatus.unknown
+
+
+def test_diagnosis_scopes_are_registered(identity):
+    game = _game(1, 101, "诊断游戏")
+    with identity.repository.unit_of_work() as uow:
+        uow.insert_versioned("Game", game)
+        uow.insert_versioned("KnowledgePackage", _package(
+            2, game=game, cells=(_cell("settings.menu", "covered", "diagnosis.stutter"),),
+        ).model_copy(update={"declared_scope": "diagnosis.stutter"}))
+    selected = _select(
+        identity, _request("诊断游戏", selected_game_revision_id=game.id, platform="steam"),
+        "selection-key",
+    )
+
+    decision = identity.assess_reuse(
+        game_context_id=selected.refs[2].entity_id,
+        device_snapshot_id=None,
+        package_id=None,
+        operation_scope="diagnosis.stutter",
+    )
+    assert decision.mode == "reuse"
+
+    with pytest.raises(ContractError):
+        identity.assess_reuse(
+            game_context_id=selected.refs[2].entity_id,
+            device_snapshot_id=None,
+            package_id=None,
+            operation_scope="diagnosis.",
+        )
+
+
+def test_declaration_slot_uses_the_specified_normalisation(identity):
+    # Canonically equivalent names share one slot...
+    composed = _select(identity, _request("Pok\u00e9mon"), "key-1")
+    decomposed = _select(identity, _request("Poke\u0301mon"), "key-2")
+    assert _selection(identity, composed.refs[0].entity_id).game_revision_id == \
+        _selection(identity, decomposed.refs[0].entity_id).game_revision_id
+    assert _count(identity.repository, "Game") == 1
+
+    # ...but internal whitespace and platform case are preserved as declared.
+    spaced = _select(identity, _request("Two  Spaces"), "key-3")
+    single = _select(identity, _request("Two Spaces"), "key-4")
+    assert _selection(identity, spaced.refs[0].entity_id).game_revision_id != \
+        _selection(identity, single.refs[0].entity_id).game_revision_id
+
+    upper = _select(identity, _request("Platform Game", platform="Steam"), "key-5")
+    lower = _select(identity, _request("Platform Game", platform="steam"), "key-6")
+    assert _selection(identity, upper.refs[0].entity_id).game_revision_id != \
+        _selection(identity, lower.refs[0].entity_id).game_revision_id

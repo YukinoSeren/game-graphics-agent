@@ -359,3 +359,82 @@ def test_windows_adapter_refuses_unregistered_paths_without_running_anything():
     # Whitelisted paths map to constant, read-only queries.
     assert "Win32_VideoController" in query_for("gpus.1.raw_name")
     assert "Win32_Processor" in query_for("cpu")
+
+
+# --- review fix pass ---------------------------------------------------------
+
+def test_a_sparse_gpu_index_is_matched_by_index_not_list_position(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU", "gpus.1.raw_name": "GPU B"})
+    repo, files, device, tasks = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "gpus.1.raw_name"])
+    outcome = tasks.run_once()
+
+    # The successfully probed GPU must not be asked about or park the task.
+    assert outcome.state.value == "completed"
+    assert _request(repo, accepted.task_id) is None
+    snapshot = _snapshot(repo, accepted.task_id)
+    assert [gpu.raw_name.value for gpu in snapshot.gpus] == ["GPU B"]
+
+
+def test_a_failed_gpu_index_is_asked_about_even_below_a_known_one(tmp_path):
+    probe = StubProbe(
+        values={"gpus.1.raw_name": "GPU B"},
+        failures={"gpus.0.raw_name": "PROBE_FAILED"},
+    )
+    repo, files, device, tasks = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["gpus.0.raw_name", "gpus.1.raw_name"])
+    outcome = tasks.run_once()
+
+    assert outcome.state.value == "waiting_input"
+    request = _request(repo, accepted.task_id)
+    assert [field.field_path for field in request.fields] == ["gpus.0.raw_name"]
+
+
+def test_zero_or_negative_measurements_are_not_known(tmp_path):
+    probe = StubProbe(values={
+        "memory_bytes": "0",
+        "display.refresh_hz": "-1",
+        "gpus.0.raw_name": "GPU A",
+        "gpus.0.vram_bytes": "0",
+    })
+    repo, files, device, tasks = _env(tmp_path, probe)
+    accepted = _scan(
+        tasks,
+        ["memory_bytes", "display.refresh_hz", "gpus.0.raw_name", "gpus.0.vram_bytes"],
+    )
+    tasks.run_once()
+
+    snapshot = _snapshot(repo, accepted.task_id)
+    assert snapshot.memory_bytes.value is None
+    assert snapshot.memory_bytes.unknown_reason == "parse_failed"
+    assert snapshot.display.refresh_hz.value is None
+    assert snapshot.gpus[0].vram_bytes.value is None
+
+
+def test_unknown_game_context_is_rejected_before_probing(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU"})
+    repo, files, device, tasks = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu"], game_context_id=_uid(999))
+    tasks.run_once()
+
+    assert probe.calls == []
+    with repo.unit_of_work() as uow:
+        row = uow.query("SELECT * FROM tasks WHERE task_id=?", (accepted.task_id,))[0]
+        snapshots = uow.query(
+            "SELECT COUNT(*) AS n FROM objects WHERE entity_type='DeviceSnapshot'"
+        )[0]["n"]
+    assert row["last_error_code"] == ErrorCode.REFERENCE_INVALID.value
+    assert snapshots == 0
+
+
+def test_device_questions_reference_the_snapshot_they_are_about(tmp_path):
+    probe = StubProbe(failures={"gpus.0.raw_name": "PROBE_FAILED"})
+    repo, files, device, tasks = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["gpus.0.raw_name"])
+    tasks.run_once()
+
+    request = _request(repo, accepted.task_id)
+    snapshot = _snapshot(repo, accepted.task_id)
+    assert [ref.entity_type for ref in request.context_refs] == ["DeviceSnapshot"]
+    assert request.context_refs[0].entity_id == snapshot.id
+    assert request.context_refs[0].version == snapshot.version

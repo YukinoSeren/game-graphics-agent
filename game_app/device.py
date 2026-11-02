@@ -121,15 +121,31 @@ class DeviceService:
                 "the device scan handler received another task type",
             )
         paths = self._validate_paths(task_input.field_paths)
+        # Reference errors are rejected before any probe or managed file exists.
+        stored_context = None
+        if task_input.game_context_id is not None:
+            stored_context = self.repository.find_object(
+                "GameContext", task_input.game_context_id
+            )
+            if stored_context is None:
+                raise ContractError(
+                    ErrorCode.REFERENCE_INVALID,
+                    "the referenced game context does not exist",
+                    field_errors=[FieldError(
+                        path="game_context_id", code="reference", message="unknown context",
+                    )],
+                )
 
         readings = self._read(paths)
         snapshot_id = new_id()
         artifacts = self._store_originals(snapshot_id, readings)
-        snapshot = self._assemble(snapshot_id, paths, readings, artifacts)
+        snapshot, gpus_by_index = self._assemble(snapshot_id, paths, readings, artifacts)
         with self.repository.unit_of_work() as uow:
             uow.insert_versioned("DeviceSnapshot", snapshot)
 
-        request = self._plan_questions(context, task_input, snapshot, readings)
+        request = self._plan_questions(
+            context, task_input, snapshot, readings, gpus_by_index, stored_context
+        )
         if request is not None:
             with self.repository.unit_of_work() as uow:
                 uow.insert_object("InformationRequest", request)
@@ -142,7 +158,7 @@ class DeviceService:
 
         critical_unknown = [
             path for path in paths
-            if is_critical(path) and not self._is_known(snapshot, path)
+            if is_critical(path) and not self._is_known(snapshot, path, gpus_by_index)
         ]
         if critical_unknown and request is not None:
             # The player must answer before device matching can proceed; the
@@ -151,7 +167,7 @@ class DeviceService:
                 information_request_id=request.id, result_refs=result_refs
             )
 
-        known = [path for path in paths if self._is_known(snapshot, path)]
+        known = [path for path in paths if self._is_known(snapshot, path, gpus_by_index)]
         if not known:
             code = "unavailable"
             state = TaskState.failed
@@ -241,7 +257,7 @@ class DeviceService:
         paths: Sequence[str],
         readings: Sequence[ProbeReading],
         originals: dict[str, Any],
-    ) -> DeviceSnapshot:
+    ) -> tuple[DeviceSnapshot, dict[int, GpuSnapshot]]:
         by_path = {reading.field_path: reading for reading in readings}
         captured = utc_now()
 
@@ -254,21 +270,26 @@ class DeviceService:
             if _GPU_PATH.match(path) is not None
         })
         gpus: list[GpuSnapshot] = []
+        # The snapshot list is compacted, so keep the probe index alongside it:
+        # gpus.1.* must never be answered by the list's first entry.
+        gpus_by_index: dict[int, GpuSnapshot] = {}
         for index in gpu_indices:
             raw_name = value_for(f"gpus.{index}.raw_name", _parse_text)
             if raw_name.value_state is not ValueState.known:
                 # No adapter member is registered without a known name; the
                 # failure stays visible in checks and questions.
                 continue
-            gpus.append(GpuSnapshot(
+            gpu = GpuSnapshot(
                 id=new_id(),
                 raw_name=raw_name,
-                vram_bytes=value_for(f"gpus.{index}.vram_bytes", _parse_int),
+                vram_bytes=value_for(f"gpus.{index}.vram_bytes", _parse_positive_int),
                 driver_version=value_for(f"gpus.{index}.driver_version", _parse_text),
-            ))
+            )
+            gpus.append(gpu)
+            gpus_by_index[index] = gpu
 
-        width = value_for("display.desktop_resolution.width", _parse_int)
-        height = value_for("display.desktop_resolution.height", _parse_int)
+        width = value_for("display.desktop_resolution.width", _parse_positive_int)
+        height = value_for("display.desktop_resolution.height", _parse_positive_int)
         if (
             width.value_state is ValueState.known
             and height.value_state is ValueState.known
@@ -308,16 +329,16 @@ class DeviceService:
             gpus=gpus,
             selected_gpu_id=None,
             cpu=value_for("cpu", _parse_text),
-            memory_bytes=value_for("memory_bytes", _parse_int),
+            memory_bytes=value_for("memory_bytes", _parse_positive_int),
             device_form=value_for("device_form", _parse_text),
             os_version=value_for("os_version", _parse_text),
             display=DisplayContext(
                 desktop_resolution=resolution,
-                refresh_hz=value_for("display.refresh_hz", _parse_float),
+                refresh_hz=value_for("display.refresh_hz", _parse_positive_float),
             ),
             power_context={},
             checks=checks,
-        )
+        ), gpus_by_index
 
     def _field_value(self, path: str, reading, original, parser) -> FieldValue:
         if reading is None:
@@ -415,11 +436,13 @@ class DeviceService:
         task_input: DeviceScanInput,
         snapshot: DeviceSnapshot,
         readings: Sequence[ProbeReading],
+        gpus_by_index: dict[int, GpuSnapshot],
+        stored_context: Any,
     ) -> InformationRequest | None:
         unknown_paths = [
             reading.field_path
             for reading in readings
-            if not self._is_known(snapshot, reading.field_path)
+            if not self._is_known(snapshot, reading.field_path, gpus_by_index)
         ]
         if not unknown_paths:
             return None
@@ -440,14 +463,20 @@ class DeviceService:
             for path in sorted(unknown_paths)
         ]
         context_refs: list[VersionRef] = []
-        if task_input.game_context_id is not None:
-            stored = self.repository.get_object("GameContext", task_input.game_context_id)
+        if stored_context is not None:
             context_refs.append(VersionRef(
                 entity_type="GameContext",
-                entity_id=stored.object_id,
-                series_id=stored.series_id,
-                version=stored.version,
+                entity_id=stored_context.object_id,
+                series_id=stored_context.series_id,
+                version=stored_context.version,
             ))
+        # The question is about this exact device snapshot, not the latest one.
+        context_refs.append(VersionRef(
+            entity_type="DeviceSnapshot",
+            entity_id=snapshot.id,
+            series_id=snapshot.series_id,
+            version=snapshot.version,
+        ))
         return InformationRequest(
             id=new_id(),
             schema_version=PRODUCT_CONTRACT_VERSION,
@@ -467,7 +496,9 @@ class DeviceService:
         )
 
     @staticmethod
-    def _is_known(snapshot: DeviceSnapshot, path: str) -> bool:
+    def _is_known(
+        snapshot: DeviceSnapshot, path: str, gpus_by_index: dict[int, GpuSnapshot]
+    ) -> bool:
         if path in ("cpu", "memory_bytes", "os_version", "device_form"):
             return getattr(snapshot, path).value_state is ValueState.known
         if path == "display.desktop_resolution.width":
@@ -479,9 +510,10 @@ class DeviceService:
         match = _GPU_PATH.match(path)
         if match is not None:
             index, attribute = int(match.group(1)), match.group(2)
-            if index >= len(snapshot.gpus):
+            gpu = gpus_by_index.get(index)
+            if gpu is None:
                 return False
-            return getattr(snapshot.gpus[index], attribute).value_state is ValueState.known
+            return getattr(gpu, attribute).value_state is ValueState.known
         return False
 
 
@@ -500,6 +532,16 @@ def _parse_int(text: str | None) -> int | None:
         # Units are never guessed: a value like "16 GB" stays unknown.
         return None
     return int(value)
+
+
+def _parse_positive_int(text: str | None) -> int | None:
+    value = _parse_int(text)
+    return value if value is not None and value > 0 else None
+
+
+def _parse_positive_float(text: str | None) -> float | None:
+    value = _parse_float(text)
+    return value if value is not None and value > 0 else None
 
 
 def _parse_float(text: str | None) -> float | None:

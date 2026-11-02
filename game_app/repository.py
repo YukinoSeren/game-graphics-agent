@@ -11,6 +11,7 @@ import json
 import re
 import sqlite3
 import threading
+import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -1020,13 +1021,19 @@ class UnitOfWork:
     # -- declared game slots ------------------------------------------------
     @staticmethod
     def _normalise_game_name(raw_name: str) -> str:
+        """NFC, then strip, then casefold — no other rewriting.
+
+        Internal whitespace is preserved and the platform keeps its declared
+        value, because the slot only serves this user's own declarations and
+        must not merge names the player typed differently.
+        """
         if not isinstance(raw_name, str) or not raw_name.strip():
             raise ContractError(
                 ErrorCode.INPUT_VALIDATION_FAILED,
                 "a declared game name must not be empty",
                 field_errors=[FieldError(path="raw_name", code="required", message="empty name")],
             )
-        return " ".join(raw_name.split()).casefold()
+        return unicodedata.normalize("NFC", raw_name).strip().casefold()
 
     @staticmethod
     def _platform_key(platform: str | None) -> str:
@@ -1034,7 +1041,7 @@ class UnitOfWork:
             return "platform:unknown"
         if not platform.strip():
             raise ContractError(ErrorCode.INPUT_VALIDATION_FAILED, "declared platform must not be blank")
-        return "platform:" + platform.strip().casefold()
+        return "platform:" + unicodedata.normalize("NFC", platform)
 
     def get_or_create_game_declaration_slot(
         self, user_scope_id: str, raw_name: str, platform: str | None, new_series_id: str

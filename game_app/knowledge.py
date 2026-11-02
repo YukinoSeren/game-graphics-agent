@@ -28,7 +28,7 @@ from game_app.contracts.enums import (
     ValueState,
 )
 from game_app.contracts.knowledge import (
-    OPERATION_SCOPES,
+    is_registered_scope,
     Game,
     GameCatalogQuery,
     GameChoice,
@@ -462,7 +462,7 @@ class IdentityService:
         package_id: str | None,
         operation_scope: str,
     ) -> ReuseDecision:
-        if operation_scope not in OPERATION_SCOPES:
+        if not is_registered_scope(operation_scope):
             raise ContractError(
                 ErrorCode.INPUT_VALIDATION_FAILED,
                 f"unregistered operation scope: {operation_scope}",
@@ -476,9 +476,11 @@ class IdentityService:
         platform = context.platform.value if context.platform.value_state is ValueState.known else None
 
         with self.repository.unit_of_work() as uow:
+            # Every immutable package version is addressable; an older published
+            # version stays consumable after a newer one is prepared.
             packages = [
                 KnowledgePackage.model_validate_json(stored.payload_bytes)
-                for stored in uow.latest_objects("KnowledgePackage")
+                for stored in uow.iter_objects("KnowledgePackage")
             ]
         published = [
             package for package in packages
@@ -499,7 +501,14 @@ class IdentityService:
                     reason="the requested package cannot be consumed",
                 )
         else:
-            compatible = [package for package in published if self._platform_ok(package, platform)]
+            if platform is None:
+                # Unknown platform: keep the newest published package so the
+                # decision can report exactly what must be verified.
+                compatible = list(published)
+            else:
+                compatible = [
+                    package for package in published if self._platform_ok(package, platform)
+                ]
             compatible.sort(key=lambda package: (package.created_at, package.version))
             chosen = compatible[-1] if compatible else None
 
@@ -511,6 +520,32 @@ class IdentityService:
             return ReuseDecision(
                 package_id=None, mode="discover", checks=checks, gap_keys=[],
                 reason="no reusable package exists for this game and platform",
+            )
+
+        if chosen.game_id != context.game_id:
+            checks.append(self._reuse_check(
+                "package.game", CheckStatus.fail,
+                "the package belongs to another game",
+            ))
+            return ReuseDecision(
+                package_id=None, mode="discover", checks=checks, gap_keys=[],
+                reason="the requested package was built for another game",
+            )
+        checks.append(self._reuse_check(
+            "package.game", CheckStatus.pass_, "the package belongs to this game",
+        ))
+
+        if platform is None:
+            # Without a declared platform no package can be called compatible;
+            # an unverified relation stays unknown rather than passing.
+            checks.append(self._reuse_check(
+                "package.platform", CheckStatus.unknown,
+                "the context platform is unknown, so package compatibility is unverified",
+            ))
+            return ReuseDecision(
+                package_id=chosen.id, mode="followup", checks=checks,
+                gap_keys=["package.platform"],
+                reason="declare the platform before reusing another platform's package",
             )
 
         if not self._platform_ok(chosen, platform):
@@ -603,8 +638,9 @@ class IdentityService:
 
     @staticmethod
     def _platform_ok(package: KnowledgePackage, platform: str | None) -> bool:
+        # An unknown platform never proves compatibility.
         if platform is None:
-            return True
+            return False
         return _norm(platform) in {_norm(item) for item in package.platform_scope}
 
     @staticmethod

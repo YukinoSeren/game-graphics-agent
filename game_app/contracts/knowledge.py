@@ -39,6 +39,19 @@ OPERATION_SCOPES = frozenset({
     "recommendation.target",
     "comparison.settings_effect",
 })
+DIAGNOSIS_SCOPE_PREFIX = "diagnosis."
+
+
+def is_registered_scope(scope: str) -> bool:
+    """Fixed scopes plus the registered ``diagnosis.<symptom>`` family."""
+    if scope in OPERATION_SCOPES:
+        return True
+    return (
+        scope.startswith(DIAGNOSIS_SCOPE_PREFIX)
+        and len(scope) > len(DIAGNOSIS_SCOPE_PREFIX)
+        and scope[len(DIAGNOSIS_SCOPE_PREFIX):].strip() == scope[len(DIAGNOSIS_SCOPE_PREFIX):]
+        and bool(scope[len(DIAGNOSIS_SCOPE_PREFIX):])
+    )
 
 
 class GameAlias(StrictModel):
@@ -165,7 +178,7 @@ class KnowledgePackage(StrictModel):
     def platform_and_scope(self) -> "KnowledgePackage":
         if not self.platform_scope:
             raise ValueError("a knowledge package declares a non-empty platform scope")
-        if self.declared_scope not in OPERATION_SCOPES:
+        if not is_registered_scope(self.declared_scope):
             raise ValueError(f"unregistered operation scope: {self.declared_scope}")
         return self
 
@@ -276,6 +289,8 @@ class IdentityResolution(StrictModel):
 
 __all__ = [
     "OPERATION_SCOPES",
+    "DIAGNOSIS_SCOPE_PREFIX",
+    "is_registered_scope",
     "GameAlias",
     "Game",
     "IdentityMapping",

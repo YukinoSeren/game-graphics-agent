@@ -7,8 +7,11 @@ touches a player library or a real provider.
 import hashlib
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
+
+import game_app.files as files_module
 
 from game_app.contracts.common import MutationContext
 from game_app.errors import ContractError, ErrorCode
@@ -361,6 +364,32 @@ def test_concurrent_first_publish_replays_the_committed_response(tmp_path):
     assert len({tuple(result.file_ids) for result in results}) == 1
     assert len({result.operation_id for result in results}) == 1
     assert len(writer_calls) == 1
+
+
+def test_identical_concurrent_rename_is_not_a_commit_failure(tmp_path, monkeypatch):
+    """Windows refuses an os.replace onto a file another thread has open.
+
+    When that concurrent writer put the *same* bytes in place for the same
+    frozen file, the submission is not a storage failure: only the timing was
+    different.
+    """
+    repo = ProductRepository(tmp_path / "product.sqlite3")
+    repo.migrate()
+    service = FileService(repo, tmp_path / "managed")
+
+    def racing_replace(source, destination):
+        Path(destination).write_bytes(Path(source).read_bytes())
+        raise PermissionError("simulated sharing violation on rename")
+
+    monkeypatch.setattr(files_module.os, "replace", racing_replace)
+
+    published = _publish(service)
+
+    final = tmp_path / "managed" / "objects" / published.file_ids[0]
+    assert final.is_file()
+    assert hashlib.sha256(final.read_bytes()).hexdigest() == hashlib.sha256(
+        b'{"value": 1}\n'
+    ).hexdigest()
 
 
 def test_backup_refuses_when_a_published_file_is_missing(tmp_path):

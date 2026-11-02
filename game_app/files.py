@@ -603,6 +603,21 @@ class FileService:
                 os.replace(temporary, final)
             except OSError as error:
                 temporary.unlink(missing_ok=True)
+                # A concurrent submission of the same key may have renamed
+                # identical bytes into place first; on Windows the second
+                # os.replace then fails with a sharing violation.  Identical
+                # content is not a conflict — verify and accept it.
+                try:
+                    already_identical = (
+                        final.is_file()
+                        and hashlib.sha256(final.read_bytes()).hexdigest() == entry.sha256
+                    )
+                except OSError:
+                    already_identical = False
+                if already_identical:
+                    if hooks.after_rename is not None:
+                        hooks.after_rename(final)
+                    continue
                 raise ContractError(
                     ErrorCode.STORAGE_COMMIT_FAILED,
                     "the managed file could not be written; nothing was published",

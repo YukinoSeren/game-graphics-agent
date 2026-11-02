@@ -18,7 +18,7 @@ from game_app.errors import ContractError, ErrorCode
 from game_app.files import PublishHooks
 from game_app.performance import PerformanceService
 from game_app.repository import canonical_json
-from tests.product.support.configuration import USER, context_key, setup, uid
+from tests.product.support.configuration import USER, context_key, setup, store_raw, uid
 from tests.product.test_sessions import FakeClock
 
 SAMPLE_DIR = (
@@ -31,11 +31,19 @@ def _service(repository, files, clock):
     return PerformanceService(repository, files, clock=clock)
 
 
-def _log_file(files) -> tuple[str, str]:
+def _log_file(files, *, user_scope_id: str = USER, key: str = "fixture-log") -> tuple[str, str]:
     data = (SAMPLE_DIR / "basic.csv").read_bytes()
-    file_id = files.store_artifact(data, relative_name="basic.csv", stable_key="log-basic")
-    sha = hashlib.sha256(data).hexdigest()
-    return file_id, sha
+    published = files.publish(
+        kind="import",
+        files={f"logs/{key}.csv": data},
+        user_scope_id=user_scope_id,
+        method="POST",
+        canonical_route="/api/log-files",
+        key=key,
+        request_schema_version="product-contract/0.4",
+        request_hash=hashlib.sha256(data).hexdigest(),
+    )
+    return published.file_ids[0], hashlib.sha256(data).hexdigest()
 
 
 def _count(repository, entity_type) -> int:
@@ -111,8 +119,8 @@ def _request(payload) -> LogAssociationRequest:
     return LogAssociationRequest.model_validate_json(canonical_json(payload))
 
 
-def _inspection_stream(service, file_id):
-    inspection = service.inspect_log(file_id, SOURCE_SCHEMA)
+def _inspection_stream(service, file_id, user_scope_id=USER):
+    inspection = service.inspect_log(file_id, SOURCE_SCHEMA, user_scope_id)
     return inspection, inspection.streams[0].stream_key
 
 
@@ -125,7 +133,7 @@ def test_inspect_log_is_bounded_and_read_only(tmp_path):
     file_id, sha = _log_file(files)
     before = _count(repository, "PlaySession") + _count(repository, "CaptureArtifact")
 
-    inspection = service.inspect_log(file_id, SOURCE_SCHEMA)
+    inspection = service.inspect_log(file_id, SOURCE_SCHEMA, USER)
 
     assert inspection.file_id == file_id
     assert inspection.content_hash == sha
@@ -150,7 +158,7 @@ def test_inspect_log_refuses_a_schema_the_file_does_not_match(tmp_path):
     file_id, _ = _log_file(files)
 
     with pytest.raises(ContractError) as caught:
-        service.inspect_log(file_id, "made-up/v9")
+        service.inspect_log(file_id, "made-up/v9", USER)
 
     assert caught.value.code is ErrorCode.UNSUPPORTED_ARTIFACT_FORMAT
     # The original is retained and still consumable.
@@ -161,10 +169,10 @@ def test_inspect_log_refuses_an_unregistered_header(tmp_path):
     repository, files, installation_id, context_id, device_id = setup(tmp_path)
     service = _service(repository, files, FakeClock())
     data = (SAMPLE_DIR / "unregistered.csv").read_bytes()
-    file_id = files.store_artifact(data, relative_name="unregistered.csv", stable_key="log-unreg")
+    file_id, _ = _publish_log(files, data, key="log-unreg")
 
     with pytest.raises(ContractError) as caught:
-        service.inspect_log(file_id, SOURCE_SCHEMA)
+        service.inspect_log(file_id, SOURCE_SCHEMA, USER)
 
     assert caught.value.code is ErrorCode.UNSUPPORTED_ARTIFACT_FORMAT
     assert files.read_managed_file(file_id) == data
@@ -553,3 +561,328 @@ def test_a_retry_after_a_failed_commit_returns_the_same_artifact(tmp_path):
     assert result.refs[0].entity_type == "CaptureArtifact"
     assert _count(repository, "CaptureArtifact") == 1
     assert _count(repository, "PlaySession") == 1
+
+
+# --- review follow-ups: ownership, in-transaction checks, honest selections --
+
+from game_app.files import PublishHooks
+
+
+def _publish_log(files, data: bytes, *, user_scope_id: str = USER, key: str = "log-publish"):
+    published = files.publish(
+        kind="import",
+        files={"logs/basic.csv": data},
+        user_scope_id=user_scope_id,
+        method="POST",
+        canonical_route="/api/log-files",
+        key=key,
+        request_schema_version="product-contract/0.4",
+        request_hash=hashlib.sha256(data).hexdigest(),
+    )
+    return published.file_ids[0], hashlib.sha256(data).hexdigest()
+
+
+def _other_user(repository, files, clock):
+    """Another user's installation, context, device and an open session."""
+    from game_app.contracts.device import GameInstallation
+    from game_app.contracts.primitives import utc_now
+    from game_app.contracts.performance import CreateSessionRequest
+    from tests.product.support.configuration import unknown_platform
+
+    other = uid(950)
+    installation_id = uid(951)
+    with repository.unit_of_work() as uow:
+        uow.insert_versioned("GameInstallation", GameInstallation(
+            id=installation_id,
+            schema_version="product-contract/0.4",
+            created_at=utc_now(),
+            created_by_task_id=None,
+            series_id=installation_id,
+            version=1,
+            revision=1,
+            user_scope_id=other,
+            game_id="b" * 32,
+            origin="user_provided",
+            platform=unknown_platform(),
+            private_path_ref=None,
+        ))
+    context_id = store_raw(repository, "GameContext", {
+        "id": uid(952), "installation_id": installation_id, "game_id": "b" * 32,
+    })
+    device_id = store_raw(repository, "DeviceSnapshot", {
+        "id": uid(953), "user_scope_id": other,
+    })
+    service = PerformanceService(repository, files, clock=clock)
+    created = service.create_session(
+        CreateSessionRequest.model_validate_json(canonical_json({
+            "installation_id": installation_id,
+            "device_snapshot_id": device_id,
+            "game_context_id": context_id,
+            "applied_id": None,
+            "configuration_state": "unverified",
+            "run_declaration": {
+                "installation_id": installation_id, "fields": {}, "raw_text": "",
+            },
+            "test_protocol_id": None,
+            "recommendation_id": None,
+        })),
+        context_key("other-session", user=other),
+    )
+    return other, installation_id, context_id, device_id, created
+
+
+def test_inspect_and_association_hide_another_users_file(tmp_path):
+    repository, files, installation_id, context_id, device_id = setup(tmp_path)
+    clock = FakeClock()
+    service = _service(repository, files, clock)
+    data = (SAMPLE_DIR / "basic.csv").read_bytes()
+    file_id, sha = _publish_log(files, data)
+    _, stream_key = _inspection_stream(service, file_id)
+    other, other_installation, other_context, other_device, _ = _other_user(
+        repository, files, clock
+    )
+
+    with pytest.raises(ContractError) as caught:
+        service.inspect_log(file_id, SOURCE_SCHEMA, other)
+    assert caught.value.code is ErrorCode.RESOURCE_NOT_FOUND
+
+    payload = _historical_payload(
+        other_installation, other_context, other_device, file_id, sha, stream_key=stream_key,
+    )
+    with pytest.raises(ContractError) as caught:
+        service.associate_log(
+            _request(payload),
+            context_key("foreign-file").model_copy(update={"user_scope_id": other}),
+        )
+    assert caught.value.code is ErrorCode.RESOURCE_NOT_FOUND
+    assert _count(repository, "CaptureArtifact") == 0
+
+
+def test_a_file_without_a_recorded_owner_is_not_consumer_visible(tmp_path):
+    repository, files, installation_id, context_id, device_id = setup(tmp_path)
+    service = _service(repository, files, FakeClock())
+    data = (SAMPLE_DIR / "basic.csv").read_bytes()
+    file_id = files.store_artifact(data, relative_name="basic.csv", stable_key="anon-log")
+
+    with pytest.raises(ContractError) as caught:
+        service.inspect_log(file_id, SOURCE_SCHEMA, USER)
+
+    assert caught.value.code is ErrorCode.RESOURCE_NOT_FOUND
+
+
+def test_the_source_hash_is_rechecked_inside_the_write_transaction(tmp_path):
+    repository, files, installation_id, context_id, device_id = setup(tmp_path)
+    clock = FakeClock()
+    service = _service(repository, files, clock)
+    data = (SAMPLE_DIR / "basic.csv").read_bytes()
+    file_id, sha = _publish_log(files, data)
+    _, stream_key = _inspection_stream(service, file_id)
+    request = _request(_historical_payload(
+        installation_id, context_id, device_id, file_id, sha, stream_key=stream_key,
+    ))
+
+    def tamper():
+        (files.objects_dir / file_id).write_bytes(data + b"tampered\n")
+
+    with pytest.raises(ContractError) as caught:
+        service.associate_log(
+            request, context_key("tampered"), hooks=PublishHooks(before_commit=tamper)
+        )
+
+    assert caught.value.code is ErrorCode.ARTIFACT_UNAVAILABLE
+    assert _count(repository, "CaptureArtifact") == 0
+    assert _count(repository, "PlaySession") == 0
+
+
+def test_an_existing_target_records_the_selected_stream(tmp_path):
+    repository, files, installation_id, context_id, device_id = setup(tmp_path)
+    clock = FakeClock()
+    service = _service(repository, files, clock)
+    session_payload = {
+        "installation_id": installation_id,
+        "device_snapshot_id": device_id,
+        "game_context_id": context_id,
+        "applied_id": None,
+        "configuration_state": "unverified",
+        "run_declaration": {
+            "installation_id": installation_id, "fields": {}, "raw_text": "",
+        },
+        "test_protocol_id": None,
+        "recommendation_id": None,
+    }
+    session = service.create_session(
+        CreateSessionRequest.model_validate_json(canonical_json(session_payload)),
+        context_key("session-1"),
+    )
+    session_id = session.refs[1].entity_id
+    segment_id = session.refs[2].entity_id
+    data = (SAMPLE_DIR / "basic.csv").read_bytes()
+    file_id, sha = _publish_log(files, data)
+    _, stream_key = _inspection_stream(service, file_id)
+    clock.advance(1)
+
+    service.associate_log(
+        _request(_existing_payload(
+            session_id, segment_id, 1, 1, file_id, sha,
+            stream_key=stream_key, close_at_s=0.5,
+        )),
+        context_key("assoc-existing"),
+    )
+
+    segment = service.get_segment(segment_id, USER)
+    assert segment.stream_selection.frame_stream_kind.value == "application_present"
+    assert segment.stream_selection.process.pid == 4242
+    stream_check = next(
+        check for check in segment.stream_selection.checks
+        if check.check_id == "segment.stream"
+    )
+    assert stream_check.status.value == "pass"
+
+
+def test_an_unknown_frame_stream_is_never_claimed_as_application_present(tmp_path):
+    repository, files, installation_id, context_id, device_id = setup(tmp_path)
+    clock = FakeClock()
+    service = _service(repository, files, clock)
+    data = (SAMPLE_DIR / "fg-unknown.csv").read_bytes()
+    file_id, sha = _publish_log(files, data)
+
+    inspection = service.inspect_log(file_id, SOURCE_SCHEMA, USER)
+
+    assert inspection.streams
+    assert {item.frame_stream_kind.value for item in inspection.streams} == {"unknown"}
+    assert any("frame generation" in note for note in inspection.limitations)
+
+
+def test_the_artifact_cites_its_declaration_manifest(tmp_path):
+    repository, files, installation_id, context_id, device_id = setup(tmp_path)
+    clock = FakeClock()
+    service = _service(repository, files, clock)
+    file_id, sha = _log_file(files)
+    _, stream_key = _inspection_stream(service, file_id)
+
+    result = service.associate_log(
+        _request(_historical_payload(
+            installation_id, context_id, device_id, file_id, sha, stream_key=stream_key,
+        )),
+        context_key("assoc-manifest"),
+    )
+
+    artifact = repository.get_object("CaptureArtifact", result.refs[0].entity_id).payload
+    manifest_id = result.refs[1].entity_id
+    for check in artifact["checks"]:
+        if check["check_id"] in ("log.association", "log.evidence"):
+            assert any(
+                ref["kind"] == "artifact" and ref["file_id"] == manifest_id
+                for ref in check["evidence_refs"]
+            ), check["check_id"]
+    evidence_check = next(
+        check for check in artifact["checks"] if check["check_id"] == "log.evidence"
+    )
+    assert evidence_check["status"] == "pass"
+    assert evidence_check["evidence_refs"]
+
+
+def test_foreign_identifiers_are_not_found_rather_than_conflicts(tmp_path):
+    repository, files, installation_id, context_id, device_id = setup(tmp_path)
+    clock = FakeClock()
+    service = _service(repository, files, clock)
+    created = service.create_session(
+        CreateSessionRequest.model_validate_json(canonical_json({
+            "installation_id": installation_id,
+            "device_snapshot_id": device_id,
+            "game_context_id": context_id,
+            "applied_id": None,
+            "configuration_state": "unverified",
+            "run_declaration": {
+                "installation_id": installation_id, "fields": {}, "raw_text": "",
+            },
+            "test_protocol_id": None,
+            "recommendation_id": None,
+        })),
+        context_key("my-session"),
+    )
+    my_segment = created.refs[2].entity_id
+    other, other_installation, other_context, other_device, other_session = _other_user(
+        repository, files, clock
+    )
+    file_id, sha = _log_file(files)
+    _, stream_key = _inspection_stream(service, file_id)
+
+    foreign_segment = _existing_payload(
+        other_session.refs[1].entity_id, my_segment, 1, 1, file_id, sha,
+        stream_key=stream_key, close_at_s=1.0,
+    )
+    with pytest.raises(ContractError) as caught:
+        service.associate_log(
+            _request(foreign_segment),
+            context_key("foreign-segment").model_copy(update={"user_scope_id": other}),
+        )
+    assert caught.value.code is ErrorCode.RESOURCE_NOT_FOUND
+
+    foreign_context = _historical_payload(
+        other_installation, context_id, other_device, file_id, sha, stream_key=stream_key,
+    )
+    with pytest.raises(ContractError) as caught:
+        service.associate_log(
+            _request(foreign_context),
+            context_key("foreign-context").model_copy(update={"user_scope_id": other}),
+        )
+    assert caught.value.code is ErrorCode.RESOURCE_NOT_FOUND
+    assert _count(repository, "CaptureArtifact") == 0
+
+
+def test_a_close_point_cannot_lie_in_the_future(tmp_path):
+    repository, files, installation_id, context_id, device_id = setup(tmp_path)
+    clock = FakeClock()
+    service = _service(repository, files, clock)
+    session = service.create_session(
+        CreateSessionRequest.model_validate_json(canonical_json({
+            "installation_id": installation_id,
+            "device_snapshot_id": device_id,
+            "game_context_id": context_id,
+            "applied_id": None,
+            "configuration_state": "unverified",
+            "run_declaration": {
+                "installation_id": installation_id, "fields": {}, "raw_text": "",
+            },
+            "test_protocol_id": None,
+            "recommendation_id": None,
+        })),
+        context_key("session-1"),
+    )
+    session_id = session.refs[1].entity_id
+    segment_id = session.refs[2].entity_id
+    file_id, sha = _log_file(files)
+    _, stream_key = _inspection_stream(service, file_id)
+    clock.advance(1)
+
+    with pytest.raises(ContractError) as caught:
+        service.associate_log(
+            _request(_existing_payload(
+                session_id, segment_id, 1, 1, file_id, sha,
+                stream_key=stream_key, close_at_s=100.0,
+            )),
+            context_key("future-close"),
+        )
+
+    assert caught.value.code is ErrorCode.INPUT_VALIDATION_FAILED
+    assert service.get_segment(segment_id, USER).end_s is None
+    assert _count(repository, "CaptureArtifact") == 0
+
+
+def test_a_historical_end_cannot_lie_in_the_future(tmp_path):
+    repository, files, installation_id, context_id, device_id = setup(tmp_path)
+    clock = FakeClock()
+    service = _service(repository, files, clock)
+    file_id, sha = _log_file(files)
+    _, stream_key = _inspection_stream(service, file_id)
+    payload = _historical_payload(
+        installation_id, context_id, device_id, file_id, sha, stream_key=stream_key,
+    )
+    payload["target"]["started_at"] = clock()
+
+    with pytest.raises(ContractError) as caught:
+        service.associate_log(_request(payload), context_key("future-end"))
+
+    assert caught.value.code is ErrorCode.PRECONDITION_UNVERIFIED
+    assert _count(repository, "PlaySession") == 0

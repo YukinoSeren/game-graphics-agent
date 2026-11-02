@@ -343,7 +343,7 @@ def test_bind_configuration_appends_without_moving_the_current_pointer(tmp_path)
         "series_id": uid(501),
         "version": 1,
     })
-    evidence_file = files.store_artifact(b"historical basis\n", relative_name="basis.txt", stable_key="basis-1")
+    evidence_file = files.store_artifact(b"historical basis\n", relative_name="basis.txt", stable_key="basis-1", user_scope_id=USER)
     evidence_hash = repository.get_object("ManagedFile", evidence_file).payload["manifest"]["sha256"]
     payload = {
         "segment_id": segment_id,
@@ -624,7 +624,7 @@ def test_binding_needs_an_ended_segment_and_evidence(tmp_path):
         "id": uid(510), "user_scope_id": USER, "installation_id": installation_id,
         "series_id": uid(511), "version": 1,
     })
-    evidence_file = files.store_artifact(b"basis\n", relative_name="basis.txt", stable_key="basis-2")
+    evidence_file = files.store_artifact(b"basis\n", relative_name="basis.txt", stable_key="basis-2", user_scope_id=USER)
     evidence_hash = repository.get_object("ManagedFile", evidence_file).payload["manifest"]["sha256"]
     evidence = {
         "kind": "artifact", "file_id": evidence_file,
@@ -793,7 +793,7 @@ def test_a_historical_configuration_reads_the_real_segment_projection(tmp_path):
     segment_id = created.refs[2].entity_id
     clock.advance(10)
     service.end_segment(_end(segment_id), context_key("end-1"))
-    evidence_file = files.store_artifact(b"past basis\n", relative_name="past.txt", stable_key="past-1")
+    evidence_file = files.store_artifact(b"past basis\n", relative_name="past.txt", stable_key="past-1", user_scope_id=USER)
     evidence_hash = repository.get_object("ManagedFile", evidence_file).payload["manifest"]["sha256"]
     evidence = {
         "kind": "artifact", "file_id": evidence_file,
@@ -930,7 +930,7 @@ def test_analysis_of_a_closed_earlier_revision_is_allowed(tmp_path):
         "id": uid(520), "user_scope_id": USER, "installation_id": installation_id,
         "series_id": uid(521), "version": 1,
     })
-    evidence_file = files.store_artifact(b"basis\n", relative_name="basis.txt", stable_key="basis-3")
+    evidence_file = files.store_artifact(b"basis\n", relative_name="basis.txt", stable_key="basis-3", user_scope_id=USER)
     evidence_hash = repository.get_object("ManagedFile", evidence_file).payload["manifest"]["sha256"]
     service.bind_configuration(
         BindConfigurationRequest.model_validate_json(canonical_json({
@@ -1022,7 +1022,7 @@ def test_historical_configuration_cannot_use_another_users_segment(tmp_path):
     clock.advance(10)
     service.end_segment(_end(segment_id), context_key("end-1"))
     other, other_installation, other_context, other_device = _other_user(repository)
-    evidence_file = files.store_artifact(b"past\n", relative_name="past.txt", stable_key="past-9")
+    evidence_file = files.store_artifact(b"past\n", relative_name="past.txt", stable_key="past-9", user_scope_id=USER)
     evidence_hash = repository.get_object("ManagedFile", evidence_file).payload["manifest"]["sha256"]
     evidence = {
         "kind": "artifact", "file_id": evidence_file,

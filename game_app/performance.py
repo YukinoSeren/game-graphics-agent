@@ -772,7 +772,7 @@ class PerformanceService:
                     "a historical binding needs an ended segment; today's configuration"
                     " cannot be projected into a past period",
                 )
-            self._evidence_problems(uow, request.evidence_refs)
+            self._evidence_problems(uow, request.evidence_refs, context.user_scope_id)
             if not request.evidence_refs:
                 raise ContractError(
                     ErrorCode.PRECONDITION_UNVERIFIED,
@@ -1206,10 +1206,13 @@ class PerformanceService:
         return TestProtocol.model_validate_json(stored.payload_bytes)
 
     # -- historical log preview and association (04 §4.3) ------------------
-    def inspect_log(self, file_id: str, source_schema: str) -> LogInspection:
+    def inspect_log(
+        self, file_id: str, source_schema: str, user_scope_id: str
+    ) -> LogInspection:
         """Bounded, read-only preview: no session, artifact or model call."""
         stored = self.repository.get_object("ManagedFile", file_id)
         payload = stored.payload
+        self._require_file_owner(payload, user_scope_id)
         if payload.get("file_status") != "published":
             raise ContractError(
                 ErrorCode.ARTIFACT_UNAVAILABLE, "the log file is not consumable"
@@ -1307,6 +1310,7 @@ class PerformanceService:
     ) -> dict[str, Any]:
         stored = self.repository.get_object("ManagedFile", request.file_id)
         payload = stored.payload
+        self._require_file_owner(payload, user_scope_id)
         if payload.get("file_status") != "published":
             raise ContractError(
                 ErrorCode.ARTIFACT_UNAVAILABLE, "the log file is not consumable"
@@ -1386,7 +1390,7 @@ class PerformanceService:
         time_mapping: TimeMapping,
         ids: Mapping[str, str],
     ) -> dict[str, Any]:
-        self._evidence_problems(uow, request.evidence_refs)
+        self._evidence_problems(uow, request.evidence_refs, user_scope_id)
         if not request.evidence_refs:
             raise ContractError(
                 ErrorCode.PRECONDITION_UNVERIFIED,
@@ -1401,6 +1405,9 @@ class PerformanceService:
 
         if isinstance(target, HistoricalLogTarget):
             installation = self._installation(uow, target.installation_id, user_scope_id)
+            # Visibility first: a foreign context is RESOURCE_NOT_FOUND, never a
+            # reference error that confirms the id exists.
+            self._context_game(uow, target.game_context_id, user_scope_id)
             self._context(uow, target.game_context_id, installation)
             self._device_snapshot(uow, target.device_snapshot_id, user_scope_id)
             self._require_declaration_installation(
@@ -1432,6 +1439,12 @@ class PerformanceService:
             if not math.isfinite(duration) or duration <= 0:
                 raise _invalid(
                     "source_range", "range", "the source range yields no positive duration"
+                )
+            if started + timedelta(seconds=duration) > now:
+                raise ContractError(
+                    ErrorCode.PRECONDITION_UNVERIFIED,
+                    "the log's end would lie in the future; the start or range is not"
+                    " a verified historical fact",
                 )
             return {
                 "historical": True,
@@ -1471,6 +1484,10 @@ class PerformanceService:
             )
         segment = self._load_segment(uow, target.segment_ref.segment_id)
         if segment.session_id != session.id:
+            # Resolve the owning session first: another user's segment must not
+            # be distinguishable from a missing one.
+            owner_session = self._load_session(uow, segment.session_id)
+            self._require_session_owner(uow, owner_session, user_scope_id)
             raise ContractError(
                 ErrorCode.REFERENCE_INVALID,
                 "the target segment belongs to another session",
@@ -1508,6 +1525,12 @@ class PerformanceService:
                 raise _invalid(
                     "target.close_at_s", "range",
                     "the close point must be after the segment start",
+                )
+            if target.close_at_s > self._elapsed_seconds(session, segment):
+                raise _invalid(
+                    "target.close_at_s", "range",
+                    "the close point lies in the future; only an actual end point may"
+                    " close the segment",
                 )
             lower, upper = segment.start_s, target.close_at_s
             binding_revision = segment.binding_revision + 1
@@ -1587,7 +1610,11 @@ class PerformanceService:
         )
         now = self.clock()
         target = request.target
-        evidence = _declaration_evidence(managed[0])
+        # Re-read and re-hash the source inside the writing transaction: the
+        # parse ran outside it and the bytes may have changed since (04 §4.3).
+        self._verify_source_bytes(uow, request.file_id, request.content_hash)
+        declaration_evidence = _declaration_evidence(managed[0])
+        evidence = declaration_evidence
         stream_checks = [
             _check(
                 "segment.stream", CheckStatus.pass_,
@@ -1728,6 +1755,7 @@ class PerformanceService:
                     "end_s": plan["close_at_s"],
                     "lifecycle": SessionLifecycle.ended,
                     "binding_revision": closed.binding_revision,
+                    "stream_selection": selection,
                 })
                 self._write_segment_revision(
                     uow, segment, updated, session,
@@ -1749,19 +1777,21 @@ class PerformanceService:
             time_mapping=time_mapping,
             quality=parsed.quality,
             checks=list(parsed.checks) + [
-                _check(
+                _check_with_evidence(
                     "log.association", CheckStatus.pass_,
                     "the artifact maps the source clock with the player-supplied anchors;"
                     " the correspondence is user_provided, not controlled", now,
+                    [declaration_evidence],
                 ),
                 _check(
                     "log.anchor_observation", CheckStatus.not_run,
                     "no automatic clock observation was made", now,
                 ),
-                _check(
+                _check_with_evidence(
                     "log.evidence", CheckStatus.pass_,
                     f"{len(request.evidence_refs)} evidence reference(s) back the anchor"
                     " and range", now,
+                    list(request.evidence_refs) + [declaration_evidence],
                 ),
             ],
         )
@@ -2070,6 +2100,45 @@ class PerformanceService:
             canonical_json(uow.get_snapshot("PlaySession", session_id, head))
         )
 
+    def _verify_source_bytes(
+        self, uow: UnitOfWork, file_id: str, content_hash: str
+    ) -> None:
+        stored = uow.find_object("ManagedFile", file_id)
+        if stored is None:
+            raise ContractError(
+                ErrorCode.RESOURCE_NOT_FOUND, "the requested file is not available"
+            )
+        payload = stored.payload
+        stored_hash = payload.get("manifest", {}).get("sha256")
+        if stored_hash != content_hash:
+            raise ContractError(
+                ErrorCode.PRECONDITION_UNVERIFIED,
+                "the log content changed since it was inspected",
+            )
+        if payload.get("file_status") != "published":
+            raise ContractError(
+                ErrorCode.ARTIFACT_UNAVAILABLE, "the log file is not consumable"
+            )
+        try:
+            data = (self.files.root / payload["relative_path"]).read_bytes()
+        except (OSError, KeyError) as error:
+            raise ContractError(
+                ErrorCode.ARTIFACT_UNAVAILABLE, "the stored log cannot be read"
+            ) from error
+        if hashlib.sha256(data).hexdigest() != stored_hash:
+            raise ContractError(
+                ErrorCode.ARTIFACT_UNAVAILABLE,
+                "the stored log no longer matches its recorded hash",
+            )
+
+    @staticmethod
+    def _require_file_owner(payload: Mapping[str, Any], user_scope_id: str) -> None:
+        """A managed file is consumable only by the user whose operation wrote it."""
+        if payload.get("user_scope_id") != user_scope_id:
+            raise ContractError(
+                ErrorCode.RESOURCE_NOT_FOUND, "the requested file is not available"
+            )
+
     def _require_session_owner(
         self, uow: UnitOfWork, session: PlaySession, user_scope_id: str
     ) -> None:
@@ -2236,7 +2305,10 @@ class PerformanceService:
             )
 
     def _evidence_problems(
-        self, uow: UnitOfWork, evidence_refs: Sequence[EvidenceRef]
+        self,
+        uow: UnitOfWork,
+        evidence_refs: Sequence[EvidenceRef],
+        user_scope_id: str,
     ) -> None:
         for ref in evidence_refs:
             if ref.kind == "artifact":
@@ -2245,6 +2317,11 @@ class PerformanceService:
                     raise ContractError(
                         ErrorCode.PRECONDITION_UNVERIFIED,
                         "the evidence file does not exist",
+                    )
+                if stored.payload.get("user_scope_id") != user_scope_id:
+                    raise ContractError(
+                        ErrorCode.RESOURCE_NOT_FOUND,
+                        "the evidence file is not available",
                     )
                 if stored.payload.get("file_status") != "published":
                     raise ContractError(
@@ -2398,6 +2475,25 @@ def _unconfirmed_stream(now: str) -> StreamSelection:
     )
 
 
+def _check_with_evidence(
+    check_id: str,
+    status: CheckStatus,
+    note: str,
+    now: str,
+    evidence_refs: Sequence[EvidenceRef],
+) -> CheckResult:
+    return CheckResult(
+        check_id=check_id,
+        definition_version=LOG_ASSOCIATION_RULE_VERSION,
+        status=status,
+        input_refs=[],
+        evidence_refs=list(evidence_refs),
+        checked_at=None if status is CheckStatus.not_run else now,
+        method="deterministic log association rule",
+        note=note,
+    )
+
+
 def _mapping_values(mapping: TimeMapping) -> dict[str, Any]:
     return {
         "source_basis": mapping.source_basis,
@@ -2439,10 +2535,15 @@ def _stream_candidates(
     ):
         for observation in observations:
             suffix = observation.stream_key if observation is not None else "unstated"
-            kind = (
-                observation.frame_stream_kind if observation is not None
-                else parsed.frame_stream_kind
-            )
+            # The parser downgrades the resolved stream to unknown when frame
+            # generation is unknown or active.  A per-row observation must not
+            # upgrade that: it is not evidence for an application_present claim.
+            kind = parsed.frame_stream_kind
+            if (
+                observation is not None
+                and parsed.frame_stream_kind is not FrameStreamKind.unknown
+            ):
+                kind = observation.frame_stream_kind
             candidates.append(LogStreamCandidate(
                 stream_key=f"{parsed.format_id}:{content_hash[:16]}:{pid}:{swapchain or '-'}:{suffix}",
                 process=process,

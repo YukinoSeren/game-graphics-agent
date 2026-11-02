@@ -26,8 +26,8 @@ def uid(value: int) -> str:
     return f"{value:032x}"
 
 
-def context_key(key: str = "key-1") -> MutationContext:
-    return MutationContext(user_scope_id=USER, idempotency_key=key, request_id=uid(999))
+def context_key(key: str = "key-1", *, user: str = USER) -> MutationContext:
+    return MutationContext(user_scope_id=user, idempotency_key=key, request_id=uid(999))
 
 
 def unknown_platform() -> FieldValue[str]:

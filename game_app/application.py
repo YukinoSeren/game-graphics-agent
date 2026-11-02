@@ -145,8 +145,8 @@ class Application:
     def create_test_protocol(self, request: Any, context: MutationContext, **kwargs: Any):
         return self.performance.create_test_protocol(request, context, **kwargs)
 
-    def inspect_log(self, file_id: str, source_schema: str):
-        return self.performance.inspect_log(file_id, source_schema)
+    def inspect_log(self, file_id: str, source_schema: str, user_scope_id: str):
+        return self.performance.inspect_log(file_id, source_schema, user_scope_id)
 
     def associate_log(self, request: Any, context: MutationContext, **kwargs: Any):
         return self.performance.associate_log(request, context, **kwargs)

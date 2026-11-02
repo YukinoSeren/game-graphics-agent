@@ -56,6 +56,9 @@ class ManagedFile(StrictModel):
     manifest: FileEntry
     relative_path: str
     file_status: PublicationStatus
+    # The persistent user whose operation published the file.  Null marks an
+    # internal artifact (task/provider output) that no user entry may consume.
+    user_scope_id: ID | None = None
 
 
 @dataclass
@@ -266,6 +269,7 @@ class FileService:
         *,
         relative_name: str,
         stable_key: str,
+        user_scope_id: str | None = None,
     ) -> str:
         """Store an immutable artifact (e.g. a provider response original).
 
@@ -308,6 +312,7 @@ class FileService:
             manifest=entry,
             relative_path=f"objects/{file_id}",
             file_status=PublicationStatus.published,
+            user_scope_id=user_scope_id,
         )
         with self.repository.unit_of_work() as uow:
             uow.insert_object_bytes(
@@ -635,6 +640,7 @@ class FileService:
                 manifest=entry,
                 relative_path=f"objects/{file_id}",
                 file_status=PublicationStatus.published,
+                user_scope_id=operation.user_scope_id,
             )
             for entry, file_id in zip(operation.manifest.entries, operation.file_ids)
         ]

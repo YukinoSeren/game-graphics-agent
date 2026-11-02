@@ -300,6 +300,7 @@ TargetProposal 是包含 EntityHeader 的持久对象，作为推荐内容一并
 | ExcludedRange | `{range:TimeRange,reason:string,evidence_refs:EvidenceRef[]}` | 全字段 R；不可因真实游戏尖峰离群而排除 |
 | StreamSelection | `{process:ProcessIdentity?,swapchain_id:string?,frame_stream_kind:FrameStreamKind,checks:CheckResult[]}` | 全字段 R；空选择意味着未确认，不能生成 valid 目标流结论 |
 | ManagedFile.manifest / relative_path / file_status | FileEntry / string / PublicationStatus，R | 路径位于受管理目录内，不由模型或浏览器直接指定系统路径；对外只返回 id |
+| ManagedFile.user_scope_id | ID?，D=null | 发布该文件的持久用户作用域；null 表示内部产物（任务/供应商响应），不得经用户入口（日志预览/关联/证据）消费；他人文件按 RESOURCE_NOT_FOUND 处理 |
 | CaptureArtifact.session_id / segment_ids / file_id | ID / ID[] / ID，R | 原始文件哈希见 ManagedFile；配置与绑定从具体 segment/binding 取，不读当前配置 |
 | CaptureArtifact.tool_name / tool_version / options | string / string? / map<string,Scalar>，R | 版本未能确认则 null 并限用；不猜未知工具参数 |
 | CaptureArtifact.source_schema / source_column_map / time_mapping | string / ColumnMapping[] / TimeMapping，R | schema 指经核验格式指纹；未知格式只保留原件，不能猜列解析 |

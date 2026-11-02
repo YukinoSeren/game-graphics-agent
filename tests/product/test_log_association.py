@@ -15,6 +15,7 @@ from game_app.contracts.performance import (
 )
 from game_app.contracts.primitives import BindingRef
 from game_app.errors import ContractError, ErrorCode
+from game_app.files import PublishHooks
 from game_app.performance import PerformanceService
 from game_app.repository import canonical_json
 from tests.product.support.configuration import context_key, setup, uid
@@ -523,3 +524,32 @@ def test_another_users_session_cannot_be_targeted(tmp_path):
 
     assert caught.value.code is ErrorCode.RESOURCE_NOT_FOUND
     assert _count(repository, "CaptureArtifact") == 0
+
+
+# --- idempotent retries must survive a commit-window failure -----------------
+
+
+def test_a_retry_after_a_failed_commit_returns_the_same_artifact(tmp_path):
+    repository, files, installation_id, context_id, device_id = setup(tmp_path)
+    clock = FakeClock()
+    service = _service(repository, files, clock)
+    file_id, sha = _log_file(files)
+    _, stream_key = _inspection_stream(service, file_id)
+    request = _request(_historical_payload(
+        installation_id, context_id, device_id, file_id, sha, stream_key=stream_key,
+    ))
+
+    def fail():
+        raise RuntimeError("commit window failure")
+
+    with pytest.raises(RuntimeError):
+        service.associate_log(
+            request, context_key("assoc-retry"), hooks=PublishHooks(before_commit=fail)
+        )
+    clock.advance(30)
+
+    result = service.associate_log(request, context_key("assoc-retry"))
+
+    assert result.refs[0].entity_type == "CaptureArtifact"
+    assert _count(repository, "CaptureArtifact") == 1
+    assert _count(repository, "PlaySession") == 1

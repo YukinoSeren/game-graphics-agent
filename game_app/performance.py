@@ -1238,7 +1238,9 @@ class PerformanceService:
             "artifact_id": ids["artifact"],
             "bindings": [plan["binding_ref"]],
             "session_revision": plan["session_revision"],
-            "time_mapping": plan["time_mapping"].model_dump(mode="json"),
+            # The mapping's checks carry a checked_at; only the deterministic
+            # derived values may enter a frozen file (same-key retry).
+            "time_mapping": _mapping_values(plan["time_mapping"]),
         }
         published = self.files.publish(
             kind="import",
@@ -2332,6 +2334,17 @@ def _unconfirmed_stream(now: str) -> StreamSelection:
             "no capture stream is selected for this segment yet", now,
         )],
     )
+
+
+def _mapping_values(mapping: TimeMapping) -> dict[str, Any]:
+    return {
+        "source_basis": mapping.source_basis,
+        "target_basis": mapping.target_basis,
+        "source_unit": mapping.source_unit,
+        "target_unit": mapping.target_unit,
+        "offset": mapping.offset,
+        "scale": mapping.scale,
+    }
 
 
 def _artifact_evidence(payload: Mapping[str, Any]) -> EvidenceRef:

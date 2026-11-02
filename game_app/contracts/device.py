@@ -21,7 +21,6 @@ from game_app.contracts.primitives import (
     Timestamp,
 )
 
-
 class BuildIdentifier(StrictModel):
     scheme: str
     raw_value: str
@@ -95,11 +94,22 @@ class Resolution(StrictModel):
 
 class DisplayContext(StrictModel):
     desktop_resolution: FieldValue[Resolution]
+    # Each axis is kept on its own: a pair is only known when both are, and a
+    # later answer must be able to complete a half-known pair.
+    desktop_resolution_axes: dict[str, FieldValue[NonNegativeInt]]
     refresh_hz: FieldValue[float]
+
+    @field_validator("desktop_resolution_axes")
+    @classmethod
+    def axis_keys(cls, value: dict[str, FieldValue[NonNegativeInt]]) -> dict:
+        if set(value) - {"width", "height"}:
+            raise ValueError("desktop resolution axes are width and/or height")
+        return value
 
 
 class GpuSnapshot(StrictModel):
     id: ID
+    probe_index: NonNegativeInt
     raw_name: FieldValue[str]
     vram_bytes: FieldValue[int]
     driver_version: FieldValue[str]

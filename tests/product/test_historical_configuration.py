@@ -237,6 +237,72 @@ def test_two_historical_registrations_are_separate_families(tmp_path):
     assert service.get_current_applied(USER, installation_id) == (None, 0)
 
 
+def test_artifact_evidence_hash_must_match_the_managed_file(tmp_path):
+    repository, files, installation_id, context_id, device_id = setup(tmp_path)
+    definitions = Definitions(repository, installation_id)
+    definition, _ = definitions.new("过去")
+    service = AdoptionService(repository, files)
+    evidence = _evidence(files)
+    evidence["content_hash"] = "0" * 64
+
+    with pytest.raises(ContractError) as caught:
+        service.record_historical_configuration(
+            _historical(
+                installation_id, context_id, device_id, evidence,
+                declared_settings=[declaration(definition, value=2)],
+            ),
+            context_key("bad-hash"),
+        )
+
+    assert caught.value.code is ErrorCode.PRECONDITION_UNVERIFIED
+    assert _count(repository, "AppliedConfiguration") == 0
+
+
+def test_period_coverage_is_not_claimed_from_mere_existence(tmp_path):
+    repository, files, installation_id, context_id, device_id = setup(tmp_path)
+    definitions = Definitions(repository, installation_id)
+    definition, _ = definitions.new("过去")
+    service = AdoptionService(repository, files)
+
+    result = service.record_historical_configuration(
+        _historical(
+            installation_id, context_id, device_id, _evidence(files),
+            declared_settings=[declaration(definition, value=2)],
+        ),
+        context_key("period"),
+    )
+
+    applied = service.get_applied(result.refs[1].entity_id)
+    coverage = next(
+        check for check in applied.checks
+        if check.check_id == "applied.period_coverage"
+    )
+    # Nothing proved the declaration covers the stated period, so it is not a pass.
+    assert coverage.status is CheckStatus.unknown
+
+
+def test_contract_shaped_segment_revision_is_accepted(tmp_path):
+    repository, files, installation_id, context_id, device_id = setup(tmp_path)
+    definitions = Definitions(repository, installation_id)
+    definition, _ = definitions.new("过去")
+    service = AdoptionService(repository, files)
+    store_raw(repository, "SessionSegment", {
+        "id": uid(800), "revision": 1, "lifecycle": "ended",
+    })
+
+    result = service.record_historical_configuration(
+        _historical(
+            installation_id, context_id, device_id, _evidence(files),
+            declared_settings=[declaration(definition, value=2)],
+        ),
+        context_key("segment"),
+    )
+
+    applied = service.get_applied(result.refs[1].entity_id)
+    segment = next(check for check in applied.checks if check.check_id == "applied.segment")
+    assert segment.status is CheckStatus.pass_
+
+
 def test_historical_registration_replays_the_same_ids(tmp_path):
     repository, files, installation_id, context_id, device_id = setup(tmp_path)
     definitions = Definitions(repository, installation_id)

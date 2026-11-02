@@ -310,6 +310,7 @@ class DeviceService:
                 continue
             gpu = GpuSnapshot(
                 id=new_id(),
+                probe_index=index,
                 raw_name=raw_name,
                 vram_bytes=value_for(f"gpus.{index}.vram_bytes", _parse_positive_int),
                 driver_version=value_for(f"gpus.{index}.driver_version", _parse_text),
@@ -319,6 +320,11 @@ class DeviceService:
 
         width = value_for("display.desktop_resolution.width", _parse_positive_int)
         height = value_for("display.desktop_resolution.height", _parse_positive_int)
+        axes: dict[str, FieldValue[int]] = {}
+        if "display.desktop_resolution.width" in paths:
+            axes["width"] = width
+        if "display.desktop_resolution.height" in paths:
+            axes["height"] = height
         if (
             width.value_state is ValueState.known
             and height.value_state is ValueState.known
@@ -376,6 +382,7 @@ class DeviceService:
             os_version=value_for("os_version", _parse_text),
             display=DisplayContext(
                 desktop_resolution=resolution,
+                desktop_resolution_axes=axes,
                 refresh_hz=value_for("display.refresh_hz", _parse_positive_float),
             ),
             power_context={},

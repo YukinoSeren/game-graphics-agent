@@ -376,6 +376,23 @@ def test_a_sparse_gpu_index_is_matched_by_index_not_list_position(tmp_path):
     assert [gpu.raw_name.value for gpu in snapshot.gpus] == ["GPU B"]
 
 
+def test_each_adapter_keeps_its_probe_index(tmp_path):
+    """The stored list is sparse, so the adapter's own position is recorded."""
+    probe = StubProbe(
+        values={"gpus.1.raw_name": "GPU B", "gpus.3.raw_name": "GPU D"},
+        failures={"gpus.0.raw_name": "PROBE_FAILED"},
+    )
+    repo, files, device, tasks = _env(tmp_path, probe)
+    accepted = _scan(
+        tasks, ["gpus.0.raw_name", "gpus.1.raw_name", "gpus.3.raw_name"]
+    )
+    tasks.run_once()
+
+    snapshot = _snapshot(repo, accepted.task_id)
+    assert [gpu.probe_index for gpu in snapshot.gpus] == [1, 3]
+    assert [gpu.raw_name.value for gpu in snapshot.gpus] == ["GPU B", "GPU D"]
+
+
 def test_a_failed_gpu_index_is_asked_about_even_below_a_known_one(tmp_path):
     probe = StubProbe(
         values={"gpus.1.raw_name": "GPU B"},

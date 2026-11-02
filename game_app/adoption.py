@@ -40,6 +40,7 @@ from game_app.contracts.enums import (
     ValueState,
 )
 from game_app.contracts.primitives import ObjectRef, utc_now
+from game_app.contracts.knowledge import ImportedRecord
 from game_app.errors import ContractError, ErrorCode, FieldError, empty_details
 from game_app.files import FileService, PublishHooks
 from game_app.repository import ProductRepository, StoredObject, UnitOfWork, canonical_json
@@ -190,6 +191,7 @@ class AdoptionService:
         settings, base_id, restored_from, merge_checks = self._compose_settings(
             uow, request, current, installation, evidence
         )
+        self._refuse_series_duplicates(uow, settings)
         if not settings and not request.preset_reference:
             raise ContractError(
                 ErrorCode.INPUT_VALIDATION_FAILED,
@@ -343,6 +345,7 @@ class AdoptionService:
             _confirm(declaration, evidence, now)
             for declaration in request.declared_settings
         ]
+        self._refuse_series_duplicates(uow, settings)
         if not settings and not request.preset_reference:
             raise ContractError(
                 ErrorCode.INPUT_VALIDATION_FAILED,
@@ -390,7 +393,13 @@ class AdoptionService:
                 _check(
                     "applied.period",
                     CheckStatus.pass_,
-                    "the declared time period is backed by the submitted evidence",
+                    "the declared time period is backed by located evidence",
+                ),
+                _check(
+                    "applied.period_coverage",
+                    CheckStatus.unknown,
+                    "nothing in the submitted evidence proves it covers the whole"
+                    " declared period; the registration keeps that limit",
                 ),
                 segment_check,
             ],
@@ -697,10 +706,9 @@ class AdoptionService:
                     ErrorCode.PRECONDITION_UNVERIFIED,
                     "the current value of the replaced setting is unknown; confirm it first",
                 )
-            if (
-                current_value.value.value != replacement.expected_old_value
-                or current_value.unit != replacement.expected_old_unit
-            ):
+            if not _same_scalar(
+                current_value.value.value, replacement.expected_old_value
+            ) or current_value.unit != replacement.expected_old_unit:
                 raise ContractError(
                     ErrorCode.LOCAL_SETTING_CONFLICT,
                     "the declared old value or unit does not match the current configuration",
@@ -719,6 +727,33 @@ class AdoptionService:
         self._refuse_unmapped_series_changes(
             uow, declarations, base, installation_id, replaced=set(old_ids)
         )
+
+    def _refuse_series_duplicates(
+        self, uow: UnitOfWork, settings: Sequence[ConfirmedSetting]
+    ) -> None:
+        """One configuration holds one executable reference per local series.
+
+        The rule applies to every origin: a baseline, a recommendation, a
+        ChangeSet merge and a rollback snapshot each end in one executable
+        value per local setting series, not two competing definitions.
+        """
+        seen: dict[str, str] = {}
+        for setting in settings:
+            if setting.setting_ref.kind != "local":
+                continue
+            definition = self._local_definition(uow, setting.setting_ref.local_setting_id)
+            series_id = definition["series_id"]
+            previous = seen.get(series_id)
+            if previous is not None and previous != setting.setting_ref.local_setting_id:
+                raise ContractError(
+                    ErrorCode.LOCAL_SETTING_CONFLICT,
+                    "a configuration holds one executable value per local setting series",
+                    field_errors=[FieldError(
+                        path="declared_settings", code="conflict",
+                        message="two definitions of one series in the same configuration",
+                    )],
+                )
+            seen[series_id] = setting.setting_ref.local_setting_id
 
     def _refuse_unmapped_series_changes(
         self,
@@ -946,10 +981,38 @@ class AdoptionService:
                     path="setting_ref.record", code="reference", message="unknown record",
                 )],
             )
-        if record.payload.get("payload_hash") != ref.record.payload_hash:
+        stored = ImportedRecord.model_validate_json(record.payload_bytes)
+        # The reference must match the record it names on every locating field:
+        # a hash alone does not prove which capture, scope or type it came from.
+        mismatched = [
+            name for name, expected, actual in (
+                ("source_revision_id", ref.record.source_revision_id, stored.source_revision_id),
+                ("capture_scope_id", ref.record.capture_scope_id, stored.capture_scope_id),
+                ("local_record_id", ref.record.local_record_id, stored.local_record_id),
+                ("record_type", ref.record.record_type, stored.record_type),
+                ("payload_hash", ref.record.payload_hash, stored.payload_hash),
+            )
+            if expected != actual
+        ]
+        if mismatched:
             raise ContractError(
                 ErrorCode.REFERENCE_INVALID,
-                "the knowledge record hash does not match its imported payload",
+                "the knowledge reference does not match the imported record: "
+                + ", ".join(mismatched),
+                field_errors=[
+                    FieldError(path=f"setting_ref.record.{name}", code="reference",
+                               message="differs from the stored record")
+                    for name in mismatched
+                ],
+            )
+        if stored.record_type != "settings":
+            raise ContractError(
+                ErrorCode.REFERENCE_INVALID,
+                "only an imported setting record can be used as a knowledge setting reference",
+                field_errors=[FieldError(
+                    path="setting_ref.record.record_type", code="enum",
+                    message=f"record type is {stored.record_type}",
+                )],
             )
         usable = uow.query(
             "SELECT usable FROM imported_record_keys WHERE record_snapshot_id=?",
@@ -987,10 +1050,25 @@ class AdoptionService:
     ) -> None:
         for ref in evidence_refs:
             if ref.kind == "artifact":
-                if uow.find_object("ManagedFile", ref.file_id) is None:
+                stored = uow.find_object("ManagedFile", ref.file_id)
+                if stored is None:
                     raise ContractError(
                         ErrorCode.PRECONDITION_UNVERIFIED,
                         "the historical evidence file does not exist",
+                    )
+                if stored.payload.get("file_status") != "published":
+                    raise ContractError(
+                        ErrorCode.PRECONDITION_UNVERIFIED,
+                        "the historical evidence file is not published",
+                    )
+                if stored.payload.get("manifest", {}).get("sha256") != ref.content_hash:
+                    raise ContractError(
+                        ErrorCode.PRECONDITION_UNVERIFIED,
+                        "the historical evidence hash does not match the stored file",
+                        field_errors=[FieldError(
+                            path="evidence_refs", code="reference",
+                            message="artifact content_hash does not match the managed file",
+                        )],
                     )
             elif ref.kind == "source_location":
                 if uow.find_object("SourceRevision", ref.source_revision_id) is None:
@@ -1030,7 +1108,9 @@ class AdoptionService:
                 ErrorCode.PRECONDITION_UNVERIFIED,
                 "a historical configuration needs an ended segment",
             )
-        if payload.get("version") != request.segment_ref.segment_revision:
+        # SessionSegment is an aggregate: its contract field is `revision`.
+        revision = payload.get("revision", payload.get("version"))
+        if revision != request.segment_ref.segment_revision:
             raise ContractError(
                 ErrorCode.BINDING_REVISION_CONFLICT,
                 "the segment changed; re-read it before registering a historical configuration",
@@ -1038,7 +1118,8 @@ class AdoptionService:
         return _check(
             "applied.segment",
             CheckStatus.pass_,
-            "the segment revision matches and the segment is ended",
+            "the segment revision matches and the segment is ended;"
+            " binding revision and period containment stay with PERF-T02",
         )
 
 
@@ -1050,6 +1131,13 @@ def ref_shape(value: Any) -> Any:
     if isinstance(value, SettingRef):
         return value.model_dump(mode="json")
     return value
+
+
+def _same_scalar(current: Any, expected: Any) -> bool:
+    """Scalar equality that keeps int/float/bool apart, as the contract does."""
+    if type(current) is not type(expected):
+        return False
+    return current == expected
 
 
 def _overlay(

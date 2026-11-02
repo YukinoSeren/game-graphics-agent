@@ -30,6 +30,7 @@ from game_app.importer import (
     ImportPublishResult,
     ImportPublisher,
     ImportService,
+    frozen_group_from_file_ids,
     import_fingerprint,
     mapping_context_hash,
 )
@@ -651,6 +652,95 @@ def _owned_context(repository: ProductRepository) -> str:
             version=1,
         )
     return context_id
+
+
+def test_a_malformed_group_is_rejected_instead_of_raising_a_validation_error(tmp_path):
+    """A task-path import must fail as a rejected import, not an internal error."""
+    files, repository = _service(tmp_path)
+    context_id = _stored_context(repository)
+    members = _run_files(
+        records=[_record("cfg-0001", "configurations", {"name": "P", "settings": []})],
+    )
+    # A blank source URL survives the format probe but no Source may store it.
+    sources = json.loads(members["sources.json"])
+    sources[0]["url"] = ""
+    members["sources.json"] = _json(sources)
+    file_ids = [
+        files.store_artifact(
+            data, relative_name=name, stable_key=f"bad:{name}"
+        )
+        for name, data in members.items()
+    ]
+    group = frozen_group_from_file_ids(files, file_ids)
+
+    result = _publish(
+        _publisher(repository, files), group, key="k-bad", context_id=context_id
+    )
+
+    assert result.status is PublicationStatus.rejected
+    assert result.code == "retained_only"
+    assert result.accepted_record_ids == []
+    assert any("sources.json" in item or "url" in item for item in result.limitations)
+
+
+def test_published_snapshot_can_read_back_its_frozen_files(tmp_path):
+    files, repository = _service(tmp_path)
+    context_id = _stored_context(repository)
+    group = _freeze(files, tmp_path, "readback", _run_files(
+        records=[_record("cfg-0001", "configurations", {"name": "P", "settings": []})],
+    ))
+
+    result = _publish(_publisher(repository, files), group, key="k-1", context_id=context_id)
+
+    with repository.unit_of_work() as uow:
+        refs = uow.query(
+            "SELECT target_id FROM object_references WHERE owner_id=?"
+            " AND target_type='ManagedFile'",
+            (result.snapshot_id,),
+        )
+    referenced = {row["target_id"] for row in refs}
+    assert set(group.file_ids.values()) <= referenced
+    for file_id in group.file_ids.values():
+        assert files.read_managed_file(file_id)
+
+
+def test_registered_import_replays_before_its_references_are_revalidated(tmp_path):
+    files, repository = _service(tmp_path)
+    context_id = _stored_context(repository)
+    group = _freeze(files, tmp_path, "replay-order", _run_files(
+        records=[_record("cfg-0001", "configurations", {"name": "P", "settings": []})],
+    ))
+    publisher = _publisher(repository, files)
+    first = _publish(publisher, group, key="k-1", context_id=context_id)
+
+    # The registered three-part identity replays even when the request now
+    # names a context that no longer resolves: a retry returns the original
+    # import instead of failing on a reference checked only for new imports.
+    replay = publisher.publish(
+        frozen=group,
+        game_context_id=_uid(999),
+        mapping_version="collector-import/1",
+        identity_mapping_ids=[],
+        user_scope_id=SCOPE,
+        idempotency_key="k-1",
+    )
+
+    assert replay.snapshot_id == first.snapshot_id
+
+
+def test_format_limitations_reach_the_published_snapshot(tmp_path):
+    files, repository = _service(tmp_path)
+    context_id = _stored_context(repository)
+    group = _freeze(files, tmp_path, "limits", _run_files(
+        records=[_record("cfg-0001", "configurations", {"name": "P", "settings": []})],
+    ))
+    assert any("candidates.json" in item for item in group.inspection.limitations)
+
+    result = _publish(
+        _publisher(repository, files), group, key="k-1", context_id=context_id
+    )
+
+    assert any("candidates.json" in item for item in result.limitations)
 
 
 def test_import_never_calls_a_provider_and_is_not_the_original_run(tmp_path):

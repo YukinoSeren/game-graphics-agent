@@ -299,6 +299,7 @@ def test_conflict_selection_resolves_the_value_and_keeps_old_evidence(tmp_path):
                 unknown_reason="not_provided",
                 acquisition_status=AcquisitionStatus.not_attempted,
             ),
+            desktop_resolution_axes={},
             refresh_hz=FieldValue[float](
                 value_state=ValueState.unknown, value=None,
                 unknown_reason="not_provided",
@@ -467,6 +468,116 @@ def test_cancel_first_then_late_answer_does_not_revive_the_task(tmp_path):
     assert _counts(repository, accepted.task_id) == before
     updated = _request(repository, request.id)
     assert updated.fields[0].answer_state is AnswerState.answered
+
+
+def test_answering_a_sparse_gpu_index_does_not_rename_another_adapter(tmp_path):
+    """Question paths use the probe's own index; the snapshot list is compacted."""
+    probe = StubProbe(
+        values={"gpus.1.raw_name": "GPU B"},
+        failures={"gpus.0.raw_name": "PROBE_FAILED"},
+    )
+    repository, files, device, tasks, answers, _ = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["gpus.0.raw_name", "gpus.1.raw_name"])
+    tasks.run_once()
+    request = _request(repository, _request_ids(repository, accepted.task_id)[0])
+    before = _snapshot(repository, request)
+    assert [gpu.raw_name.value for gpu in before.gpus] == ["GPU B"]
+    second_id = before.gpus[0].id
+
+    _answer(answers, request, answers={"gpus.0.raw_name": "GPU A"})
+
+    after = _latest_snapshot(repository, before.series_id)
+    by_index = {gpu.probe_index: gpu for gpu in after.gpus}
+    assert set(by_index) == {0, 1}
+    assert by_index[0].raw_name.value == "GPU A"
+    # The adapter that was already known keeps its identity and its name.
+    assert by_index[1].id == second_id
+    assert by_index[1].raw_name.value == "GPU B"
+
+
+def test_a_resolved_request_rejects_a_direct_answer(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU"}, failures={"device_form": "PROBE_FAILED"})
+    repository, files, device, tasks, answers, _ = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "device_form"])
+    tasks.run_once()
+    request = _request(repository, _request_ids(repository, accepted.task_id)[0])
+    _answer(answers, request, answers={"device_form": "Desktop PC"}, key="answer-root")
+    resolved = _request(repository, request.id)
+    assert resolved.state is InformationRequestState.resolved
+
+    with pytest.raises(ContractError) as caught:
+        _answer(answers, resolved, answers={"device_form": "Laptop"}, key="answer-again")
+
+    assert caught.value.code is ErrorCode.INFORMATION_REQUEST_STATE_CONFLICT
+    assert _request(repository, request.id) == resolved
+
+
+def test_a_skipped_request_rejects_a_direct_answer(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU"}, failures={"device_form": "PROBE_FAILED"})
+    repository, files, device, tasks, answers, _ = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "device_form"])
+    tasks.run_once()
+    request = _request(repository, _request_ids(repository, accepted.task_id)[0])
+    _answer(answers, request, skipped=["device_form"], key="skip-root")
+    skipped = _request(repository, request.id)
+    assert skipped.state is InformationRequestState.skipped
+
+    with pytest.raises(ContractError) as caught:
+        _answer(answers, skipped, answers={"device_form": "Desktop PC"}, key="answer-again")
+
+    assert caught.value.code is ErrorCode.INFORMATION_REQUEST_STATE_CONFLICT
+    assert _request(repository, request.id) == skipped
+
+
+def test_answering_a_field_keeps_the_failed_attempt_history(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU"}, failures={"device_form": "PROBE_FAILED"})
+    repository, files, device, tasks, answers, _ = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "device_form"])
+    tasks.run_once()
+    request = _request(repository, _request_ids(repository, accepted.task_id)[0])
+    before = _snapshot(repository, request)
+    prior = before.device_form
+    assert prior.acquisition_status is AcquisitionStatus.failed
+    assert len(prior.attempts) == 1
+    assert prior.provenance
+
+    _answer(answers, request, answers={"device_form": "Desktop PC"})
+
+    after = _latest_snapshot(repository, before.series_id)
+    assert after.device_form.value == "Desktop PC"
+    # The failed probe attempt is history: the answer appends to it.
+    statuses = [attempt.status for attempt in after.device_form.attempts]
+    assert statuses[0] is AcquisitionStatus.failed
+    assert statuses[-1] is AcquisitionStatus.succeeded
+    assert any(
+        item.method is AcquisitionMethod.system_probe
+        for item in after.device_form.provenance
+    )
+
+
+def test_answering_the_missing_axis_completes_the_resolution(tmp_path):
+    probe = StubProbe(
+        values={
+            "display.desktop_resolution.width": "2560",
+        },
+        failures={"display.desktop_resolution.height": "PROBE_FAILED"},
+    )
+    repository, files, device, tasks, answers, _ = _env(tmp_path, probe)
+    accepted = _scan(
+        tasks,
+        ["display.desktop_resolution.width", "display.desktop_resolution.height"],
+    )
+    tasks.run_once()
+    request = _request(repository, _request_ids(repository, accepted.task_id)[0])
+    before = _snapshot(repository, request)
+    assert before.display.desktop_resolution.value_state is ValueState.unknown
+
+    _answer(answers, request, answers={"display.desktop_resolution.height": 1440})
+
+    after = _latest_snapshot(repository, before.series_id)
+    assert after.display.desktop_resolution.value_state is ValueState.known
+    assert after.display.desktop_resolution.value.width == 2560
+    assert after.display.desktop_resolution.value.height == 1440
 
 
 def test_another_users_question_cannot_be_answered(tmp_path):

@@ -28,6 +28,8 @@ from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlsplit
 from uuid import UUID, uuid5
 
+from pydantic import ValidationError
+
 from game_app.contracts.common import CheckResult
 from game_app.contracts.enums import (
     CheckStatus,
@@ -1368,6 +1370,17 @@ def snapshot_manifest(manifest: FileManifest) -> SnapshotManifest:
     ])
 
 
+def _validation_message(error: ValidationError) -> str:
+    """One stable sentence; the raw pydantic text never reaches the user."""
+    locations = sorted({
+        ".".join(str(part) for part in item["loc"]) for item in error.errors()
+    })
+    return (
+        "the frozen group does not satisfy the product contract: "
+        + ", ".join(locations)
+    )
+
+
 def frozen_group_from_file_ids(
     files: FileService,
     file_ids: Sequence[str],
@@ -1398,7 +1411,7 @@ def frozen_group_from_file_ids(
     data = {
         name: files.read_managed_file(file_id) for name, file_id in by_name.items()
     }
-    inspection = registry.inspect_files(data)
+    inspection, inconsistencies = registry._probe(data)
     if inspection.format_id is None:
         if inspection.missing_files:
             raise ContractError(
@@ -1408,6 +1421,13 @@ def frozen_group_from_file_ids(
         raise ContractError(
             ErrorCode.UNSUPPORTED_ARTIFACT_FORMAT,
             "no registered format matches this file group",
+        )
+    if inconsistencies:
+        # freeze() refuses such a group too; the managed-id entry path must not
+        # be a weaker door into the same importer.
+        raise ContractError(
+            ErrorCode.IMPORT_SNAPSHOT_INCONSISTENT,
+            "; ".join(inconsistencies),
         )
     return FrozenGroup(
         format_id=inspection.format_id,
@@ -1455,8 +1475,6 @@ class ImportPublisher:
         hooks: PublishHooks | None = None,
         created_by_task_id: str | None = None,
     ) -> ImportPublishResult:
-        mappings = [self._identity_mapping(mapping_id) for mapping_id in identity_mapping_ids]
-        self._require_game_context(game_context_id, user_scope_id)
         fingerprint = import_fingerprint(frozen.manifest)
         context_hash = mapping_context_hash(mapping_version, identity_mapping_ids)
         snapshot_id = _snapshot_id(fingerprint, mapping_version, context_hash)
@@ -1464,8 +1482,12 @@ class ImportPublisher:
         existing = self._find_by_triple(fingerprint, mapping_version, context_hash)
         if existing is not None:
             # The identity is already registered: a retry returns the original
-            # import, including a rejected one.  It never re-runs the mapping.
+            # import, including a rejected one.  It never re-runs the mapping,
+            # and it does not re-validate references that have since changed.
             return self._result(existing["import_snapshot_id"])
+
+        mappings = [self._identity_mapping(mapping_id) for mapping_id in identity_mapping_ids]
+        self._require_game_context(game_context_id, user_scope_id)
 
         mapped: ScopedImport | None = None
         rejection: str | None = None
@@ -1479,11 +1501,23 @@ class ImportPublisher:
             if error.code is not ErrorCode.IMPORT_SNAPSHOT_INCONSISTENT:
                 raise
             rejection = error.message
+        except ValidationError as error:
+            # The bytes are recognised as a collector run but do not satisfy the
+            # product contract.  That is a rejected import, never an internal
+            # error: the originals are kept and the reason is recorded.
+            rejection = _validation_message(error)
 
         status = (
             PublicationStatus.rejected if rejection is not None else PublicationStatus.published
         )
         limitations = list(mapped.limitations) if mapped else [rejection or "the group was rejected"]
+        # What the format probe could not prove travels with the snapshot: an
+        # interrupted original run, a missing finished_at or an unreconciled
+        # candidate list must stay visible downstream.
+        if mapped is not None:
+            limitations.extend(
+                f"format: {item}" for item in frozen.inspection.limitations
+            )
         if rejection is not None:
             limitations.insert(0, f"the frozen group was rejected: {rejection}")
         game_id = mapped.game_id if mapped else None
@@ -1506,6 +1540,9 @@ class ImportPublisher:
             "diagnostic_record_ids": diagnostic_ids,
             "limitations": limitations,
             "manifest": frozen.manifest.model_dump(mode="json"),
+            # The published snapshot must locate the exact originals it was
+            # built from; a name/hash list alone cannot be re-read.
+            "frozen_file_ids": dict(frozen.file_ids),
         }
         key = idempotency_key or f"snapshot:{snapshot_id}"
         request_hash = hashlib.sha256(canonical_json({
@@ -1538,6 +1575,7 @@ class ImportPublisher:
                 created_by_task_id=created_by_task_id,
                 legacy_run_id=declaration["legacy_run_id"],
                 group_manifest=frozen.manifest,
+                frozen_file_ids=list(frozen.file_ids.values()),
             ),
             hooks=hooks,
         )
@@ -1561,6 +1599,7 @@ class ImportPublisher:
         created_by_task_id: str | None,
         legacy_run_id: str | None,
         group_manifest: FileManifest,
+        frozen_file_ids: Sequence[str],
     ) -> list[ObjectRef]:
         winner = uow.query(
             "SELECT import_snapshot_id FROM import_snapshots"
@@ -1635,6 +1674,10 @@ class ImportPublisher:
             for extraction in mapped.extractions:
                 uow.insert_reference(snapshot_id, "extraction", ObjectRef(
                     entity_type="ImportedExtraction", entity_id=extraction.id,
+                ))
+            for file_id in frozen_file_ids:
+                uow.insert_reference(snapshot_id, "frozen_file", ObjectRef(
+                    entity_type="ManagedFile", entity_id=file_id,
                 ))
         uow.execute(
             "INSERT INTO import_snapshots(import_snapshot_id, import_fingerprint,"

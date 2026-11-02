@@ -15,6 +15,7 @@ from game_app.contracts.enums import (
     ValueState,
 )
 from game_app.contracts.configuration import AdoptConfigurationInput
+from game_app.contracts.enums import LegacyRecordState
 from game_app.errors import ContractError, ErrorCode
 from game_app.files import PublishHooks
 from game_app.repository import canonical_json
@@ -381,6 +382,70 @@ def test_manual_edit_requires_a_current_configuration(tmp_path):
     assert _count(repository, "AppliedConfiguration") == 0
 
 
+def test_replacement_old_value_must_match_the_scalar_type_too(tmp_path):
+    repository, files, installation_id, context_id, device_id = setup(tmp_path)
+    definitions = Definitions(repository, installation_id)
+    old_id, series_id = definitions.new("设置甲")
+    service = _service(repository, files)
+    base = _adopt(
+        service,
+        adopt_request(
+            installation_id, context_id, device_id,
+            declared_settings=[declaration(old_id, value=1)],
+        ),
+    )
+    base_id = base.refs[1].entity_id
+    new_id = definitions.correct(old_id, series_id, "设置甲（新）")
+
+    with pytest.raises(ContractError) as caught:
+        _adopt(
+            service,
+            adopt_request(
+                installation_id, context_id, device_id,
+                origin="manual_edit",
+                expected_current_applied_id=base_id,
+                base_applied_id=base_id,
+                declared_settings=[declaration(new_id, value=4)],
+                setting_ref_replacements=[{
+                    "old_local_setting_id": old_id,
+                    "new_local_setting_id": new_id,
+                    # True == 1 in Python; the contract keeps the types apart.
+                    "expected_old_value": True,
+                    "expected_old_unit": None,
+                }],
+            ),
+            key="bool-old",
+        )
+
+    assert caught.value.code is ErrorCode.LOCAL_SETTING_CONFLICT
+
+
+def test_a_declared_definition_removed_before_the_commit_is_refused(tmp_path):
+    """The writing transaction re-checks what it is about to reference."""
+    repository, files, installation_id, context_id, device_id = setup(tmp_path)
+    definitions = Definitions(repository, installation_id)
+    definition, _ = definitions.new("甲")
+    service = _service(repository, files)
+
+    def remove_definition(_path):
+        with repository.unit_of_work() as uow:
+            uow.execute("DELETE FROM objects WHERE id=?", (definition,))
+
+    with pytest.raises(ContractError) as caught:
+        _adopt(
+            service,
+            adopt_request(
+                installation_id, context_id, device_id,
+                declared_settings=[declaration(definition, value=1)],
+            ),
+            key="vanished",
+            hooks=PublishHooks(after_rename=remove_definition),
+        )
+
+    assert caught.value.code is ErrorCode.REFERENCE_INVALID
+    assert _count(repository, "AppliedConfiguration") == 0
+
+
 # --- explicit reference replacement ------------------------------------------
 
 
@@ -493,6 +558,164 @@ def test_replacements_require_exact_old_values_and_units(tmp_path):
             key="chain",
         )
     assert caught.value.code is ErrorCode.INPUT_VALIDATION_FAILED
+
+
+def test_two_definitions_from_one_series_are_refused_for_any_origin(tmp_path):
+    """One configuration can hold only one executable value per local series."""
+    repository, files, installation_id, context_id, device_id = setup(tmp_path)
+    definitions = Definitions(repository, installation_id)
+    old_id, series_id = definitions.new("设置甲")
+    new_id = definitions.correct(old_id, series_id, "设置甲（新）")
+    service = _service(repository, files)
+
+    with pytest.raises(ContractError) as caught:
+        _adopt(
+            service,
+            adopt_request(
+                installation_id, context_id, device_id,
+                declared_settings=[
+                    declaration(old_id, value=1),
+                    declaration(new_id, value=2),
+                ],
+            ),
+        )
+
+    assert caught.value.code is ErrorCode.LOCAL_SETTING_CONFLICT
+    assert _count(repository, "AppliedConfiguration") == 0
+    assert service.get_current_applied(USER, installation_id) == (None, 0)
+
+
+def _store_imported_record(
+    repository, *, record_type: str, local_id: str = "set-0001", serial: int = 880
+):
+    import hashlib
+
+    from game_app.contracts.knowledge import ImportedRecord, RecordExtension
+    from game_app.contracts.primitives import utc_now
+
+    payload = {"id": local_id, "raw_name": "Synthetic setting"}
+    payload_hash = hashlib.sha256(canonical_json(payload)).hexdigest()
+    record = ImportedRecord(
+        id=uid(serial),
+        schema_version="product-contract/0.4",
+        created_at=utc_now(),
+        created_by_task_id=None,
+        record_snapshot_id=uid(serial),
+        import_snapshot_id=uid(serial + 1),
+        capture_scope_id="src-0001",
+        local_record_id=local_id,
+        legacy_record_id=f"src-0001:{local_id}",
+        source_revision_id=uid(serial + 2),
+        record_type=record_type,
+        payload=payload,
+        payload_hash=payload_hash,
+        upstream_status=LegacyRecordState.accepted,
+        upstream_envelope={},
+        checks=[],
+        extension=RecordExtension(
+            boundary_semantics=None, setting_identity_ref=None, checks=[]
+        ),
+    )
+    with repository.unit_of_work() as uow:
+        uow.insert_object("ImportedRecord", record)
+        uow.claim_imported_record_key(
+            record_snapshot_id=record.id,
+            import_snapshot_id=record.import_snapshot_id,
+            capture_scope_id=record.capture_scope_id,
+            record_type=record.record_type,
+            local_record_id=record.local_record_id,
+            usable=True,
+        )
+    return record
+
+
+def _knowledge_ref(record, **overrides):
+    ref = {
+        "package_id": uid(883),
+        "record_snapshot_id": record.id,
+        "source_revision_id": record.source_revision_id,
+        "capture_scope_id": record.capture_scope_id,
+        "local_record_id": record.local_record_id,
+        "record_type": "settings",
+        "payload_hash": record.payload_hash,
+    }
+    ref.update(overrides)
+    return {"kind": "knowledge", "record": ref, "local_setting_id": None}
+
+
+def test_a_knowledge_setting_ref_must_match_a_setting_record_exactly(tmp_path):
+    repository, files, installation_id, context_id, device_id = setup(tmp_path)
+    service = _service(repository, files)
+    configuration_record = _store_imported_record(
+        repository, record_type="configurations"
+    )
+    setting_declaration = {
+        "setting_ref": _knowledge_ref(configuration_record),
+        "value": 1,
+        "unknown_reason": None,
+        "unit": None,
+        "claimed_activation": "unknown",
+        "activation_note": None,
+        "observation_id": None,
+    }
+
+    with pytest.raises(ContractError) as caught:
+        _adopt(
+            service,
+            adopt_request(
+                installation_id, context_id, device_id,
+                declared_settings=[setting_declaration],
+            ),
+            key="wrong-type",
+        )
+    assert caught.value.code is ErrorCode.REFERENCE_INVALID
+
+    setting_record = _store_imported_record(
+        repository, record_type="settings", local_id="set-0002", serial=890
+    )
+    for overrides in (
+        {"local_record_id": "other-id"},
+        {"payload_hash": "0" * 64},
+        {"capture_scope_id": "another-scope"},
+    ):
+        bad = dict(setting_declaration)
+        bad["setting_ref"] = _knowledge_ref(setting_record, **overrides)
+        with pytest.raises(ContractError) as caught:
+            _adopt(
+                service,
+                adopt_request(
+                    installation_id, context_id, device_id,
+                    declared_settings=[bad],
+                ),
+                key=f"bad-ref-{next(iter(overrides))}",
+            )
+        assert caught.value.code is ErrorCode.REFERENCE_INVALID
+
+
+def test_a_matching_knowledge_setting_ref_is_accepted(tmp_path):
+    repository, files, installation_id, context_id, device_id = setup(tmp_path)
+    service = _service(repository, files)
+    record = _store_imported_record(repository, record_type="settings")
+
+    result = _adopt(
+        service,
+        adopt_request(
+            installation_id, context_id, device_id,
+            declared_settings=[{
+                "setting_ref": _knowledge_ref(record),
+                "value": 1,
+                "unknown_reason": None,
+                "unit": None,
+                "claimed_activation": "unknown",
+                "activation_note": None,
+                "observation_id": None,
+            }],
+        ),
+        key="knowledge-ok",
+    )
+
+    applied = service.get_applied(result.refs[1].entity_id)
+    assert applied.settings[0].setting_ref.record.record_snapshot_id == record.id
 
 
 def test_same_series_change_without_a_mapping_is_refused(tmp_path):

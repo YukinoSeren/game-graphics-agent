@@ -143,8 +143,8 @@ D-P01首次名称登记、目录查询和选择响应由[02 §5.1](../02-knowled
 | DeviceSnapshot.cpu / memory_bytes | FieldValue<string> / FieldValue<int>，R | 正内存字节；未知不填 0 |
 | DeviceSnapshot.device_form / os_version | FieldValue<string> / FieldValue<string>，R | 台式/笔记本来源不明保留未知 |
 | DeviceSnapshot.display / power_context | DisplayContext / map<string,FieldValue<Scalar>>，R | 功耗/电源等扩展键由适配器声明，不猜 TGP |
-| GpuSnapshot.id / raw_name / vram_bytes / driver_version | ID / FieldValue<string> / FieldValue<int> / FieldValue<string>，R | GPU id 仅在该设备快照内唯一；引用时必须同时给 device_snapshot_id |
-| DisplayContext.desktop_resolution / refresh_hz | FieldValue<Resolution> / FieldValue<float>，R | 正刷新率；桌面分辨率不冒充游戏渲染分辨率 |
+| GpuSnapshot.id / probe_index / raw_name / vram_bytes / driver_version | ID / NonNegativeInt / FieldValue<string> / FieldValue<int> / FieldValue<string>，R | GPU id 仅在该设备快照内唯一；引用时必须同时给 device_snapshot_id；probe_index 是适配器原始位置，问题路径 gpus.N.* 按它定位，不能用列表下标（列表只含已登记成员，可能不连续） |
+| DisplayContext.desktop_resolution / desktop_resolution_axes / refresh_hz | FieldValue<Resolution> / map<string,FieldValue<int>> / FieldValue<float>，R | 正刷新率；桌面分辨率不冒充游戏渲染分辨率；桌面分辨率只在一对轴都已知时才有已知值，因此两根轴各自保留宽度/高度 FieldValue（键 width/height），后答一根轴可与先前的已知轴合成 |
 | Resolution | `{width:int,height:int}` | 二者 R，均>0；无默认 1080p |
 
 ## 4. 公共知识包装与包引用

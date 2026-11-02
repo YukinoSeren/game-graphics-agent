@@ -231,6 +231,30 @@ class AnswerService:
                 raise ContractError(
                     ErrorCode.INFORMATION_REQUEST_STATE_CONFLICT,
                     "this question was superseded; read the replacement",
+                    details=empty_details(
+                        current_resource_ref=(
+                            None if request.superseded_by_request_id is None
+                            else ObjectRef(
+                                entity_type="InformationRequest",
+                                entity_id=request.superseded_by_request_id,
+                            )
+                        )
+                    ),
+                )
+            if request.state in (
+                InformationRequestState.resolved,
+                InformationRequestState.skipped,
+            ):
+                # A handled question is answered through the facts_only
+                # amendment entry; a direct answer would silently rewrite it.
+                raise ContractError(
+                    ErrorCode.INFORMATION_REQUEST_STATE_CONFLICT,
+                    "this question is already handled; create a correction instead",
+                    details=empty_details(
+                        current_resource_ref=ObjectRef(
+                            entity_type="InformationRequest", entity_id=request.id,
+                        )
+                    ),
                 )
 
             now = self.clock()
@@ -825,6 +849,7 @@ def _attempt(
 
 
 def _answered_value(value: Scalar, response_id: str, path: str, now: str) -> FieldValue:
+    """The answer itself; the snapshot merge appends it to the probe history."""
     return FieldValue[Scalar](
         value_state=ValueState.known,
         value=value,
@@ -838,6 +863,20 @@ def _answered_value(value: Scalar, response_id: str, path: str, now: str) -> Fie
         )],
         attempts=[_attempt(response_id, now, AcquisitionStatus.succeeded)],
     )
+
+
+def _merge_history(new_value: FieldValue, previous: FieldValue | None) -> FieldValue:
+    """Append a new answer to what the snapshot already recorded.
+
+    A failed probe, its provenance and its attempts stay in the record; the
+    answer is one more attempt, not a replacement of the acquisition history.
+    """
+    if previous is None:
+        return new_value
+    return new_value.model_copy(update={
+        "provenance": [*previous.provenance, *new_value.provenance],
+        "attempts": [*previous.attempts, *new_value.attempts],
+    })
 
 
 def _skipped_value(field: RequestedField, response_id: str, now: str) -> FieldValue:
@@ -905,10 +944,13 @@ def _resolved_value(
         candidates=list(prior.candidates),
         provenance=provenance,
         acquisition_status=AcquisitionStatus.succeeded,
-        attempts=[_attempt(
-            response_id, now, AcquisitionStatus.succeeded,
-            method=AcquisitionMethod.player_confirmed,
-        )],
+        attempts=[
+            *prior.attempts,
+            _attempt(
+                response_id, now, AcquisitionStatus.succeeded,
+                method=AcquisitionMethod.player_confirmed,
+            ),
+        ],
         resolution=FieldResolution(
             selected_provenance_indexes=[0],
             reason=f"player selected candidate {index}",
@@ -936,16 +978,12 @@ def _reduce_state(fields: Sequence[RequestedField]) -> InformationRequestState:
 def _apply_device_values(
     old: DeviceSnapshot, answers: Mapping[str, FieldValue], now: str
 ) -> DeviceSnapshot:
-    gpus = [gpu.model_copy() for gpu in old.gpus]
+    # Adapters are addressed by their probe index, never by list position: the
+    # stored list only holds members with a known name and may be sparse.
+    gpus = {gpu.probe_index: gpu.model_copy() for gpu in old.gpus}
     updates: dict[str, Any] = {}
     display = old.display
-    resolution_axes = {
-        "width": old.display.desktop_resolution.value.width
-        if old.display.desktop_resolution.value_state is ValueState.known else None,
-        "height": old.display.desktop_resolution.value.height
-        if old.display.desktop_resolution.value_state is ValueState.known else None,
-    }
-    resolution_values: dict[str, FieldValue] = {}
+    axes = dict(display.desktop_resolution_axes)
 
     ordered = sorted(
         answers.items(),
@@ -955,12 +993,13 @@ def _apply_device_values(
     )
     for path, value in ordered:
         if path in ("cpu", "memory_bytes", "os_version", "device_form"):
-            updates[path] = value
+            updates[path] = _merge_history(value, getattr(old, path))
             continue
         if path == "display.refresh_hz":
             display = DisplayContext(
                 desktop_resolution=display.desktop_resolution,
-                refresh_hz=value,
+                desktop_resolution_axes=axes,
+                refresh_hz=_merge_history(value, display.refresh_hz),
             )
             continue
         if path in (
@@ -968,42 +1007,61 @@ def _apply_device_values(
             "display.desktop_resolution.height",
         ):
             axis = path.rsplit(".", 1)[1]
-            resolution_axes[axis] = value.value
-            resolution_values[axis] = value
+            axes[axis] = _merge_history(value, axes.get(axis))
             continue
         match = _GPU_PATH.match(path)
         if match is None:
             continue
         index, attribute = int(match.group(1)), match.group(2)
-        if index >= len(gpus):
+        existing = gpus.get(index)
+        if existing is None:
             if attribute != "raw_name":
                 # Without a known name there is no adapter member to attach the
                 # other attributes to; the answer still stays in the response.
                 continue
-            gpus.append(GpuSnapshot(
+            gpus[index] = GpuSnapshot(
                 id=new_id(),
+                probe_index=index,
                 raw_name=value,
                 vram_bytes=_unknown_field(),
                 driver_version=_unknown_field(),
-            ))
-        else:
-            gpus[index] = gpus[index].model_copy(update={attribute: value})
-
-    if resolution_values:
-        width, height = resolution_axes["width"], resolution_axes["height"]
-        if width is not None and height is not None and width > 0 and height > 0:
-            resolution = FieldValue[Resolution](
-                value_state=ValueState.known,
-                value=Resolution(width=width, height=height),
-                acquisition_status=AcquisitionStatus.succeeded,
-                provenance=list(next(iter(resolution_values.values())).provenance),
             )
         else:
-            resolution = display.desktop_resolution
-        display = DisplayContext(
-            desktop_resolution=resolution,
-            refresh_hz=display.refresh_hz,
+            gpus[index] = existing.model_copy(update={
+                attribute: _merge_history(value, getattr(existing, attribute)),
+            })
+
+    if {"width", "height"} <= set(axes) and any(
+        path in (
+            "display.desktop_resolution.width",
+            "display.desktop_resolution.height",
         )
+        for path in answers
+    ):
+        width, height = axes["width"], axes["height"]
+        if (
+            width.value_state is ValueState.known
+            and height.value_state is ValueState.known
+            and width.value is not None
+            and height.value is not None
+        ):
+            display = DisplayContext(
+                desktop_resolution=FieldValue[Resolution](
+                    value_state=ValueState.known,
+                    value=Resolution(width=width.value, height=height.value),
+                    acquisition_status=AcquisitionStatus.succeeded,
+                    provenance=[*width.provenance, *height.provenance],
+                    attempts=[*width.attempts, *height.attempts],
+                ),
+                desktop_resolution_axes=axes,
+                refresh_hz=display.refresh_hz,
+            )
+        else:
+            display = DisplayContext(
+                desktop_resolution=display.desktop_resolution,
+                desktop_resolution_axes=axes,
+                refresh_hz=display.refresh_hz,
+            )
 
     return old.model_copy(update={
         **updates,
@@ -1011,7 +1069,7 @@ def _apply_device_values(
         "version": old.version + 1,
         "created_at": now,
         "captured_at": now,
-        "gpus": gpus,
+        "gpus": [gpus[index] for index in sorted(gpus)],
         "display": display,
     })
 

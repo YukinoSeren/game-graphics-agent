@@ -1500,6 +1500,13 @@ class ImportPublisher:
         context_hash = mapping_context_hash(mapping_version, identity_mapping_ids)
         snapshot_id = _snapshot_id(fingerprint, mapping_version, context_hash)
 
+        # Ownership is checked before the dedupe replay: an already published
+        # snapshot must not become a door into another player's declaration.
+        mappings = [
+            self._identity_mapping(mapping_id, user_scope_id)
+            for mapping_id in identity_mapping_ids
+        ]
+
         existing = self._find_by_triple(fingerprint, mapping_version, context_hash)
         if existing is not None:
             # The identity is already registered: a retry returns the original
@@ -1507,10 +1514,6 @@ class ImportPublisher:
             # and it does not re-validate references that have since changed.
             return self._result(existing["import_snapshot_id"])
 
-        mappings = [
-            self._identity_mapping(mapping_id, user_scope_id)
-            for mapping_id in identity_mapping_ids
-        ]
         self._require_game_context(game_context_id, user_scope_id)
 
         mapped: ScopedImport | None = None

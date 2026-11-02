@@ -612,3 +612,80 @@ def test_a_snapshot_records_the_task_owner(tmp_path):
 
     snapshot = _snapshot(repo, accepted.task_id)
     assert snapshot.user_scope_id == _uid(90)
+
+
+# --- review fix pass ---------------------------------------------------------
+
+
+def test_a_stale_baseline_is_a_retryable_failure_not_a_version_clash(tmp_path, monkeypatch):
+    probe = StubProbe(values={"cpu": "Example CPU"})
+    repo, files, device, tasks = _env(tmp_path, probe)
+    first = _scan(tasks, ["cpu"], key="scan-a")
+    assert tasks.run_once().state.value == "completed"
+    second = _scan(tasks, ["cpu"], key="scan-b")
+    assert tasks.run_once().state.value == "completed"
+    stale = _snapshot(repo, first.task_id)
+
+    # Another writer committed after this scan read its baseline.
+    monkeypatch.setattr(DeviceService, "_latest_snapshot", lambda self, _sid: stale)
+    third = _scan(tasks, ["cpu"], key="scan-c")
+    outcome = tasks.run_once()
+
+    assert outcome.state.value == "failed"
+    with repo.unit_of_work() as uow:
+        row = uow.query("SELECT * FROM tasks WHERE task_id=?", (third.task_id,))[0]
+        versions = [
+            stored.version
+            for stored in uow.iter_objects("DeviceSnapshot")
+        ]
+    assert row["last_error_code"] == ErrorCode.PRECONDITION_UNVERIFIED.value
+    assert versions == [1, 2]
+
+
+def test_a_narrow_rescan_keeps_the_adapters_already_known(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU", "gpus.0.raw_name": "GPU A"})
+    repo, files, device, tasks = _env(tmp_path, probe)
+    first = _scan(tasks, ["cpu", "gpus.0.raw_name"], key="scan-a")
+    assert tasks.run_once().state.value == "completed"
+    assert [gpu.raw_name.value for gpu in _snapshot(repo, first.task_id).gpus] == ["GPU A"]
+
+    second = _scan(tasks, ["cpu"], key="scan-b")
+    assert tasks.run_once().state.value == "completed"
+
+    after = _snapshot(repo, second.task_id)
+    assert after.series_id == _snapshot(repo, first.task_id).series_id
+    assert [gpu.raw_name.value for gpu in after.gpus] == ["GPU A"]
+    assert not any(
+        check.check_id == "probe.gpus" and check.status.value == "not_run"
+        for check in after.checks
+    )
+
+
+def test_an_all_answered_rerun_does_not_call_the_adapter(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU"}, failures={"device_form": "PROBE_FAILED"})
+    repo, files, device, tasks = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["device_form"])
+    tasks.run_once()
+    request = _request(repo, accepted.task_id)
+    from game_app.answers import AnswerService
+    from game_app.contracts.common import MutationContext
+
+    answers = AnswerService(repo, files, tasks=tasks)
+    answers.answer_information(
+        {
+            "request_id": request.id,
+            "expected_request_version": request.version,
+            "expected_context_revision": request.expected_context_revision,
+            "answers": {"device_form": "Desktop PC"},
+            "skipped_fields": [],
+            "raw_text": "",
+            "conflict_selections": {},
+        },
+        MutationContext(user_scope_id=_uid(90), idempotency_key="answer-1", request_id=_uid(92)),
+    )
+    probe.calls.clear()
+
+    outcome = tasks.run_once()
+
+    assert outcome.state.value == "completed"
+    assert probe.calls == []

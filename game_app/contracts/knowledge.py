@@ -112,7 +112,7 @@ class IdentityMapping(StrictModel):
     legacy_namespace: str
     legacy_value: LegacyID
     target_game_id: ID | None
-    declared_by_user_scope_id: ID | None
+    declared_by_user_scope_id: ID | None = None
     checks: list[CheckResult]
 
 

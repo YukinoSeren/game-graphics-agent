@@ -571,6 +571,11 @@ class IdentityService:
                 for stored in uow.iter_objects("IdentityMapping")
                 if stored.payload.get("legacy_namespace") == namespace
                 and stored.payload.get("legacy_value") == typed.legacy_game_id
+                # Only public mappings and the caller's own declarations are
+                # visible here; another player's declaration is not reused and
+                # its existence is not leaked.
+                and stored.payload.get("declared_by_user_scope_id")
+                in (None, context.user_scope_id)
             ]
             if existing_mappings:
                 if {item.target_game_id for item in existing_mappings} != {game.series_id}:

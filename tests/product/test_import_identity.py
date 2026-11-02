@@ -16,6 +16,7 @@ from game_app.contracts.enums import (
 )
 from game_app.contracts.knowledge import (
     Game,
+    IdentityMapping,
     ImportIdentityMappingRequest,
 )
 from game_app.contracts.primitives import utc_now
@@ -413,3 +414,69 @@ def test_the_same_key_with_different_content_is_an_idempotency_conflict(tmp_path
 
     assert caught.value.code is ErrorCode.IDEMPOTENCY_CONFLICT
     assert _count(repository, "IdentityMapping") == 1
+
+
+# --- review fix pass ---------------------------------------------------------
+
+
+def test_an_existing_snapshot_does_not_bypass_the_mapping_owner_check(tmp_path):
+    files, repository = _service(tmp_path)
+    game = _store_game(repository, serial=210)
+    identity = IdentityService(repository, files)
+    mapping_id = _declare(identity, game).refs[0].entity_id
+    context_id = _stored_context(repository)
+    group = _group(files, _run_files(), name="replay-foreign")
+    publisher = ImportPublisher(repository, files)
+    first = _publish(
+        publisher, group, key="imp-a", context_id=context_id, mappings=[mapping_id],
+    )
+    assert first.code == "published"
+
+    with pytest.raises(ContractError) as caught:
+        _publish(
+            publisher, group, key="imp-b", context_id=context_id,
+            mappings=[mapping_id], user=OTHER,
+        )
+
+    assert caught.value.code is ErrorCode.RESOURCE_NOT_FOUND
+    assert _count(repository, "ImportSnapshot") == 1
+
+
+def test_two_users_declaring_the_same_run_each_own_their_mapping(tmp_path):
+    files, repository = _service(tmp_path)
+    game = _store_game(repository, serial=220, status="verified", owner=None)
+    identity = IdentityService(repository, files)
+
+    first = _declare(identity, game, key="map-a", user=USER)
+    second = _declare(identity, game, key="map-b", user=OTHER)
+
+    assert first.refs[0].entity_id != second.refs[0].entity_id
+    stored = repository.get_object("IdentityMapping", second.refs[0].entity_id).payload
+    assert stored["declared_by_user_scope_id"] == OTHER
+
+
+def test_an_old_mapping_without_a_declarer_reads_as_public(tmp_path):
+    files, repository = _service(tmp_path)
+    game = _store_game(repository, serial=230)
+    mapping_id = _uid(240)
+    with repository.unit_of_work() as uow:
+        uow.insert_object("IdentityMapping", IdentityMapping(
+            id=mapping_id,
+            schema_version="product-contract/0.4",
+            created_at=utc_now(),
+            legacy_namespace="collector_run:run-1",
+            legacy_value="0123456789abcdef",
+            target_game_id=game.series_id,
+            checks=[],
+        ))
+    context_id = _stored_context(repository)
+    group = _group(files, _run_files(), name="legacy-mapping")
+
+    result = _publish(
+        ImportPublisher(repository, files), group,
+        key="imp-legacy", context_id=context_id, mappings=[mapping_id],
+    )
+
+    assert result.code == "published"
+    stored = repository.get_object("IdentityMapping", mapping_id).payload
+    assert stored.get("declared_by_user_scope_id") is None

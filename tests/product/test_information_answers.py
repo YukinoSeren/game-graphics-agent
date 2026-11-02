@@ -1116,3 +1116,105 @@ def test_a_facts_only_answer_does_not_associate_with_the_source_task(tmp_path):
             "SELECT COUNT(*) AS n FROM task_responses WHERE task_id=?", (accepted.task_id,)
         )[0]["n"]
     assert after == before
+
+
+def test_an_identical_question_is_not_asked_a_third_time(tmp_path):
+    probe = StubProbe(
+        values={"cpu": "Example CPU"},
+        failures={"device_form": "PROBE_FAILED", "memory_bytes": "PROBE_FAILED"},
+    )
+    repository, files, device, tasks, answers, _ = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "device_form", "memory_bytes"])
+    tasks.run_once()
+    first = _request(repository, _request_ids(repository, accepted.task_id)[0])
+    # device_form is answered and critical, so the task wakes; memory stays
+    # unresolved, so the rerun asks about it alone.
+    _answer(
+        answers, first,
+        answers={"device_form": "Desktop PC", "memory_bytes": "16 GB"},
+        key="answer-1",
+    )
+    tasks.run_once()
+    second = _latest_source_request(repository, accepted.task_id)
+    assert [field.field_path for field in second.fields] == ["memory_bytes"]
+    before = _request_count(repository, accepted.task_id)
+
+    _answer(answers, second, answers={"memory_bytes": "still 16 GB"}, key="answer-2")
+    _requeue(repository, accepted.task_id)
+    outcome = tasks.run_once()
+
+    assert outcome.state.value == "failed"
+    row = _task_row(repository, accepted.task_id)
+    assert row["last_error_code"] == "PRECONDITION_UNVERIFIED"
+    assert _request_count(repository, accepted.task_id) == before
+
+
+# --- review fix pass: a response describes its own submission -----------------
+
+
+def _responses(repository) -> list:
+    from game_app.contracts.information import InformationResponse
+
+    with repository.unit_of_work() as uow:
+        return [
+            InformationResponse.model_validate_json(stored.payload_bytes)
+            for stored in uow.iter_objects("InformationResponse")
+        ]
+
+
+def test_a_second_answer_reports_only_the_fields_it_submitted(tmp_path):
+    probe = StubProbe(
+        values={"cpu": "Example CPU"},
+        failures={"device_form": "PROBE_FAILED", "memory_bytes": "PROBE_FAILED"},
+    )
+    repository, files, device, tasks, answers, _ = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "device_form", "memory_bytes"])
+    tasks.run_once()
+    request = _request(repository, _request_ids(repository, accepted.task_id)[0])
+    _answer(answers, request, answers={"device_form": "Desktop PC"}, key="answer-1")
+    updated = _request(repository, request.id)
+
+    _answer(answers, updated, answers={"memory_bytes": 17179869184}, key="answer-2")
+
+    second = _responses(repository)[-1]
+    # The earlier answer is part of the request projection, not this submission.
+    assert second.answered_fields == ["memory_bytes"]
+    assert second.answered_values == {"memory_bytes": 17179869184}
+    assert "device_form" not in second.unresolved_fields
+
+
+def test_re_answering_an_older_request_does_not_overwrite_a_newer_probe(tmp_path):
+    probe = StubProbe(
+        values={"cpu": "Example CPU"},
+        failures={"device_form": "PROBE_FAILED", "memory_bytes": "PROBE_FAILED"},
+    )
+    repository, files, device, tasks, answers, _ = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "device_form", "memory_bytes"])
+    tasks.run_once()
+    request = _request(repository, _request_ids(repository, accepted.task_id)[0])
+    _answer(answers, request, answers={"device_form": "Desktop PC"}, key="answer-1")
+    tasks.run_once()  # probes memory, applies the stored answer
+
+    # A later scan on the same device series reads the form successfully.
+    probe.failures.pop("device_form")
+    probe.values["device_form"] = "Probe Form"
+    later = _scan(tasks, ["cpu", "device_form"], key="scan-2")
+    assert tasks.run_once().state.value == "completed"
+    series_id = _snapshot(repository, _request(repository, request.id)).series_id
+    assert _latest_snapshot(repository, series_id).device_form.value == "Probe Form"
+
+    # The first question is still partially answered; answering it again must
+    # not replay the stale answer over the newer probe.
+    _answer(
+        answers, _request(repository, request.id),
+        answers={"memory_bytes": 17179869184}, key="answer-2",
+    )
+
+    after = _latest_snapshot(repository, series_id)
+    assert after.device_form.value == "Probe Form"
+    form_attempts = [
+        attempt for attempt in after.device_form.attempts
+        if attempt.information_response_id is not None
+    ]
+    # Exactly one response ever answered this field.
+    assert len(form_attempts) == 1

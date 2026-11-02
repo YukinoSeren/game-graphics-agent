@@ -294,19 +294,27 @@ class AnswerService:
             plan = self.validate_information_answer(
                 response_input, request, response_id=response_id, now=now, prior_ref=prior_ref
             )
-            derived = self._derive_snapshot(uow, request, plan, response_id, now)
+            # A response describes this submission only: fields the player did
+            # not submit here belong to the request projection, not to it.
+            submitted = set(response_input.answers)
+            derived = self._derive_snapshot(
+                uow, request, plan, response_id, now, submitted=submitted
+            )
             answered_fields = [
                 field.field_path for field in plan.fields
-                if field.answer_state is AnswerState.answered
+                if field.field_path in submitted
+                and field.answer_state is AnswerState.answered
             ]
             unresolved_fields = [
                 field.field_path for field in plan.fields
-                if field.answer_state is AnswerState.unresolved
+                if field.field_path in submitted
+                and field.answer_state is AnswerState.unresolved
             ]
             answered_values = {
                 field.field_path: field.value.value
                 for field in plan.fields
-                if field.answer_state is AnswerState.answered
+                if field.field_path in submitted
+                and field.answer_state is AnswerState.answered
             }
 
             result_refs: list[ObjectRef] = [
@@ -504,6 +512,8 @@ class AnswerService:
         plan: AnswerPlan,
         response_id: str,
         now: str,
+        *,
+        submitted: set[str],
     ) -> DeviceSnapshot | None:
         ref = next(
             (item for item in request.context_refs if item.entity_type == "DeviceSnapshot"),
@@ -535,7 +545,8 @@ class AnswerService:
         values = {
             field.field_path: field.value
             for field in plan.fields
-            if field.answer_state in (AnswerState.answered, AnswerState.unresolved)
+            if field.field_path in submitted
+            and field.answer_state in (AnswerState.answered, AnswerState.unresolved)
         }
         if not values:
             return None

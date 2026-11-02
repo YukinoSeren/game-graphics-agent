@@ -166,7 +166,9 @@ class DeviceService:
         probe_paths = [path for path in paths if path not in handled]
 
         context.phase("acquire")
-        readings = self._read(probe_paths)
+        # An all-answered rerun needs no probe at all; an adapter is never asked
+        # to read an empty path list.
+        readings = self._read(probe_paths) if probe_paths else []
         snapshot_id = new_id()
         artifacts = self._store_originals(snapshot_id, readings)
         snapshot, gpus_by_index = self._assemble(
@@ -195,11 +197,26 @@ class DeviceService:
         )
         # The snapshot and the question about it are one fact: a consumer must
         # never see a snapshot whose failures were not asked about.  The slot is
-        # maintained in the same transaction as the snapshot it names.
+        # maintained in the same transaction as the snapshot it names, and the
+        # version is allocated under the write lock so two writers cannot
+        # compute the same next version.
         with self.repository.unit_of_work() as uow:
             self._ensure_slot(
                 uow, user_scope_id, scope_key, series_id, device_series_id
             )
+            latest = uow.latest_for_series("DeviceSnapshot", series_id)
+            if (latest is None) != (baseline is None) or (
+                latest is not None
+                and baseline is not None
+                and latest.object_id != baseline.id
+            ):
+                raise ContractError(
+                    ErrorCode.PRECONDITION_UNVERIFIED,
+                    "the device series changed while this scan ran; run the scan again",
+                )
+            snapshot = snapshot.model_copy(update={
+                "version": 1 if latest is None else latest.version + 1,
+            })
             uow.insert_versioned("DeviceSnapshot", snapshot)
             if request is not None:
                 uow.insert_object("InformationRequest", request)
@@ -370,8 +387,8 @@ class DeviceService:
             if field.answer_state is AnswerState.skipped
         }
         return (
-            set(unknown_paths) == latest_asked
-            and set(answered) == latest_answered
+            set(unknown_paths) == latest_asked - latest_skipped
+            and (set(answered) & latest_asked) == latest_answered
             and skipped == latest_skipped
         )
 
@@ -494,11 +511,14 @@ class DeviceService:
             )
             return _merge_probe(new, previous)
 
-        gpu_indices = sorted({
-            int(_GPU_PATH.match(path).group(1))
-            for path in paths
-            if _GPU_PATH.match(path) is not None
-        })
+        gpu_indices = sorted(
+            {
+                int(_GPU_PATH.match(path).group(1))
+                for path in paths
+                if _GPU_PATH.match(path) is not None
+            }
+            | set(baseline_gpus)
+        )
         gpus: list[GpuSnapshot] = []
         # The snapshot list is compacted, so keep the probe index alongside it:
         # gpus.1.* must never be answered by the list's first entry.
@@ -644,7 +664,7 @@ class DeviceService:
             created_at=captured,
             created_by_task_id=None,
             series_id=series_id,
-            version=baseline.version + 1 if baseline is not None else 1,
+            version=1,  # allocated under the write lock, not from the read baseline
             device_series_id=device_series_id,
             user_scope_id=user_scope_id,
             captured_at=captured,

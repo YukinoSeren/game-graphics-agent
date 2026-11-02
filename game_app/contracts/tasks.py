@@ -39,8 +39,14 @@ class AnalysisInput(StrictModel):
     cleaning_protocol_version: str
 
 
+class DeviceScanInput(StrictModel):
+    kind: Literal["device_scan"]
+    game_context_id: ID | None
+    field_paths: list[str]
+
+
 TaskInputPayload = Annotated[
-    Union[KnowledgeInput, AnalysisInput], Field(discriminator="kind")
+    Union[KnowledgeInput, AnalysisInput, DeviceScanInput], Field(discriminator="kind")
 ]
 TaskInputAdapter = TypeAdapter(TaskInputPayload)
 
@@ -104,6 +110,7 @@ class ResumeTaskInput(StrictModel):
 __all__ = [
     "KnowledgeInput",
     "AnalysisInput",
+    "DeviceScanInput",
     "TaskInputPayload",
     "TaskInputAdapter",
     "DomainResult",

@@ -44,6 +44,7 @@ PRODUCT_CONTRACT_VERSION = "product-contract/0.4"
 DEFAULT_ROUTES = {
     "knowledge": "/api/knowledge-tasks",
     "analysis": "/api/analyses",
+    "device_scan": "/api/device-scans",
 }
 _COUNTER_LIMITS = {
     "model": "max_model_calls",
@@ -141,11 +142,20 @@ class TaskContext:
         return self.service._load_input(self.task_id)
 
     @property
+    def task_input_revision(self) -> int:
+        return self.service._load_input_revision(self.task_id)
+
+    @property
     def budget(self) -> Budget:
         return self.service._load_budget(self.task_id)
 
-    def suspend(self, *, information_request_id: str) -> None:
-        self.service._suspend(self.task_id, information_request_id)
+    def suspend(
+        self,
+        *,
+        information_request_id: str,
+        result_refs: Sequence[ObjectRef] = (),
+    ) -> None:
+        self.service._suspend(self.task_id, information_request_id, result_refs=result_refs)
         self.suspended = True
         raise _SuspendExecution()
 
@@ -681,7 +691,13 @@ class TaskService:
             )
             return state
 
-    def _suspend(self, task_id: str, information_request_id: str) -> None:
+    def _suspend(
+        self,
+        task_id: str,
+        information_request_id: str,
+        *,
+        result_refs: Sequence[ObjectRef] = (),
+    ) -> None:
         with self.repository.unit_of_work() as uow:
             row = self._task_row(uow, task_id)
             if TaskState(row["state"]) is not TaskState.running:
@@ -691,8 +707,14 @@ class TaskService:
                 )
             revision = row["revision"] + 1
             uow.execute(
-                "UPDATE tasks SET state='waiting_input', revision=?, updated_at=? WHERE task_id=?",
-                (revision, self.clock(), task_id),
+                "UPDATE tasks SET state='waiting_input', result_refs=?, revision=?,"
+                " updated_at=? WHERE task_id=?",
+                (
+                    canonical_json([ref.model_dump(mode="json") for ref in result_refs]).decode(),
+                    revision,
+                    self.clock(),
+                    task_id,
+                ),
             )
             self._append_event(
                 uow, task_id, self._next_sequence(uow, task_id), row["current_input_revision"],
@@ -881,6 +903,10 @@ class TaskService:
                 (task_id, row["current_input_revision"]),
             )
         return TaskInputAdapter.validate_python(json.loads(input_row[0]["input"]))
+
+    def _load_input_revision(self, task_id: str) -> int:
+        with self.repository.unit_of_work() as uow:
+            return int(self._task_row(uow, task_id)["current_input_revision"])
 
     def _load_budget(self, task_id: str) -> Budget:
         with self.repository.unit_of_work() as uow:

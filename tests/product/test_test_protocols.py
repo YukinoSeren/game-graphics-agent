@@ -157,6 +157,9 @@ def test_create_returns_the_protocol_and_a_readable_declaration(tmp_path):
     assert known["interval_p95_nearest_rank/v1"] is None
     assert known["slowest_1pct_inverse_mean/v1"] is None
 
+    with repository.unit_of_work() as uow:
+        assert uow.query("SELECT COUNT(*) AS n FROM external_calls")[0]["n"] == 0
+
 
 def test_replay_returns_the_same_protocol_and_changed_content_conflicts(tmp_path):
     repository, files, installation_id, context_id, device_id = setup(tmp_path)

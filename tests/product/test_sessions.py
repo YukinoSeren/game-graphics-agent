@@ -102,6 +102,9 @@ def test_create_without_configuration_opens_a_segment_and_first_binding(tmp_path
     assert binding.applied_id is None
     assert binding.supersedes_revision is None
 
+    with repository.unit_of_work() as uow:
+        assert uow.query("SELECT COUNT(*) AS n FROM external_calls")[0]["n"] == 0
+
 
 def test_null_applied_cannot_be_declared_bound(tmp_path):
     repository, files, installation_id, context_id, device_id = setup(tmp_path)

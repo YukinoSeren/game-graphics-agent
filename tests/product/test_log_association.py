@@ -138,6 +138,8 @@ def test_inspect_log_is_bounded_and_read_only(tmp_path):
     assert inspection.streams[0].process.started_at is None
     assert inspection.streams[0].frame_stream_kind.value == "application_present"
     assert inspection.limitations == []
+    with repository.unit_of_work() as uow:
+        assert uow.query("SELECT COUNT(*) AS n FROM external_calls")[0]["n"] == 0
     assert _count(repository, "PlaySession") + _count(repository, "CaptureArtifact") == before
 
 

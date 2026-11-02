@@ -1203,6 +1203,69 @@ class UnitOfWork:
                 )],
             ) from error
 
+    # -- current applied pointer --------------------------------------------
+    def current_applied(self, user_scope_id: str, installation_id: str) -> Any | None:
+        _require_id(user_scope_id, "user_scope_id")
+        _require_id(installation_id, "installation_id")
+        return self.connection.execute(
+            "SELECT * FROM current_applied WHERE user_scope_id=? AND installation_id=?",
+            (user_scope_id, installation_id),
+        ).fetchone()
+
+    def advance_current_applied(
+        self,
+        *,
+        user_scope_id: str,
+        installation_id: str,
+        expected_applied_id: str | None,
+        next_applied_id: str,
+        now: str,
+    ) -> int:
+        """Compare-and-set the per-installation pointer and append its event.
+
+        This is the only implementation of the pointer rule: the caller's
+        expected id is compared with the row *inside* the write transaction, and
+        a mismatch raises before anything is written.
+        """
+        _require_id(user_scope_id, "user_scope_id")
+        _require_id(installation_id, "installation_id")
+        _require_id(next_applied_id, "next_applied_id")
+        row = self.current_applied(user_scope_id, installation_id)
+        previous = None if row is None else row["applied_id"]
+        if expected_applied_id != previous:
+            raise ContractError(
+                ErrorCode.CURRENT_CONFIGURATION_CONFLICT,
+                "the current configuration changed; re-read it before adopting",
+                field_errors=[FieldError(
+                    path="expected_current_applied_id", code="conflict",
+                    message="not the current adopted configuration",
+                )],
+                details=empty_details(
+                    current_resource_ref=(
+                        None if previous is None
+                        else ObjectRef(entity_type="AppliedConfiguration", entity_id=previous)
+                    )
+                ),
+            )
+        revision = 1 if row is None else int(row["revision"]) + 1
+        self.connection.execute(
+            "INSERT INTO current_applied(user_scope_id, installation_id, applied_id,"
+            " revision, updated_at) VALUES(?, ?, ?, ?, ?)"
+            " ON CONFLICT(user_scope_id, installation_id) DO UPDATE SET"
+            " applied_id=excluded.applied_id, revision=excluded.revision,"
+            " updated_at=excluded.updated_at",
+            (user_scope_id, installation_id, next_applied_id, revision, now),
+        )
+        self.connection.execute(
+            "INSERT INTO current_applied_events(user_scope_id, installation_id,"
+            " pointer_revision, previous_applied_id, next_applied_id, created_at)"
+            " VALUES(?, ?, ?, ?, ?, ?)",
+            (
+                user_scope_id, installation_id, revision, previous, next_applied_id, now,
+            ),
+        )
+        return revision
+
     # -- metric rule registry ----------------------------------------------
     def record_metric_rule(
         self, *, metric_key: str, registry_version: str, rule_hash: str, definition_id: str

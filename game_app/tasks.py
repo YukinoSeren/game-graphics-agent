@@ -47,6 +47,7 @@ DEFAULT_ROUTES = {
     "knowledge_import": "/api/knowledge-imports",
     "analysis": "/api/analyses",
     "device_scan": "/api/device-scans",
+    "log_import": "/api/log-imports",
 }
 _COUNTER_LIMITS = {
     "model": "max_model_calls",

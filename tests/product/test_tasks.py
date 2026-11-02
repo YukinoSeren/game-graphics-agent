@@ -834,3 +834,74 @@ def test_phase_requires_a_registered_key(repo_factory):
     assert service.get_task(accepted.task_id).task.last_error_code == "INPUT_VALIDATION_FAILED"
     with repo.unit_of_work() as uow:
         assert uow.query("SELECT COUNT(*) AS n FROM task_events WHERE cause LIKE 'phase:%'")[0]["n"] == 0
+
+
+# --- A-1: the log_import member of the task union ---------------------------
+
+
+def _log_import_input(**overrides) -> dict:
+    payload = {
+        "kind": "log_import",
+        "file_id": _uid(700),
+        "session_id": _uid(701),
+        "segment_ref": {
+            "segment_id": _uid(702),
+            "segment_revision": 1,
+            "binding_revision": 1,
+        },
+        "source_schema": "offline-frame-csv/v1",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_log_import_is_a_task_input_member():
+    from game_app.contracts.tasks import TaskInputAdapter
+
+    typed = TaskInputAdapter.validate_python(_log_import_input())
+
+    assert typed.kind == "log_import"
+    assert typed.file_id == _uid(700)
+    assert typed.segment_ref.segment_revision == 1
+    assert typed.source_schema == "offline-frame-csv/v1"
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"file_id": "not-a-hex-id"},
+        {"source_schema": "   "},
+        {"session_id": "abc"},
+        {"segment_ref": {"segment_id": _uid(702), "segment_revision": 0, "binding_revision": 1}},
+        {"segment_ref": {"segment_id": _uid(702), "segment_revision": 1}},
+    ],
+)
+def test_invalid_log_import_is_refused_without_creating_a_task(repo_factory, override):
+    repo = repo_factory()
+    service = _service(repo)
+    payload = _log_import_input(**override)
+    if "segment_ref" in override and "binding_revision" not in override["segment_ref"]:
+        del payload["source_schema"]
+        payload["source_schema"] = "offline-frame-csv/v1"
+
+    with pytest.raises(ContractError) as caught:
+        service.register_task(payload, _ctx("log-bad"))
+
+    assert caught.value.code is ErrorCode.INPUT_VALIDATION_FAILED
+    with repo.unit_of_work() as uow:
+        assert uow.query("SELECT COUNT(*) AS n FROM tasks")[0]["n"] == 0
+
+
+def test_application_refuses_log_import_because_no_handler_is_registered(repo_factory, tmp_path):
+    from game_app.application import Application
+
+    repo = repo_factory()
+    app = Application(repo, file_root=str(tmp_path / "managed"))
+
+    with pytest.raises(ContractError) as caught:
+        app.register_task(_log_import_input(), _ctx("log-app"))
+
+    assert caught.value.code is ErrorCode.INPUT_VALIDATION_FAILED
+    assert caught.value.field_errors[0].path == "kind"
+    with repo.unit_of_work() as uow:
+        assert uow.query("SELECT COUNT(*) AS n FROM tasks")[0]["n"] == 0

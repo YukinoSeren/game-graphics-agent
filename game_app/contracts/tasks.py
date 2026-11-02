@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal, Union
 
-from pydantic import Field, TypeAdapter, model_validator
+from pydantic import Field, TypeAdapter, field_validator, model_validator
 
 from game_app.contracts.common import Budget, CallCounters, CheckResult
 from game_app.contracts.enums import ExecutionStopCode, TaskState, TaskType
@@ -59,8 +59,36 @@ class DeviceScanInput(StrictModel):
     field_paths: list[str]
 
 
+class LogImportInput(StrictModel):
+    """A managed capture log to attach to one fixed segment/binding revision.
+
+    The client names a managed file and the exact revisions; it never supplies
+    a local path, a column mapping or a time anchor.  Historical log anchors
+    belong to the synchronous association entry (04 §4.3), not to this input.
+    """
+
+    kind: Literal["log_import"]
+    file_id: ID
+    session_id: ID
+    segment_ref: BindingRef
+    source_schema: str
+
+    @field_validator("source_schema")
+    @classmethod
+    def schema_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("source_schema must not be blank")
+        return value
+
+
 TaskInputPayload = Annotated[
-    Union[KnowledgeInput, KnowledgeImportInput, AnalysisInput, DeviceScanInput],
+    Union[
+        KnowledgeInput,
+        KnowledgeImportInput,
+        AnalysisInput,
+        DeviceScanInput,
+        LogImportInput,
+    ],
     Field(discriminator="kind"),
 ]
 TaskInputAdapter = TypeAdapter(TaskInputPayload)
@@ -127,6 +155,7 @@ __all__ = [
     "KnowledgeImportInput",
     "AnalysisInput",
     "DeviceScanInput",
+    "LogImportInput",
     "TaskInputPayload",
     "TaskInputAdapter",
     "DomainResult",

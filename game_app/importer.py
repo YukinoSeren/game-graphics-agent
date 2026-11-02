@@ -32,22 +32,28 @@ from game_app.contracts.common import CheckResult
 from game_app.contracts.enums import (
     CheckStatus,
     LegacyRecordState,
+    PublicationStatus,
+    TaskState,
+    TaskType,
 )
 from game_app.contracts.knowledge import (
     BoundarySemantics,
     IdentityMapping,
     ImportedExtraction,
     ImportedRecord,
+    ImportSnapshot,
     ImportValidation,
     RecordExtension,
+    SnapshotFileEntry,
+    SnapshotManifest,
     Source,
     SourceMetadata,
     SourceRevision,
 )
-from game_app.contracts.primitives import StrictModel, new_id, utc_now
-from game_app.errors import ContractError, ErrorCode
-from game_app.files import FileManifest, FileService, PublishHooks
-from game_app.repository import canonical_json
+from game_app.contracts.primitives import ObjectRef, StrictModel, new_id, utc_now
+from game_app.errors import ContractError, ErrorCode, FieldError
+from game_app.files import FileEntry, FileManifest, FileService, PublishHooks
+from game_app.repository import ProductRepository, UnitOfWork, canonical_json
 
 PRODUCT_CONTRACT_VERSION = "product-contract/0.4"
 COLLECTOR_RUN_FORMAT_ID = "collector-run/v0.1"
@@ -656,6 +662,7 @@ class ScopedImport:
     """Staging result of IMP-T02; IMP-T03 publishes it, nothing here is written."""
 
     import_snapshot_id: str
+    legacy_run_id: str | None
     game_id: str | None
     sources: list[Source]
     source_revisions: list[SourceRevision]
@@ -815,6 +822,7 @@ class ScopedReferenceMapper:
         limitations.extend(extraction_limits)
         return ScopedImport(
             import_snapshot_id=import_snapshot_id,
+            legacy_run_id=run.get("id"),
             game_id=game_id,
             sources=mapped_sources,
             source_revisions=mapped_revisions,
@@ -938,10 +946,12 @@ def _resolve_game(
             " no public game id was assumed"
         ]
     target = targets.pop()
-    stored = files.repository.find_object("Game", target)
-    if stored is None:
+    # A mapping names the stable game series, not one version object.
+    with files.repository.unit_of_work() as uow:
+        latest = uow.latest_for_series("Game", target)
+    if latest is None:
         return None, [
-            f"the identity mapping for {legacy_value!r} targets a game that does not exist;"
+            f"the identity mapping for {legacy_value!r} targets a game series that does not exist;"
             " no public game id was assumed"
         ]
     return target, []
@@ -1292,6 +1302,518 @@ def _map_extractions(
 
 
 
+# --- publication and recovery (IMP-T03) --------------------------------------
+
+IMPORT_PUBLISH_ROUTE = "/internal/knowledge-import-publish"
+_SNAPSHOT_ID_NAMESPACE = UUID("d3f1a2b4-5c6d-4e7f-8a90-1b2c3d4e5f60")
+DECLARATION_FILE = "declaration.json"
+
+
+def import_fingerprint(manifest: FileManifest) -> str:
+    """Canonical name + byte length + sha256 over the frozen group.
+
+    The original bytes decide the identity; a re-serialised JSON view does not.
+    """
+    return hashlib.sha256(canonical_json([
+        {
+            "relative_name": entry.relative_name,
+            "byte_length": entry.byte_length,
+            "sha256": entry.sha256,
+        }
+        for entry in sorted(manifest.entries, key=lambda item: item.relative_name)
+    ])).hexdigest()
+
+
+def mapping_context_hash(mapping_version: str, identity_mapping_ids: Sequence[str]) -> str:
+    """What the mapping interpreted, not what the bytes were."""
+    return hashlib.sha256(canonical_json({
+        "mapping_version": mapping_version,
+        "identity_mapping_ids": sorted(set(identity_mapping_ids)),
+        "rule_version": IMPORT_RULE_VERSION,
+    })).hexdigest()
+
+
+def _snapshot_id(fingerprint: str, mapping_version: str, context_hash: str) -> str:
+    return uuid5(
+        _SNAPSHOT_ID_NAMESPACE,
+        ":".join(("import_snapshot", fingerprint, mapping_version, context_hash)),
+    ).hex
+
+
+@dataclass(frozen=True)
+class ImportPublishResult:
+    snapshot_id: str
+    status: PublicationStatus
+    code: str
+    import_fingerprint: str
+    mapping_context_hash: str
+    parent_import_snapshot_id: str | None
+    game_id: str | None
+    accepted_record_ids: list[str]
+    diagnostic_record_ids: list[str]
+    declaration_file_id: str
+    limitations: list[str]
+    refs: list[ObjectRef]
+
+
+def snapshot_manifest(manifest: FileManifest) -> SnapshotManifest:
+    return SnapshotManifest(entries=[
+        SnapshotFileEntry(
+            relative_name=entry.relative_name,
+            byte_length=entry.byte_length,
+            sha256=entry.sha256,
+            media_type=entry.media_type,
+        )
+        for entry in sorted(manifest.entries, key=lambda item: item.relative_name)
+    ])
+
+
+def frozen_group_from_file_ids(
+    files: FileService,
+    file_ids: Sequence[str],
+    registry: FormatRegistry | None = None,
+) -> FrozenGroup:
+    """Re-open a frozen group from the managed ids a task input names.
+
+    A client never supplies a directory; the bytes and their names come from
+    the managed-file records themselves.
+    """
+    registry = registry or default_format_registry()
+    if not file_ids:
+        raise ContractError(
+            ErrorCode.INPUT_VALIDATION_FAILED, "a knowledge import needs at least one file id"
+        )
+    entries: list[FileEntry] = []
+    by_name: dict[str, str] = {}
+    for file_id in file_ids:
+        stored = files.repository.get_object("ManagedFile", file_id)
+        entry = FileEntry.model_validate(stored.payload["manifest"])
+        if entry.relative_name in by_name:
+            raise ContractError(
+                ErrorCode.IMPORT_SNAPSHOT_INCONSISTENT,
+                f"two managed files are named {entry.relative_name!r}",
+            )
+        by_name[entry.relative_name] = file_id
+        entries.append(entry)
+    data = {
+        name: files.read_managed_file(file_id) for name, file_id in by_name.items()
+    }
+    inspection = registry.inspect_files(data)
+    if inspection.format_id is None:
+        if inspection.missing_files:
+            raise ContractError(
+                ErrorCode.IMPORT_SNAPSHOT_INCONSISTENT,
+                "the file group is missing " + ", ".join(inspection.missing_files),
+            )
+        raise ContractError(
+            ErrorCode.UNSUPPORTED_ARTIFACT_FORMAT,
+            "no registered format matches this file group",
+        )
+    return FrozenGroup(
+        format_id=inspection.format_id,
+        operation_id="",
+        file_ids=by_name,
+        manifest=FileManifest(
+            entries=sorted(entries, key=lambda item: item.relative_name)
+        ),
+        inspection=inspection,
+    )
+
+
+class ImportPublisher:
+    """Publish one frozen group as an ImportSnapshot, idempotently.
+
+    ``FileService.publish`` owns the file window: a rename without a commit
+    leaves an unconsumable orphan that a same-key retry reuses, and a lost
+    response after the commit replays the original response.
+    """
+
+    def __init__(
+        self,
+        repository: ProductRepository,
+        files: FileService,
+        *,
+        registry: FormatRegistry | None = None,
+        clock: Callable[[], str] = utc_now,
+    ) -> None:
+        self.repository = repository
+        self.files = files
+        self.registry = registry or default_format_registry()
+        self.clock = clock
+
+    # -- public entry -------------------------------------------------------
+    def publish(
+        self,
+        *,
+        frozen: FrozenGroup,
+        game_context_id: str,
+        mapping_version: str,
+        identity_mapping_ids: Sequence[str],
+        user_scope_id: str,
+        idempotency_key: str | None = None,
+        canonical_route: str = IMPORT_PUBLISH_ROUTE,
+        hooks: PublishHooks | None = None,
+        created_by_task_id: str | None = None,
+    ) -> ImportPublishResult:
+        mappings = [self._identity_mapping(mapping_id) for mapping_id in identity_mapping_ids]
+        self._require_game_context(game_context_id)
+        fingerprint = import_fingerprint(frozen.manifest)
+        context_hash = mapping_context_hash(mapping_version, identity_mapping_ids)
+        snapshot_id = _snapshot_id(fingerprint, mapping_version, context_hash)
+
+        existing = self._find_by_triple(fingerprint, mapping_version, context_hash)
+        if existing is not None:
+            # The identity is already registered: a retry returns the original
+            # import, including a rejected one.  It never re-runs the mapping.
+            return self._result(existing["import_snapshot_id"])
+
+        mapped: ScopedImport | None = None
+        rejection: str | None = None
+        try:
+            mapped = ScopedReferenceMapper(self.files, clock=self.clock).map(
+                frozen,
+                import_snapshot_id=snapshot_id,
+                identity_mappings=mappings,
+            )
+        except ContractError as error:
+            if error.code is not ErrorCode.IMPORT_SNAPSHOT_INCONSISTENT:
+                raise
+            rejection = error.message
+
+        status = (
+            PublicationStatus.rejected if rejection is not None else PublicationStatus.published
+        )
+        limitations = list(mapped.limitations) if mapped else [rejection or "the group was rejected"]
+        if rejection is not None:
+            limitations.insert(0, f"the frozen group was rejected: {rejection}")
+        game_id = mapped.game_id if mapped else None
+        accepted_ids = list(mapped.validation.accepted_record_ids) if mapped else []
+        diagnostic_ids = list(mapped.validation.diagnostic_record_ids) if mapped else []
+        declaration = {
+            "kind": "collector_import",
+            "rule_version": IMPORT_RULE_VERSION,
+            "import_snapshot_id": snapshot_id,
+            "import_fingerprint": fingerprint,
+            "mapping_version": mapping_version,
+            "mapping_context_hash": context_hash,
+            "identity_mapping_ids": sorted(set(identity_mapping_ids)),
+            "game_context_id": game_context_id,
+            "origin": "collector_run",
+            "legacy_run_id": mapped.legacy_run_id if mapped else self._legacy_run_id(frozen),
+            "import_status": status.value,
+            "rejection_reason": rejection,
+            "accepted_record_ids": accepted_ids,
+            "diagnostic_record_ids": diagnostic_ids,
+            "limitations": limitations,
+            "manifest": frozen.manifest.model_dump(mode="json"),
+        }
+        key = idempotency_key or f"snapshot:{snapshot_id}"
+        request_hash = hashlib.sha256(canonical_json({
+            "import_fingerprint": fingerprint,
+            "mapping_version": mapping_version,
+            "mapping_context_hash": context_hash,
+            "user_scope_id": user_scope_id,
+        })).hexdigest()
+        self.files.publish(
+            kind="import",
+            files={f"imports/{snapshot_id}/{DECLARATION_FILE}": canonical_json(declaration)},
+            user_scope_id=user_scope_id,
+            method="POST",
+            canonical_route=canonical_route,
+            key=key,
+            request_schema_version="product-contract/0.4",
+            request_hash=request_hash,
+            writer=lambda uow, operation, managed: self._write(
+                uow,
+                managed=managed,
+                snapshot_id=snapshot_id,
+                fingerprint=fingerprint,
+                mapping_version=mapping_version,
+                context_hash=context_hash,
+                identity_mapping_ids=list(identity_mapping_ids),
+                mapped=mapped,
+                status=status,
+                limitations=limitations,
+                game_id=game_id,
+                created_by_task_id=created_by_task_id,
+                legacy_run_id=declaration["legacy_run_id"],
+                group_manifest=frozen.manifest,
+            ),
+            hooks=hooks,
+        )
+        return self._result(snapshot_id)
+
+    # -- the publishing transaction ----------------------------------------
+    def _write(
+        self,
+        uow: UnitOfWork,
+        *,
+        managed: Sequence[Any],
+        snapshot_id: str,
+        fingerprint: str,
+        mapping_version: str,
+        context_hash: str,
+        identity_mapping_ids: Sequence[str],
+        mapped: ScopedImport | None,
+        status: PublicationStatus,
+        limitations: Sequence[str],
+        game_id: str | None,
+        created_by_task_id: str | None,
+        legacy_run_id: str | None,
+        group_manifest: FileManifest,
+    ) -> list[ObjectRef]:
+        winner = uow.query(
+            "SELECT import_snapshot_id FROM import_snapshots"
+            " WHERE import_fingerprint=? AND mapping_version=? AND mapping_context_hash=?",
+            (fingerprint, mapping_version, context_hash),
+        )
+        if winner:
+            return self._refs(uow, winner[0]["import_snapshot_id"])
+
+        parent = uow.query(
+            "SELECT import_snapshot_id FROM import_snapshots WHERE import_fingerprint=?"
+            " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (fingerprint,),
+        )
+        parent_id = parent[0]["import_snapshot_id"] if parent else None
+        declaration_file_id = managed[0].id
+        snapshot = ImportSnapshot(
+            id=snapshot_id,
+            schema_version="product-contract/0.4",
+            created_at=self.clock(),
+            created_by_task_id=created_by_task_id,
+            origin="collector_run",
+            legacy_run_id=legacy_run_id,
+            manifest=snapshot_manifest(group_manifest),
+            import_fingerprint=fingerprint,
+            import_status=status,
+            mapping_version=mapping_version,
+            mapping_context_hash=context_hash,
+            parent_import_snapshot_id=parent_id,
+            identity_mapping_ids=list(identity_mapping_ids),
+            limitations=list(limitations),
+        )
+        uow.insert_object("ImportSnapshot", snapshot)
+        if mapped is not None:
+            for source in mapped.sources:
+                uow.insert_object("Source", source)
+            for revision in mapped.source_revisions:
+                uow.insert_object("SourceRevision", revision)
+            diagnostic = set(mapped.validation.diagnostic_record_ids)
+            for record in mapped.records:
+                uow.insert_object("ImportedRecord", record)
+                uow.claim_imported_record_key(
+                    record_snapshot_id=record.id,
+                    import_snapshot_id=snapshot_id,
+                    capture_scope_id=record.capture_scope_id,
+                    record_type=record.record_type,
+                    local_record_id=record.local_record_id,
+                    usable=record.id not in diagnostic,
+                )
+            for extraction in mapped.extractions:
+                uow.insert_object("ImportedExtraction", extraction)
+            # The dependency graph is a real reference row per member.  The
+            # declaration ManagedFile itself is inserted by FileService after
+            # this writer, so its id lives in the projection table instead.
+            snapshot_ref = ObjectRef(entity_type="ImportSnapshot", entity_id=snapshot_id)
+            for source in mapped.sources:
+                uow.insert_reference(snapshot_id, "source", ObjectRef(
+                    entity_type="Source", entity_id=source.id,
+                ))
+            for revision in mapped.source_revisions:
+                uow.insert_reference(snapshot_id, "source_revision", ObjectRef(
+                    entity_type="SourceRevision", entity_id=revision.id,
+                ))
+            for record in mapped.records:
+                uow.insert_reference(snapshot_id, "record", ObjectRef(
+                    entity_type="ImportedRecord", entity_id=record.id,
+                ))
+                uow.insert_reference(record.id, "source_revision", ObjectRef(
+                    entity_type="SourceRevision", entity_id=record.source_revision_id,
+                ))
+                uow.insert_reference(record.id, "import_snapshot", snapshot_ref)
+            for extraction in mapped.extractions:
+                uow.insert_reference(snapshot_id, "extraction", ObjectRef(
+                    entity_type="ImportedExtraction", entity_id=extraction.id,
+                ))
+        uow.execute(
+            "INSERT INTO import_snapshots(import_snapshot_id, import_fingerprint,"
+            " mapping_version, mapping_context_hash, import_status, declaration_file_id,"
+            " parent_import_snapshot_id, mapped_game_id, created_by_task_id, created_at)"
+            " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                snapshot_id,
+                fingerprint,
+                mapping_version,
+                context_hash,
+                status.value,
+                declaration_file_id,
+                parent_id,
+                game_id,
+                created_by_task_id,
+                self.clock(),
+            ),
+        )
+        return self._refs(uow, snapshot_id)
+
+    # -- result reconstruction ---------------------------------------------
+    def _result(self, snapshot_id: str) -> ImportPublishResult:
+        with self.repository.unit_of_work() as uow:
+            row = uow.query(
+                "SELECT * FROM import_snapshots WHERE import_snapshot_id=?", (snapshot_id,)
+            )
+            if not row:
+                raise ContractError(
+                    ErrorCode.RESOURCE_NOT_FOUND, "the import snapshot is not registered"
+                )
+            keys = uow.query(
+                "SELECT record_snapshot_id, usable FROM imported_record_keys"
+                " WHERE import_snapshot_id=? ORDER BY rowid",
+                (snapshot_id,),
+            )
+        stored = self.repository.get_object("ImportSnapshot", snapshot_id)
+        snapshot = ImportSnapshot.model_validate_json(stored.payload_bytes)
+        accepted = [item["record_snapshot_id"] for item in keys if item["usable"]]
+        diagnostic = [item["record_snapshot_id"] for item in keys if not item["usable"]]
+        code = "published" if accepted and row[0]["mapped_game_id"] else "retained_only"
+        return ImportPublishResult(
+            snapshot_id=snapshot_id,
+            status=PublicationStatus(row[0]["import_status"]),
+            code=code,
+            import_fingerprint=row[0]["import_fingerprint"],
+            mapping_context_hash=row[0]["mapping_context_hash"],
+            parent_import_snapshot_id=row[0]["parent_import_snapshot_id"],
+            game_id=row[0]["mapped_game_id"],
+            accepted_record_ids=accepted,
+            diagnostic_record_ids=diagnostic,
+            declaration_file_id=row[0]["declaration_file_id"],
+            limitations=list(snapshot.limitations),
+            refs=[
+                ObjectRef(entity_type="ImportSnapshot", entity_id=snapshot_id),
+                ObjectRef(entity_type="ManagedFile", entity_id=row[0]["declaration_file_id"]),
+            ],
+        )
+
+    def _refs(self, uow: UnitOfWork, snapshot_id: str) -> list[ObjectRef]:
+        row = uow.query(
+            "SELECT declaration_file_id FROM import_snapshots WHERE import_snapshot_id=?",
+            (snapshot_id,),
+        )
+        refs = [ObjectRef(entity_type="ImportSnapshot", entity_id=snapshot_id)]
+        if row:
+            refs.append(ObjectRef(
+                entity_type="ManagedFile", entity_id=row[0]["declaration_file_id"]
+            ))
+        return refs
+
+    def _find_by_triple(
+        self, fingerprint: str, mapping_version: str, context_hash: str
+    ) -> Any | None:
+        with self.repository.unit_of_work() as uow:
+            rows = uow.query(
+                "SELECT * FROM import_snapshots WHERE import_fingerprint=?"
+                " AND mapping_version=? AND mapping_context_hash=?",
+                (fingerprint, mapping_version, context_hash),
+            )
+        return rows[0] if rows else None
+
+    def _identity_mapping(self, mapping_id: str) -> IdentityMapping:
+        stored = self.repository.find_object("IdentityMapping", mapping_id)
+        if stored is None:
+            raise ContractError(
+                ErrorCode.REFERENCE_INVALID,
+                "the referenced identity mapping does not exist",
+                field_errors=[FieldError(
+                    path="identity_mapping_ids", code="reference", message="unknown mapping",
+                )],
+            )
+        return IdentityMapping.model_validate_json(stored.payload_bytes)
+
+    def _require_game_context(self, game_context_id: str) -> None:
+        stored = self.repository.find_object("GameContext", game_context_id)
+        if stored is None:
+            raise ContractError(
+                ErrorCode.REFERENCE_INVALID,
+                "the referenced game context does not exist",
+                field_errors=[FieldError(
+                    path="game_context_id", code="reference", message="unknown context",
+                )],
+            )
+
+    def _legacy_run_id(self, frozen: FrozenGroup) -> str | None:
+        try:
+            data = read_frozen_bytes(frozen, self.files).get("run.json")
+            run = json.loads(data.decode("utf-8")) if data is not None else None
+        except (ContractError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        return run.get("id") if isinstance(run, dict) else None
+
+
+class ImportService:
+    """Task handler for ``knowledge_import``: frozen ids in, result out."""
+
+    def __init__(
+        self,
+        repository: ProductRepository,
+        files: FileService,
+        *,
+        publisher: ImportPublisher | None = None,
+        registry: FormatRegistry | None = None,
+    ) -> None:
+        self.repository = repository
+        self.files = files
+        self.registry = registry or default_format_registry()
+        self.publisher = publisher or ImportPublisher(
+            repository, files, registry=self.registry
+        )
+
+    def handle(self, context: Any) -> Any:
+        from game_app.contracts.tasks import DomainResult, KnowledgeImportInput
+        from game_app.tasks import HandlerOutcome
+
+        task_input = context.task_input
+        if not isinstance(task_input, KnowledgeImportInput):
+            raise ContractError(
+                ErrorCode.INPUT_VALIDATION_FAILED,
+                "the knowledge import handler received another task type",
+            )
+        frozen = frozen_group_from_file_ids(
+            self.files, task_input.file_ids, self.registry
+        )
+        result = self.publisher.publish(
+            frozen=frozen,
+            game_context_id=task_input.game_context_id,
+            mapping_version=task_input.mapping_version,
+            identity_mapping_ids=task_input.identity_mapping_ids,
+            user_scope_id=context.user_scope_id,
+            created_by_task_id=context.task_id,
+        )
+        checks = [CheckResult(
+            check_id="import.publish",
+            definition_version=IMPORT_RULE_VERSION,
+            status=(
+                CheckStatus.fail if result.status is PublicationStatus.rejected
+                else CheckStatus.pass_
+            ),
+            input_refs=[],
+            evidence_refs=[],
+            checked_at=self.publisher.clock(),
+            method="deterministic import rule",
+            note=f"import status {result.status.value}; result code {result.code}",
+        )]
+        published = result.code == "published"
+        return HandlerOutcome(
+            state=TaskState.completed if published else TaskState.partial,
+            domain_result=DomainResult(
+                domain=TaskType.knowledge_import,
+                code=result.code,
+                input_revision=context.task_input_revision,
+                checks=checks,
+            ),
+            result_refs=list(result.refs),
+        )
+
+
 __all__ = [
     "COLLECTOR_DERIVED_FILES",
     "COLLECTOR_DIAGNOSTIC_FILES",
@@ -1305,14 +1827,22 @@ __all__ = [
     "FreezeHooks",
     "FrozenGroup",
     "FrozenInputReader",
+    "IMPORT_PUBLISH_ROUTE",
     "IMPORT_RULE_VERSION",
+    "ImportPublishResult",
+    "ImportPublisher",
+    "ImportService",
     "ImportValidator",
     "ProbeResult",
     "ScopedImport",
     "ScopedReferenceMapper",
     "canonical_source_url",
     "default_format_registry",
+    "frozen_group_from_file_ids",
+    "import_fingerprint",
+    "mapping_context_hash",
     "read_frozen_bytes",
     "read_group",
+    "snapshot_manifest",
     "verify_group_unchanged",
 ]

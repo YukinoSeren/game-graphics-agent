@@ -153,6 +153,11 @@ class TaskContext:
     def budget(self) -> Budget:
         return self.service._load_budget(self.task_id)
 
+    @property
+    def user_scope_id(self) -> str:
+        """The persisted owner of this task; a handler never trusts an argument."""
+        return self.service._load_user_scope(self.task_id)
+
     def suspend(
         self,
         *,
@@ -971,6 +976,10 @@ class TaskService:
     def _load_budget(self, task_id: str) -> Budget:
         with self.repository.unit_of_work() as uow:
             return Budget.model_validate_json(self._task_row(uow, task_id)["budget"])
+
+    def _load_user_scope(self, task_id: str) -> str:
+        with self.repository.unit_of_work() as uow:
+            return str(self._task_row(uow, task_id)["user_scope_id"])
 
     def _next_sequence(self, uow: UnitOfWork, task_id: str) -> int:
         row = uow.query(

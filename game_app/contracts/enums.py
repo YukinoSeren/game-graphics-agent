@@ -342,6 +342,7 @@ ENTITY_TYPES = frozenset({
     "SourceRelation",
     "ImportSnapshot",
     "ImportedRecord",
+    "ImportedExtraction",
     "KnowledgePackage",
     "MetricDefinition",
     "RecommendationVersion",

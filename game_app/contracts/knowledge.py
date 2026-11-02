@@ -245,6 +245,59 @@ class ImportValidation(StrictModel):
     checks: list[CheckResult]
 
 
+class SnapshotFileEntry(StrictModel):
+    """Mirror of the shared ``FileEntry`` shape, so contracts stay independent."""
+
+    relative_name: str
+    byte_length: NonNegativeInt
+    sha256: Hash
+    media_type: str
+
+
+class SnapshotManifest(StrictModel):
+    entries: list[SnapshotFileEntry]
+
+    @field_validator("entries")
+    @classmethod
+    def non_empty(cls, value: list[SnapshotFileEntry]) -> list[SnapshotFileEntry]:
+        if not value:
+            raise ValueError("a published import manifest is non-empty")
+        return value
+
+
+class ImportSnapshot(StrictModel):
+    """One published import of one frozen byte group (02a §4/§6)."""
+
+    id: ID
+    schema_version: str
+    created_at: Timestamp
+    created_by_task_id: ID | None
+    origin: Literal["collector_run", "research_json"]
+    legacy_run_id: LegacyID | None
+    manifest: SnapshotManifest
+    import_fingerprint: Hash
+    import_status: PublicationStatus
+    mapping_version: str
+    mapping_context_hash: Hash
+    parent_import_snapshot_id: ID | None
+    identity_mapping_ids: list[ID]
+    limitations: list[str]
+
+    @field_validator("identity_mapping_ids")
+    @classmethod
+    def mapping_ids_are_unique(cls, value: list[ID]) -> list[ID]:
+        if len(set(value)) != len(value):
+            raise ValueError("an import names each identity mapping once")
+        return value
+
+    @field_validator("mapping_version")
+    @classmethod
+    def mapping_version_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("mapping_version must not be blank")
+        return value
+
+
 class CoverageCell(StrictModel):
     key: str
     dimensions: dict[str, Scalar]
@@ -434,6 +487,9 @@ __all__ = [
     "ImportedRecord",
     "ImportedExtraction",
     "ImportValidation",
+    "ImportSnapshot",
+    "SnapshotFileEntry",
+    "SnapshotManifest",
     "CoverageCell",
     "KnowledgeGap",
     "KnowledgePackage",

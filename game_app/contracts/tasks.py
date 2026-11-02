@@ -1,8 +1,8 @@
 """Task input union and TaskRun projection shared by the executor.
 
 The union mirrors ``shared/data-contracts.md`` §8.1/§9: each kind is a concrete
-model, never arbitrary JSON.  Only the two kinds needed by the first slice are
-implemented; later modules add their own members to the union.
+model, never arbitrary JSON.  Only implemented kinds appear; later modules add
+their own members to the union.
 """
 
 from __future__ import annotations
@@ -31,6 +31,20 @@ class KnowledgeInput(StrictModel):
     budget: Budget
 
 
+class KnowledgeImportInput(StrictModel):
+    """A collector file group already stored as managed files (02a §5).
+
+    The client names frozen file ids; it never supplies a local directory, and
+    an empty group is rejected rather than interpreted as "import nothing".
+    """
+
+    kind: Literal["knowledge_import"]
+    file_ids: list[ID] = Field(min_length=1)
+    game_context_id: ID
+    mapping_version: str
+    identity_mapping_ids: list[ID]
+
+
 class AnalysisInput(StrictModel):
     kind: Literal["analysis"]
     artifact_id: ID
@@ -46,7 +60,8 @@ class DeviceScanInput(StrictModel):
 
 
 TaskInputPayload = Annotated[
-    Union[KnowledgeInput, AnalysisInput, DeviceScanInput], Field(discriminator="kind")
+    Union[KnowledgeInput, KnowledgeImportInput, AnalysisInput, DeviceScanInput],
+    Field(discriminator="kind"),
 ]
 TaskInputAdapter = TypeAdapter(TaskInputPayload)
 
@@ -109,6 +124,7 @@ class ResumeTaskInput(StrictModel):
 
 __all__ = [
     "KnowledgeInput",
+    "KnowledgeImportInput",
     "AnalysisInput",
     "DeviceScanInput",
     "TaskInputPayload",

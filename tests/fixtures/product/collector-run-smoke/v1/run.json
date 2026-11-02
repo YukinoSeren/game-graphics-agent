@@ -1,0 +1,16 @@
+{
+  "id": "smoke-run-0001",
+  "contract_version": "0.1",
+  "started_at": "2026-11-01T00:00:00+00:00",
+  "finished_at": "2026-11-01T00:05:00+00:00",
+  "input": {
+    "game_name": "Synthetic Game",
+    "mode": "discover",
+    "platform_scope": "Windows PC",
+    "seed_urls": []
+  },
+  "game_id": "0123456789abcdef",
+  "status": "completed_scope",
+  "stop_reason": "coverage_reached",
+  "interrupted": false
+}

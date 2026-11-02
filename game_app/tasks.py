@@ -43,6 +43,7 @@ from game_app.repository import ProductRepository, UnitOfWork, canonical_json
 PRODUCT_CONTRACT_VERSION = "product-contract/0.4"
 DEFAULT_ROUTES = {
     "knowledge": "/api/knowledge-tasks",
+    "knowledge_import": "/api/knowledge-imports",
     "analysis": "/api/analyses",
     "device_scan": "/api/device-scans",
 }

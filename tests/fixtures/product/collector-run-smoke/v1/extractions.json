@@ -1,0 +1,10 @@
+[
+  {
+    "source_id": "src-0001",
+    "status": "ok",
+    "model": "synthetic-model",
+    "started_at": "2026-11-01T00:02:00+00:00",
+    "raw": "{}",
+    "parsed": {}
+  }
+]

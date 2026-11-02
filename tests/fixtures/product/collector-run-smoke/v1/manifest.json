@@ -1,0 +1,39 @@
+{
+  "fixture_id": "collector-run-smoke",
+  "version": 1,
+  "schema_version": "product-contract/0.4",
+  "files": [
+    {
+      "relative_name": "run.json",
+      "byte_length": 407,
+      "sha256": "094d93386a8da60f887c79d8cbc802cdb15da58dde48ab97484a8003225eb1d9",
+      "media_type": "application/json"
+    },
+    {
+      "relative_name": "sources.json",
+      "byte_length": 273,
+      "sha256": "489c21e34a8110714c50baa53a61f74a4c1b64900b6d1676c47062eb00f6e9b4",
+      "media_type": "application/json"
+    },
+    {
+      "relative_name": "records.json",
+      "byte_length": 857,
+      "sha256": "5cd24086926b6bc3f2a264346eb77a7bb0e4c3862df9aeff278bfb4fdd85a9d7",
+      "media_type": "application/json"
+    },
+    {
+      "relative_name": "gaps.json",
+      "byte_length": 3,
+      "sha256": "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570",
+      "media_type": "application/json"
+    },
+    {
+      "relative_name": "extractions.json",
+      "byte_length": 174,
+      "sha256": "0c06afd156870266a252a9a9d6b116b98515f81468f945bb664fa9d7a11242a8",
+      "media_type": "application/json"
+    }
+  ],
+  "annotation_method": "hand-authored synthetic values; not a real collector run",
+  "known_limitations": ["synthetic run; no provider, game or hardware involved"]
+}

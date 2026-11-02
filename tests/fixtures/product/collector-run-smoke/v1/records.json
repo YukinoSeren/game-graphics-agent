@@ -1,0 +1,34 @@
+[
+  {
+    "id": "src-0001:cfg-0001",
+    "local_id": "cfg-0001",
+    "record_type": "configurations",
+    "record_status": "accepted",
+    "recommendation_status": "candidate",
+    "applicability": "unknown",
+    "reference_scope": "src-0001",
+    "source_id": "src-0001",
+    "revision_id": "rev-0001",
+    "game_id": "0123456789abcdef",
+    "payload": {
+      "name": "Synthetic preset",
+      "settings": []
+    }
+  },
+  {
+    "id": "src-0001:evi-0001",
+    "local_id": "evi-0001",
+    "record_type": "evidence",
+    "record_status": "accepted",
+    "recommendation_status": null,
+    "applicability": "unknown",
+    "reference_scope": "src-0001",
+    "source_id": "src-0001",
+    "revision_id": "rev-0001",
+    "game_id": "0123456789abcdef",
+    "payload": {
+      "quote": "synthetic statement",
+      "evidence_origin": "source_statement"
+    }
+  }
+]

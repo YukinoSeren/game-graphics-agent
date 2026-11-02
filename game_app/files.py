@@ -689,6 +689,7 @@ def _media_type(name: str) -> str:
     return {
         ".json": "application/json",
         ".csv": "text/csv",
+        ".md": "text/markdown",
         ".txt": "text/plain",
         ".sqlite3": "application/vnd.sqlite3",
     }.get(suffix, "application/octet-stream")

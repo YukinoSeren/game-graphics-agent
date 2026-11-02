@@ -819,3 +819,24 @@ def test_a_historical_configuration_reads_the_real_segment_projection(tmp_path):
     assert caught.value.field_errors[0].path == "segment_ref.segment_revision"
 
 
+def test_the_application_layer_exposes_the_performance_entries(tmp_path):
+    from game_app.application import Application
+    from game_app.contracts.performance import MetricCatalogQuery
+
+    repository, files, installation_id, context_id, device_id = setup(tmp_path)
+    app = Application(repository, file_root=str(tmp_path / "app-managed"))
+
+    created = app.create_session(
+        _request(installation_id, context_id, device_id), context_key("app-session")
+    )
+
+    assert [ref.entity_type for ref in created.refs] == [
+        "PlayerDeclaration", "PlaySession", "SessionSegment", "ConfigurationBinding", "ManagedFile",
+    ]
+    assert app.get_session(created.refs[1].entity_id).id == created.refs[1].entity_id
+    assert app.get_segment(created.refs[2].entity_id).id == created.refs[2].entity_id
+    page = app.list_metric_definitions(MetricCatalogQuery(frame_stream_kind=None))
+    assert len(page.choices) == 4
+
+
+

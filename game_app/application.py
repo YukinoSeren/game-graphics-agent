@@ -19,6 +19,7 @@ from game_app.errors import ContractError, ErrorCode, FieldError
 from game_app.files import FileService
 from game_app.importer import ImportService
 from game_app.knowledge import IdentityService
+from game_app.performance import PerformanceService
 from game_app.repository import ProductRepository
 from game_app.tasks import TaskService
 
@@ -54,6 +55,7 @@ class Application:
         )
         self.amendments = AmendmentService(repository, self.files, clock=clock)
         self.identity = IdentityService(repository, self.files)
+        self.performance = PerformanceService(repository, self.files, clock=clock)
 
     # -- task control -------------------------------------------------------
     def register_task(
@@ -120,6 +122,40 @@ class Application:
 
     def declare_import_identity(self, request: Any, context: MutationContext, **kwargs: Any):
         return self.identity.declare_import_identity(request, context, **kwargs)
+
+    # -- 04 performance entries (synchronous, thin wrappers) ----------------
+    def create_session(self, request: Any, context: MutationContext, **kwargs: Any):
+        return self.performance.create_session(request, context, **kwargs)
+
+    def end_segment(self, request: Any, context: MutationContext, **kwargs: Any):
+        return self.performance.end_segment(request, context, **kwargs)
+
+    def split_segment(self, request: Any, context: MutationContext, **kwargs: Any):
+        return self.performance.split_segment(request, context, **kwargs)
+
+    def end_session(self, request: Any, context: MutationContext, **kwargs: Any):
+        return self.performance.end_session(request, context, **kwargs)
+
+    def bind_configuration(self, request: Any, context: MutationContext, **kwargs: Any):
+        return self.performance.bind_configuration(request, context, **kwargs)
+
+    def list_metric_definitions(self, query: Any):
+        return self.performance.list_metric_definitions(query)
+
+    def create_test_protocol(self, request: Any, context: MutationContext, **kwargs: Any):
+        return self.performance.create_test_protocol(request, context, **kwargs)
+
+    def inspect_log(self, file_id: str, source_schema: str):
+        return self.performance.inspect_log(file_id, source_schema)
+
+    def associate_log(self, request: Any, context: MutationContext, **kwargs: Any):
+        return self.performance.associate_log(request, context, **kwargs)
+
+    def get_session(self, session_id: str):
+        return self.performance.get_session(session_id)
+
+    def get_segment(self, segment_id: str):
+        return self.performance.get_segment(segment_id)
 
 
 __all__ = ["Application"]

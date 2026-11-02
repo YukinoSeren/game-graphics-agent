@@ -142,20 +142,17 @@ Blocked：<Q1/Q2/G-* 相关跳过项>
 ### 批次 A — 性能
 
 ```text
-按此顺序执行，每个任务各自提交、各自评审：
+按此顺序执行，每个切片各自提交、各自评审。
+执行指令：docs/technical-design/batch-3-handoff.md（先读它，按其中的切片顺序与规则做）。
 
-1. PERF-T02 会话/闭合绑定/声明与测试协议（04 §10）
-   - 同时把 LogImportInput 加入 contracts/tasks.py 的 task union（批次 2D 唯一遗留缺口）
-   - 产物：tests/product/test_sessions.py
-2. PERF-T03 分析/比较/比较协议/日志关联（04 §10）
-   - 产物：tests/product/test_metrics.py
-3. PERF-T04 自有采集租约/收尾/恢复（04 §10）
-   - 产物：tests/product/test_capture_lifecycle.py
-4. VAL-T02 框架搭建（08 §10）
-   - 本批次只建确定性/故障串联框架，不宣称全量结案
-   - 产物：tests/product/test_contracts.py、test_faults.py
+1. A-1 LogImportInput 进入 task union（补批次 2D 的唯一遗留缺口）
+2. A-2 会话与不可变绑定：create_session / end_segment / split_segment /
+   end_session / bind_configuration
+3. A-3 测试协议与指标目录：list_metric_definitions / create_test_protocol
+4. A-4 历史日志关联：inspect_log / associate_log
 
-禁用：任何真实采集适配器、真实游戏进程、真实 GPU 查询。
+本批只覆盖 PERF-T02。PERF-T03/T04 与 VAL-T02 框架在下一批另写交接。
+禁用：任何真实采集适配器、真实游戏进程、真实 GPU 查询、PresentMon。
 ```
 
 <!-- BATCH-A-END -->

@@ -402,6 +402,77 @@ class UnitOfWork:
             ) from error
         return ObjectRef(entity_type=entity_type, entity_id=object_id)
 
+    def insert_object(self, entity_type: str, entity: BaseModel) -> ObjectRef:
+        """Insert a non-versioned record (local registration, mapping, selection)."""
+        _require_type(entity_type)
+        if not isinstance(entity, BaseModel):
+            raise ContractError(ErrorCode.INPUT_VALIDATION_FAILED, "entity must be a contract model")
+        payload = entity.model_dump(mode="json")
+        object_id = _require_id(payload.get("id", ""), "id")
+        series_id = payload.get("series_id")
+        version = payload.get("version")
+        if series_id is not None:
+            _require_id(series_id, "series_id")
+        try:
+            self.connection.execute(
+                "INSERT INTO objects(id, entity_type, schema_version, payload, series_id, version, created_at)"
+                " VALUES(?, ?, ?, ?, ?, ?, ?)",
+                (
+                    object_id,
+                    entity_type,
+                    payload.get("schema_version", "product-contract/0.4"),
+                    canonical_json(payload),
+                    series_id,
+                    version,
+                    payload.get("created_at") or utc_now(),
+                ),
+            )
+        except sqlite3.IntegrityError as error:
+            raise ContractError(
+                ErrorCode.INPUT_VALIDATION_FAILED,
+                "the object already exists",
+                field_errors=[FieldError(path="id", code="conflict", message="duplicate identity")],
+            ) from error
+        return ObjectRef(entity_type=entity_type, entity_id=object_id)
+
+    def iter_objects(self, entity_type: str) -> list[StoredObject]:
+        rows = self.connection.execute(
+            "SELECT * FROM objects WHERE entity_type=? ORDER BY created_at, id", (entity_type,)
+        ).fetchall()
+        return [self._stored_from_row(row) for row in rows]
+
+    def latest_objects(self, entity_type: str) -> list[StoredObject]:
+        """One row per series: the highest version at this read point."""
+        rows = self.connection.execute(
+            "SELECT o.* FROM objects o JOIN ("
+            " SELECT series_id, MAX(version) AS max_version FROM objects"
+            " WHERE entity_type=? AND series_id IS NOT NULL GROUP BY series_id"
+            ") latest ON o.series_id=latest.series_id AND o.version=latest.max_version"
+            " WHERE o.entity_type=? ORDER BY o.created_at, o.id",
+            (entity_type, entity_type),
+        ).fetchall()
+        return [self._stored_from_row(row) for row in rows]
+
+    def latest_for_series(self, entity_type: str, series_id: str) -> StoredObject | None:
+        row = self.connection.execute(
+            "SELECT * FROM objects WHERE entity_type=? AND series_id=?"
+            " ORDER BY version DESC LIMIT 1",
+            (entity_type, series_id),
+        ).fetchone()
+        return None if row is None else self._stored_from_row(row)
+
+    def _stored_from_row(self, row: Any) -> StoredObject:
+        return StoredObject(
+            entity_type=row["entity_type"],
+            object_id=row["id"],
+            schema_version=row["schema_version"],
+            payload_bytes=bytes(row["payload"]),
+            payload=json.loads(bytes(row["payload"])),
+            series_id=row["series_id"],
+            version=row["version"],
+            created_at=row["created_at"],
+        )
+
     def find_object(self, entity_type: str, object_id: str) -> StoredObject | None:
         row = self.connection.execute(
             "SELECT * FROM objects WHERE id = ?", (object_id,)
@@ -964,6 +1035,32 @@ class UnitOfWork:
         if not platform.strip():
             raise ContractError(ErrorCode.INPUT_VALIDATION_FAILED, "declared platform must not be blank")
         return "platform:" + platform.strip().casefold()
+
+    def get_or_create_game_declaration_slot(
+        self, user_scope_id: str, raw_name: str, platform: str | None, new_series_id: str
+    ) -> str:
+        """Return the series owning this declaration slot, creating it if free.
+
+        Writers are serialised by ``BEGIN IMMEDIATE``, so the read-then-insert is
+        atomic: concurrent different-key selections share one provisional series.
+        """
+        _require_id(user_scope_id, "user_scope_id")
+        _require_id(new_series_id, "new_series_id")
+        normalized = self._normalise_game_name(raw_name)
+        platform_key = self._platform_key(platform)
+        row = self.connection.execute(
+            "SELECT series_id FROM game_declaration_slots"
+            " WHERE user_scope_id=? AND normalized_raw_name=? AND platform_key=?",
+            (user_scope_id, normalized, platform_key),
+        ).fetchone()
+        if row is not None:
+            return row["series_id"]
+        self.connection.execute(
+            "INSERT INTO game_declaration_slots(user_scope_id, normalized_raw_name, platform_key,"
+            " series_id, created_at) VALUES(?, ?, ?, ?, ?)",
+            (user_scope_id, normalized, platform_key, new_series_id, utc_now()),
+        )
+        return new_series_id
 
     def claim_game_declaration_slot(
         self, user_scope_id: str, raw_name: str, platform: str | None, series_id: str

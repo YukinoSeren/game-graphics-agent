@@ -2,9 +2,14 @@
 # Run the remaining implementation batches back to back, one fresh session each.
 #
 #   bash scripts/run_batches.sh                 # all batches A-F, guarded permissions
-#   UNATTENDED=1 bash scripts/run_batches.sh    # no permission prompts (see the warning)
 #   BATCHES="A" bash scripts/run_batches.sh     # just one batch
 #   DRY_RUN=1 bash scripts/run_batches.sh       # assemble prompts, run nothing
+#
+# Unattended mode disables every permission check for the child sessions, which
+# means they may run any command and push.  It must be requested twice, and it
+# is meant for one developer's own machine on a scratch branch:
+#
+#   UNATTENDED=1 I_ACCEPT_UNATTENDED=1 bash scripts/run_batches.sh
 #
 # Each batch is a separate `claude -p` process, so each gets a fresh context.
 # A batch must leave `.superpowers/batch-runs/report-<letter>.md`; its text is
@@ -24,9 +29,27 @@ MAX_ATTEMPTS="${MAX_ATTEMPTS:-2}"
 RETRY_SLEEP="${RETRY_SLEEP:-60}"
 DRY_RUN="${DRY_RUN:-0}"
 UNATTENDED="${UNATTENDED:-0}"
+ACCEPT_UNATTENDED="${I_ACCEPT_UNATTENDED:-0}"
 
 if [[ ! -f "$DOC" ]]; then
   echo "missing $DOC" >&2
+  exit 2
+fi
+
+# These values reach the shell as loop words, an arithmetic bound and a sleep
+# argument; keep each one to a plain token so nothing else can be interpreted.
+if [[ ! "$BATCHES" =~ ^[A-F[:space:]]+$ ]]; then
+  echo "BATCHES must list batch letters A-F separated by spaces" >&2
+  exit 2
+fi
+for value in "$MAX_ATTEMPTS" "$RETRY_SLEEP"; do
+  if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+    echo "MAX_ATTEMPTS and RETRY_SLEEP must be plain non-negative integers" >&2
+    exit 2
+  fi
+done
+if ! (( MAX_ATTEMPTS >= 1 )); then
+  echo "MAX_ATTEMPTS must be at least 1" >&2
   exit 2
 fi
 
@@ -48,13 +71,31 @@ if [[ -z "$MASTER_TEXT" ]]; then
   exit 2
 fi
 
-PERM_ARGS=(--permission-mode acceptEdits
-  --allowedTools "Read Edit Write Glob Grep Agent Skill TodoWrite"
-  --allowedTools "Bash(git *) Bash(py *) Bash(ls *) Bash(mkdir *)")
+# One argument per array element, each quoted, so no word is re-split or
+# expanded as a glob when the array is passed to the child process.
+PERM_ARGS=(
+  "--permission-mode" "acceptEdits"
+  "--allowedTools" "Read Edit Write Glob Grep Agent Skill TodoWrite"
+  "--allowedTools" "Bash(git *) Bash(py *) Bash(ls *) Bash(mkdir *)"
+)
 if [[ "$UNATTENDED" == "1" ]]; then
-  # Disables every permission check.  Only use where you accept that the
-  # sessions may run any command and push to the configured remote.
-  PERM_ARGS=(--dangerously-skip-permissions)
+  if [[ "$ACCEPT_UNATTENDED" != "1" ]]; then
+    cat >&2 <<'MSG'
+UNATTENDED=1 disables every permission check for the child sessions: they may
+run any command and push to the configured remote.  Refusing until that is
+acknowledged explicitly.
+
+Use a scratch branch, then repeat the request:
+
+  git switch -c auto/remaining
+  UNATTENDED=1 I_ACCEPT_UNATTENDED=1 bash scripts/run_batches.sh
+
+Omit UNATTENDED to keep the guarded permission set instead.
+MSG
+    exit 2
+  fi
+  echo "WARNING: unattended mode disables permission checks for every batch." >&2
+  PERM_ARGS=("--dangerously-skip-permissions")
 fi
 
 CARRY=""

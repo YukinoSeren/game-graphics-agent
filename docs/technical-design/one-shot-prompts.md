@@ -268,6 +268,27 @@ R03 仍是建议而非已确认规则：不得据其宣布 readiness 或 actiona
 5. 每批次结束后核对 `docs/technical-design/implementation-plan.md` 的复选框，
    当前该文档与真实进度已脱节（VAL-T01 已完成但未勾选）。
 
+### 3.1 一条命令跑完 A—F
+
+`scripts/run_batches.sh` 把 §1 与 §2 拼成每批提示词，用独立的 `claude -p` 进程
+逐批执行，上下文天然隔离；上一批的报告原文注入下一批。
+
+```bash
+DRY_RUN=1 bash scripts/run_batches.sh            # 只拼提示词，不调用模型
+git switch -c auto/remaining                     # 建议：在分支上跑
+UNATTENDED=1 I_ACCEPT_UNATTENDED=1 \
+  bash scripts/run_batches.sh > .superpowers/batch-runs/driver.log 2>&1 &
+BATCHES="C D E F" bash scripts/run_batches.sh     # 失败后续跑
+```
+
+- 不加 `UNATTENDED` 时使用受限权限集（`acceptEdits` + 明确的工具白名单），
+  子会话可能因权限提示而停下。
+- `UNATTENDED=1` 会关闭**全部**权限检查，子会话可执行任意命令并向远端推送，
+  因此必须同时给出 `I_ACCEPT_UNATTENDED=1`；否则脚本拒绝运行并打印提示。
+  只在本人机器、隔离的分支上使用。
+- 任一批次失败或没有写出 `report-<字母>.md`，脚本立即停止，不会继续下一批，
+  也不会替你推送后续批次。
+
 ## 4. 当前剩余工作量速查
 
 | 类别 | 内容 |

@@ -170,8 +170,22 @@ class HistoricalConfigurationInput(StrictModel):
         return self
 
 
+class ContextDeclarationInput(StrictModel):
+    """A player's own statement about a run, saved before it is interpreted.
+
+    It records declared fields only; it never claims a probe, an activation or
+    provenance.  01 owns the declaration path, 04 builds RunConditions from the
+    stored values afterwards.
+    """
+
+    kind: Literal["context_declaration"]
+    installation_id: ID | None
+    game_id: ID
+    fields: dict[str, Scalar]
+
+
 DeclarationInput = Annotated[
-    Union[AdoptConfigurationInput, HistoricalConfigurationInput],
+    Union[AdoptConfigurationInput, HistoricalConfigurationInput, ContextDeclarationInput],
     Field(discriminator="kind"),
 ]
 
@@ -274,6 +288,7 @@ __all__ = [
     "SettingRefReplacement",
     "AdoptConfigurationInput",
     "HistoricalConfigurationInput",
+    "ContextDeclarationInput",
     "DeclarationInput",
     "PlayerDeclaration",
     "AppliedConfiguration",

@@ -1104,6 +1104,42 @@ class AdoptionService:
     def _segment_check(
         self, uow: UnitOfWork, request: HistoricalConfigurationInput
     ) -> CheckResult:
+        # PERF-T02 owns the segment projection; a real ended segment is read
+        # from it (objects only carry the creation snapshot).
+        row = uow.query(
+            "SELECT revision, lifecycle, binding_revision FROM session_segments"
+            " WHERE segment_id=?",
+            (request.segment_ref.segment_id,),
+        )
+        if row:
+            current = row[0]
+            if current["lifecycle"] != "ended":
+                raise ContractError(
+                    ErrorCode.PRECONDITION_UNVERIFIED,
+                    "a historical configuration needs an ended segment",
+                )
+            errors = []
+            if current["revision"] != request.segment_ref.segment_revision:
+                errors.append(FieldError(
+                    path="segment_ref.segment_revision", code="conflict",
+                    message=f"current revision is {current['revision']}",
+                ))
+            if current["binding_revision"] != request.segment_ref.binding_revision:
+                errors.append(FieldError(
+                    path="segment_ref.binding_revision", code="conflict",
+                    message=f"current binding revision is {current['binding_revision']}",
+                ))
+            if errors:
+                raise ContractError(
+                    ErrorCode.BINDING_REVISION_CONFLICT,
+                    "the segment changed; re-read it before registering a historical configuration",
+                    field_errors=errors,
+                )
+            return _check(
+                "applied.segment",
+                CheckStatus.pass_,
+                "the segment revision and binding revision match and the segment is ended",
+            )
         stored = uow.find_object("SessionSegment", request.segment_ref.segment_id)
         if stored is None:
             # PERF-T02 owns session storage; until it lands the segment cannot be

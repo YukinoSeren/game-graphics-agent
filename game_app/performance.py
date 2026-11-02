@@ -11,9 +11,12 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any, Callable, Mapping, Sequence
 from uuid import UUID, uuid5
+
+from game_app.adapters.presentmon import LogParseResult, default_registry, parse_log
 
 from game_app.contracts.common import (
     CheckResult,
@@ -36,11 +39,17 @@ from game_app.contracts.enums import (
 )
 from game_app.contracts.performance import (
     BindConfigurationRequest,
+    CaptureArtifact,
     ConfigurationBinding,
     CreateSessionRequest,
     CreateTestProtocolRequest,
     EndSessionRequest,
     EndSegmentRequest,
+    ExistingLogTarget,
+    HistoricalLogTarget,
+    LogAssociationRequest,
+    LogInspection,
+    LogStreamCandidate,
     MetricCatalogQuery,
     MetricChoicePage,
     MetricDefinition,
@@ -51,6 +60,7 @@ from game_app.contracts.performance import (
     SplitSegmentRequest,
     StreamSelection,
     TestProtocol,
+    TimeMapping,
 )
 from game_app.contracts.primitives import (
     BindingRange,
@@ -73,6 +83,9 @@ SEGMENT_SPLIT_ROUTE = "/api/session-segments/{segment_id}/split"
 SEGMENT_BIND_ROUTE = "/api/session-segments/{segment_id}/bindings"
 TEST_PROTOCOL_ROUTE = "/api/test-protocols"
 TEST_PROTOCOL_RULE_VERSION = "test-protocol/0.4"
+LOG_ASSOCIATION_ROUTE = "/api/log-associations"
+LOG_ASSOCIATION_RULE_VERSION = "log-association/0.4"
+LOG_TARGET_TIME_BASIS = "session"
 SESSION_TIME_BASIS = "session"
 
 _ID_NAMESPACE = UUID("9c3d7b0e-6a24-4f18-9e53-1b7c2d5a4e60")
@@ -166,10 +179,14 @@ class PerformanceService:
         files: FileService,
         *,
         clock: Callable[[], str] = utc_now,
+        log_registry: Any = None,
     ) -> None:
         self.repository = repository
         self.files = files
         self.clock = clock
+        # Only formats verified against an offline sample are enabled; the
+        # default registry does not claim PresentMon support.
+        self.log_registry = log_registry or default_registry()
 
     # -- reads --------------------------------------------------------------
     def get_session(self, session_id: str) -> PlaySession:
@@ -1120,6 +1137,582 @@ class PerformanceService:
             )
         return TestProtocol.model_validate_json(stored.payload_bytes)
 
+    # -- historical log preview and association (04 §4.3) ------------------
+    def inspect_log(self, file_id: str, source_schema: str) -> LogInspection:
+        """Bounded, read-only preview: no session, artifact or model call."""
+        stored = self.repository.get_object("ManagedFile", file_id)
+        payload = stored.payload
+        if payload.get("file_status") != "published":
+            raise ContractError(
+                ErrorCode.ARTIFACT_UNAVAILABLE, "the log file is not consumable"
+            )
+        content_hash = payload["manifest"]["sha256"]
+        data = self.files.read_managed_file(file_id)
+        parsed = parse_log(
+            data,
+            registry=self.log_registry,
+            evidence=_artifact_evidence(payload),
+        )
+        if parsed.format_id != source_schema:
+            raise ContractError(
+                ErrorCode.UNSUPPORTED_ARTIFACT_FORMAT,
+                "the file does not match the named source schema; its original is retained",
+            )
+        return LogInspection(
+            file_id=file_id,
+            content_hash=content_hash,
+            source_schema=source_schema,
+            source_ranges=parsed.source_ranges,
+            streams=_stream_candidates(parsed, content_hash),
+            limitations=list(parsed.limitations),
+        )
+
+    def associate_log(
+        self,
+        request: LogAssociationRequest,
+        context: MutationContext,
+        *,
+        request_schema_version: str = PRODUCT_CONTRACT_VERSION,
+        hooks: PublishHooks | None = None,
+    ) -> ResourceResult:
+        route = LOG_ASSOCIATION_ROUTE
+        request_hash = _request_hash(route, request_schema_version, request)
+        ids = {
+            role: _deterministic_id(
+                context.user_scope_id, route, context.idempotency_key, request_hash, role,
+            )
+            for role in ("artifact", "session", "segment", "binding", "declaration")
+        }
+        if self._has_registered(context, route):
+            # A replay returns its original response; the placeholder bytes are
+            # never written because the idempotency record is found first.
+            published = self.files.publish(
+                kind="import",
+                files={f"log-associations/{ids['artifact']}/declaration.json": b"{}"},
+                user_scope_id=context.user_scope_id,
+                method="POST",
+                canonical_route=route,
+                key=context.idempotency_key,
+                request_schema_version=request_schema_version,
+                request_hash=request_hash,
+                hooks=hooks,
+            )
+            return ResourceResult(
+                refs=[ObjectRef.model_validate(ref) for ref in published.refs]
+            )
+
+        plan = self._prepare_association(request, context.user_scope_id, ids)
+        manifest = {
+            "kind": "log_association",
+            "rule_version": LOG_ASSOCIATION_RULE_VERSION,
+            "input": request.model_dump(mode="json"),
+            "artifact_id": ids["artifact"],
+            "bindings": [plan["binding_ref"]],
+            "session_revision": plan["session_revision"],
+            "time_mapping": plan["time_mapping"].model_dump(mode="json"),
+        }
+        published = self.files.publish(
+            kind="import",
+            files={
+                f"log-associations/{ids['artifact']}/declaration.json":
+                    canonical_json(manifest)
+            },
+            user_scope_id=context.user_scope_id,
+            method="POST",
+            canonical_route=route,
+            key=context.idempotency_key,
+            request_schema_version=request_schema_version,
+            request_hash=request_hash,
+            writer=lambda uow, operation, managed: self._write_association(
+                uow, request=request, user_scope_id=context.user_scope_id,
+                parsed=plan["parsed"], time_mapping=plan["time_mapping"],
+                ids=ids, managed=managed,
+            ),
+            hooks=hooks,
+        )
+        return ResourceResult(refs=[ObjectRef.model_validate(ref) for ref in published.refs])
+
+    def _prepare_association(
+        self, request: LogAssociationRequest, user_scope_id: str, ids: Mapping[str, str]
+    ) -> dict[str, Any]:
+        stored = self.repository.get_object("ManagedFile", request.file_id)
+        payload = stored.payload
+        if payload.get("file_status") != "published":
+            raise ContractError(
+                ErrorCode.ARTIFACT_UNAVAILABLE, "the log file is not consumable"
+            )
+        if payload["manifest"]["sha256"] != request.content_hash:
+            raise ContractError(
+                ErrorCode.PRECONDITION_UNVERIFIED,
+                "the submitted content hash does not match the stored log",
+                field_errors=[FieldError(
+                    path="content_hash", code="reference",
+                    message="the file changed or was named with another hash",
+                )],
+            )
+        data = self.files.read_managed_file(request.file_id)
+        parsed = parse_log(
+            data,
+            registry=self.log_registry,
+            evidence=_artifact_evidence(payload),
+        )
+        if parsed.format_id != request.source_schema:
+            raise ContractError(
+                ErrorCode.UNSUPPORTED_ARTIFACT_FORMAT,
+                "the file does not match the named source schema; its original is retained",
+            )
+        candidates = _stream_candidates(parsed, request.content_hash)
+        chosen = next(
+            (item for item in candidates if item.stream_key == request.stream_key), None
+        )
+        if chosen is None:
+            raise _invalid(
+                "stream_key", "reference",
+                "the stream key does not exist in the inspected log",
+            )
+        self._require_interpretable_range(parsed, request)
+        scale = parsed.time_mapping.scale
+        if scale is None:
+            raise ContractError(
+                ErrorCode.PRECONDITION_UNVERIFIED,
+                "the log's time unit was not verified; the clock mapping is not guessed",
+            )
+        offset = request.target_anchor_s - request.source_anchor * scale
+        time_mapping = TimeMapping(
+            source_basis=parsed.time_mapping.source_basis,
+            target_basis=LOG_TARGET_TIME_BASIS,
+            source_unit=parsed.time_mapping.source_unit,
+            target_unit="s",
+            offset=offset,
+            scale=scale,
+            checks=[
+                _check(
+                    "time.anchor", CheckStatus.pass_,
+                    "the mapping is derived from the player-supplied anchors; it is"
+                    " user_provided, not an automatic observation", self.clock(),
+                ),
+                _check(
+                    "time.observation", CheckStatus.not_run,
+                    "no automatic clock observation was made", self.clock(),
+                ),
+            ],
+        )
+        with self.repository.unit_of_work() as uow:
+            plan = self._association_plan(
+                uow, request, user_scope_id, parsed, time_mapping, ids
+            )
+        plan["parsed"] = parsed
+        plan["time_mapping"] = time_mapping
+        plan["chosen"] = chosen
+        plan["content_hash"] = request.content_hash
+        return plan
+
+    def _association_plan(
+        self,
+        uow: UnitOfWork,
+        request: LogAssociationRequest,
+        user_scope_id: str,
+        parsed: LogParseResult,
+        time_mapping: TimeMapping,
+        ids: Mapping[str, str],
+    ) -> dict[str, Any]:
+        self._evidence_problems(uow, request.evidence_refs)
+        if not request.evidence_refs:
+            raise ContractError(
+                ErrorCode.PRECONDITION_UNVERIFIED,
+                "an association needs evidence for its anchor and range",
+            )
+        target = request.target
+        scale = time_mapping.scale or 0.0
+        mapped_start = (request.source_range.start - request.source_anchor) * scale
+        mapped_start += request.target_anchor_s
+        mapped_end = (request.source_range.end - request.source_anchor) * scale
+        mapped_end += request.target_anchor_s
+
+        if isinstance(target, HistoricalLogTarget):
+            installation = self._installation(uow, target.installation_id, user_scope_id)
+            self._context(uow, target.game_context_id, installation)
+            self._device_snapshot(uow, target.device_snapshot_id, user_scope_id)
+            self._require_declaration_installation(
+                target.run_declaration, installation["series_id"]
+            )
+            self._test_protocol_ref(uow, target.test_protocol_id, installation["game_id"])
+            if (
+                request.source_anchor != request.source_range.start
+                or request.target_anchor_s != 0
+            ):
+                raise _invalid(
+                    "target", "conflict",
+                    "a historical session anchor is the range start mapped to second 0",
+                )
+            try:
+                started = datetime.fromisoformat(target.started_at)
+                now = datetime.fromisoformat(self.clock())
+            except ValueError as error:
+                raise ContractError(
+                    ErrorCode.PRECONDITION_UNVERIFIED,
+                    "the historical start is not a usable backend time",
+                ) from error
+            if started > now:
+                raise ContractError(
+                    ErrorCode.PRECONDITION_UNVERIFIED,
+                    "a historical start cannot lie in the future",
+                )
+            duration = (request.source_range.end - request.source_range.start) * scale
+            if not math.isfinite(duration) or duration <= 0:
+                raise _invalid(
+                    "source_range", "range", "the source range yields no positive duration"
+                )
+            return {
+                "historical": True,
+                "session_id": ids["session"],
+                "segment_id": ids["segment"],
+                "session_revision": 1,
+                "binding_ref": {
+                    "segment_id": ids["segment"],
+                    "segment_revision": 1,
+                    "binding_revision": 1,
+                },
+                "close_at_s": None,
+                "is_open": False,
+                "duration_s": duration,
+                "started_at": target.started_at,
+                "mapped_start": mapped_start,
+                "mapped_end": mapped_end,
+            }
+
+        session = self._load_session(uow, target.session_id)
+        self._require_session_owner(uow, session, user_scope_id)
+        if session.revision != target.expected_session_revision:
+            raise ContractError(
+                ErrorCode.BINDING_REVISION_CONFLICT,
+                "the session changed; re-read it before associating the log",
+                field_errors=[FieldError(
+                    path="session_revision", code="conflict",
+                    message=f"current revision is {session.revision}",
+                )],
+                details=empty_details(
+                    expected_revision=target.expected_session_revision,
+                    current_revision=session.revision,
+                    current_resource_ref=ObjectRef(
+                        entity_type="PlaySession", entity_id=session.id,
+                    ),
+                ),
+            )
+        segment = self._load_segment(uow, target.segment_ref.segment_id)
+        if segment.session_id != session.id:
+            raise ContractError(
+                ErrorCode.REFERENCE_INVALID,
+                "the target segment belongs to another session",
+            )
+        self._require_current_revisions(
+            segment,
+            expected_segment_revision=target.segment_ref.segment_revision,
+            expected_binding_revision=target.segment_ref.binding_revision,
+        )
+        if segment.lifecycle is SessionLifecycle.ended:
+            if target.close_at_s is not None:
+                raise _invalid(
+                    "target.close_at_s", "conflict",
+                    "an ended segment keeps its boundary; close_at_s must be null",
+                )
+            lower, upper = segment.start_s, segment.end_s
+            binding_revision = segment.binding_revision
+            segment_revision = segment.revision
+            is_open = False
+        else:
+            if session.lifecycle is not SessionLifecycle.active:
+                raise ContractError(
+                    ErrorCode.PRECONDITION_UNVERIFIED,
+                    "an open segment in an ended session cannot be associated",
+                )
+            if target.close_at_s is None:
+                raise ContractError(
+                    ErrorCode.PRECONDITION_UNVERIFIED,
+                    "an open segment needs a finite end point with its evidence",
+                )
+            if (
+                not math.isfinite(target.close_at_s)
+                or target.close_at_s <= segment.start_s
+            ):
+                raise _invalid(
+                    "target.close_at_s", "range",
+                    "the close point must be after the segment start",
+                )
+            lower, upper = segment.start_s, target.close_at_s
+            binding_revision = segment.binding_revision + 1
+            segment_revision = segment.revision + 1
+            is_open = True
+        if (
+            not math.isfinite(mapped_start)
+            or not math.isfinite(mapped_end)
+            or mapped_start < 0
+            or mapped_start < lower
+            or mapped_end > upper
+        ):
+            raise _invalid(
+                "source_range", "range",
+                "the mapped range must be non-negative and inside the target segment",
+            )
+        return {
+            "historical": False,
+            "session_id": session.id,
+            "segment_id": segment.id,
+            "session_revision": session.revision,
+            "binding_ref": {
+                "segment_id": segment.id,
+                "segment_revision": segment_revision,
+                "binding_revision": binding_revision,
+            },
+            "close_at_s": target.close_at_s,
+            "is_open": is_open,
+            "duration_s": None,
+            "started_at": None,
+            "mapped_start": mapped_start,
+            "mapped_end": mapped_end,
+        }
+
+    def _require_interpretable_range(
+        self, parsed: LogParseResult, request: LogAssociationRequest
+    ) -> None:
+        if not parsed.source_ranges:
+            raise ContractError(
+                ErrorCode.PRECONDITION_UNVERIFIED,
+                "the log states no verified source range; the original is retained",
+            )
+        wanted = request.source_range
+        inside = any(
+            candidate.time_basis == wanted.time_basis
+            and candidate.unit == wanted.unit
+            and wanted.start >= candidate.start
+            and wanted.end <= candidate.end
+            for candidate in parsed.source_ranges
+        )
+        if not inside:
+            raise _invalid(
+                "source_range", "range",
+                "the source range lies outside the log's interpretable range",
+            )
+        if not (wanted.start <= request.source_anchor <= wanted.end):
+            raise _invalid(
+                "source_anchor", "range",
+                "the source anchor must lie inside the submitted source range",
+            )
+
+    def _write_association(
+        self,
+        uow: UnitOfWork,
+        *,
+        request: LogAssociationRequest,
+        user_scope_id: str,
+        parsed: LogParseResult,
+        time_mapping: TimeMapping,
+        ids: Mapping[str, str],
+        managed: Sequence[Any],
+    ) -> list[ObjectRef]:
+        # Re-check every revision inside the write transaction: the plan was
+        # prepared outside it and a concurrent change must lose, not merge.
+        plan = self._association_plan(
+            uow, request, user_scope_id, parsed, time_mapping, ids
+        )
+        now = self.clock()
+        target = request.target
+        evidence = _declaration_evidence(managed[0])
+        stream_checks = [
+            _check(
+                "segment.stream", CheckStatus.pass_,
+                "the selected stream is the one the player named from the preview", now,
+            ),
+        ]
+        chosen = next(
+            item for item in _stream_candidates(parsed, request.content_hash)
+            if item.stream_key == request.stream_key
+        )
+        selection = StreamSelection(
+            process=chosen.process,
+            swapchain_id=chosen.swapchain_id,
+            frame_stream_kind=chosen.frame_stream_kind,
+            checks=stream_checks,
+        )
+
+        if isinstance(target, HistoricalLogTarget) and plan["historical"]:
+            conditions, scenario = _build_run_conditions(
+                target.run_declaration.fields, evidence, now
+            )
+            started = datetime.fromisoformat(plan["started_at"])
+            ended_at = (started + timedelta(seconds=plan["duration_s"])).isoformat()
+            declaration = PlayerDeclaration(
+                id=ids["declaration"],
+                schema_version=PRODUCT_CONTRACT_VERSION,
+                created_at=now,
+                created_by_task_id=None,
+                installation_id=target.installation_id,
+                input=ContextDeclarationInput(
+                    kind="context_declaration",
+                    installation_id=target.installation_id,
+                    game_id=self._context_game(uow, target.game_context_id, user_scope_id),
+                    fields=target.run_declaration.fields,
+                ),
+                raw_text=target.run_declaration.raw_text,
+                submitted_at=now,
+                declaration_file_id=managed[0].id,
+            )
+            session = PlaySession(
+                id=ids["session"],
+                schema_version=PRODUCT_CONTRACT_VERSION,
+                created_at=now,
+                created_by_task_id=None,
+                installation_id=target.installation_id,
+                game_id=declaration.input.game_id,
+                device_snapshot_id=target.device_snapshot_id,
+                game_context_id=target.game_context_id,
+                started_at=target.started_at,
+                ended_at=ended_at,
+                revision=1,
+                lifecycle=SessionLifecycle.ended,
+                initial_applied_id=None,
+                recommendation_id=None,
+                configuration_state=ConfigurationState.unverified,
+                scenario=scenario,
+                target_proposal_ref=None,
+                test_protocol_id=target.test_protocol_id,
+                run_conditions=conditions,
+            )
+            segment = SessionSegment(
+                id=ids["segment"],
+                schema_version=PRODUCT_CONTRACT_VERSION,
+                created_at=now,
+                created_by_task_id=None,
+                session_id=session.id,
+                start_s=0.0,
+                end_s=plan["duration_s"],
+                time_basis=SESSION_TIME_BASIS,
+                revision=1,
+                lifecycle=SessionLifecycle.ended,
+                applied_id=None,
+                configuration_state=ConfigurationState.unverified,
+                binding_revision=1,
+                scenario=scenario,
+                excluded_ranges=[],
+                stream_selection=selection,
+                run_conditions=conditions,
+            )
+            binding = ConfigurationBinding(
+                id=ids["binding"],
+                schema_version=PRODUCT_CONTRACT_VERSION,
+                created_at=now,
+                created_by_task_id=None,
+                segment_id=segment.id,
+                binding_revision=1,
+                applied_id=None,
+                configuration_state=ConfigurationState.unverified,
+                effective_range=BindingRange(
+                    start=0.0, end=plan["duration_s"],
+                    time_basis=SESSION_TIME_BASIS, unit="s",
+                ),
+                evidence_refs=[],
+                supersedes_revision=None,
+            )
+            uow.insert_object("PlayerDeclaration", declaration)
+            uow.insert_object("PlaySession", session)
+            uow.insert_object("SessionSegment", segment)
+            uow.insert_object("ConfigurationBinding", binding)
+            uow.append_snapshot("PlaySession", session.id, session)
+            uow.append_snapshot("SessionSegment", segment.id, segment)
+            self._insert_segment_head(uow, segment, segment.id, now)
+            self._insert_binding_row(uow, binding, now)
+            installation = self._installation(
+                uow, target.installation_id, user_scope_id
+            )
+            context = self._context(uow, target.game_context_id, installation)
+            self._write_creation_references(
+                uow, session=session, segment=segment, declaration=declaration,
+                installation=installation, context=context,
+            )
+            uow.record_domain_event(
+                target_type="PlaySession", target_id=session.id, dimension="session",
+                sequence=1, previous_state=None, next_state=SessionLifecycle.ended.value,
+                cause="historical_log_registered",
+                related_refs=[
+                    ObjectRef(entity_type="PlayerDeclaration", entity_id=declaration.id),
+                ],
+                created_at=now,
+            )
+            uow.record_domain_event(
+                target_type="SessionSegment", target_id=segment.id, dimension="session",
+                sequence=1, previous_state=None, next_state=SessionLifecycle.ended.value,
+                cause="historical_log_registered",
+                related_refs=[ObjectRef(entity_type="PlaySession", entity_id=session.id)],
+                created_at=now,
+            )
+        else:
+            session = self._load_session(uow, plan["session_id"])
+            segment = self._load_segment(uow, plan["segment_id"])
+            if plan["is_open"]:
+                closed = self._close_segment_at(
+                    uow, segment, session, plan["close_at_s"], now=now,
+                    evidence_refs=list(request.evidence_refs),
+                )
+                updated = segment.model_copy(update={
+                    "revision": segment.revision + 1,
+                    "end_s": plan["close_at_s"],
+                    "lifecycle": SessionLifecycle.ended,
+                    "binding_revision": closed.binding_revision,
+                })
+                self._write_segment_revision(
+                    uow, segment, updated, session,
+                    cause="segment_closed_for_log_association",
+                )
+            session_id = session.id
+            segment_id = segment.id
+
+        artifact = CaptureArtifact(
+            id=ids["artifact"],
+            schema_version=PRODUCT_CONTRACT_VERSION,
+            created_at=now,
+            created_by_task_id=None,
+            session_id=plan["session_id"],
+            segment_ids=[plan["segment_id"]],
+            file_id=request.file_id,
+            tool_name=parsed.tool_name,
+            tool_version=parsed.tool_version,
+            options={},
+            source_schema=parsed.source_schema,
+            source_column_map=list(parsed.column_map),
+            time_mapping=time_mapping,
+            quality=parsed.quality,
+            checks=list(parsed.checks) + [
+                _check(
+                    "log.association", CheckStatus.pass_,
+                    "the artifact maps the source clock with the player-supplied anchors;"
+                    " the correspondence is user_provided, not controlled", now,
+                ),
+                _check(
+                    "log.anchor_observation", CheckStatus.not_run,
+                    "no automatic clock observation was made", now,
+                ),
+                _check(
+                    "log.evidence", CheckStatus.pass_,
+                    f"{len(request.evidence_refs)} evidence reference(s) back the anchor"
+                    " and range", now,
+                ),
+            ],
+        )
+        uow.insert_object("CaptureArtifact", artifact)
+        uow.insert_reference(artifact.id, "session", ObjectRef(
+            entity_type="PlaySession", entity_id=artifact.session_id,
+        ))
+        uow.insert_reference(artifact.id, "segment", ObjectRef(
+            entity_type="SessionSegment", entity_id=artifact.segment_ids[0],
+        ))
+        uow.insert_reference(artifact.id, "file", ObjectRef(
+            entity_type="ManagedFile", entity_id=artifact.file_id,
+        ))
+        return [
+            ObjectRef(entity_type="CaptureArtifact", entity_id=artifact.id),
+            ObjectRef(entity_type="ManagedFile", entity_id=managed[0].id),
+        ]
+
     # -- segment internals --------------------------------------------------
     def _segment_and_session(
         self, uow: UnitOfWork, segment_id: str, user_scope_id: str
@@ -1244,7 +1837,21 @@ class PerformanceService:
         *,
         now: str,
     ) -> ConfigurationBinding:
-        if not math.isfinite(end_s) or end_s <= segment.start_s:
+        return self._close_segment_at(
+            uow, segment, session, end_s, now=now, evidence_refs=[],
+        )
+
+    def _close_segment_at(
+        self,
+        uow: UnitOfWork,
+        segment: SessionSegment,
+        session: PlaySession,
+        end_s: float | None,
+        *,
+        now: str,
+        evidence_refs: Sequence[EvidenceRef],
+    ) -> ConfigurationBinding:
+        if end_s is None or not math.isfinite(end_s) or end_s <= segment.start_s:
             raise ContractError(
                 ErrorCode.PRECONDITION_UNVERIFIED,
                 "the backend clock did not provide a reliable end point; the segment stays open",
@@ -1273,7 +1880,7 @@ class PerformanceService:
                 start=row["start_s"], end=end_s,
                 time_basis=row["time_basis"], unit=row["unit"],
             ),
-            evidence_refs=[],
+            evidence_refs=list(evidence_refs),
             supersedes_revision=segment.binding_revision,
         )
         uow.insert_object("ConfigurationBinding", binding)
@@ -1699,6 +2306,49 @@ def _unconfirmed_stream(now: str) -> StreamSelection:
             "no capture stream is selected for this segment yet", now,
         )],
     )
+
+
+def _artifact_evidence(payload: Mapping[str, Any]) -> EvidenceRef:
+    manifest = payload["manifest"]
+    return EvidenceRef(
+        kind="artifact",
+        file_id=payload["id"],
+        content_hash=manifest["sha256"],
+        locator=manifest["relative_name"],
+    )
+
+
+def _stream_candidates(
+    parsed: LogParseResult, content_hash: str
+) -> list[LogStreamCandidate]:
+    """Name each observed process/swapchain/stream from the parsed bytes.
+
+    A process that was not identified stays null; no PID is invented and two
+    processes are never merged into one candidate.
+    """
+    groups: dict[tuple[int, str | None], Any] = {}
+    for frame in parsed.frames:
+        groups.setdefault((frame.process.pid, frame.swapchain_id), frame.process)
+    if not groups:
+        return []
+    observations = list(parsed.observed_streams) or [None]
+    candidates: list[LogStreamCandidate] = []
+    for (pid, swapchain), process in sorted(
+        groups.items(), key=lambda item: (item[0][0], item[0][1] or "")
+    ):
+        for observation in observations:
+            suffix = observation.stream_key if observation is not None else "unstated"
+            kind = (
+                observation.frame_stream_kind if observation is not None
+                else parsed.frame_stream_kind
+            )
+            candidates.append(LogStreamCandidate(
+                stream_key=f"{parsed.format_id}:{content_hash[:16]}:{pid}:{swapchain or '-'}:{suffix}",
+                process=process,
+                swapchain_id=swapchain,
+                frame_stream_kind=kind,
+            ))
+    return candidates
 
 
 def _metric_definition_id(rule: metrics.MetricRule) -> str:

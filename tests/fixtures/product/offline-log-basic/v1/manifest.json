@@ -1,0 +1,66 @@
+{
+  "fixture_id": "offline-log-basic",
+  "version": 1,
+  "schema_version": "product-contract/0.4",
+  "files": [
+    {
+      "relative_name": "basic.csv",
+      "byte_length": 390,
+      "sha256": "5bbb043e9a942525f4617a359fa25d89252715f4b422cb4bc7409fa9217fece4",
+      "media_type": "text/csv"
+    },
+    {
+      "relative_name": "conflicting-streams.csv",
+      "byte_length": 266,
+      "sha256": "96f05874615c875f786a689b5f17c820f7c673f98663a0fdd5f6a95d6f73f3a6",
+      "media_type": "text/csv"
+    },
+    {
+      "relative_name": "fg-unknown.csv",
+      "byte_length": 288,
+      "sha256": "6ed6484d9e8cde7d50cbaa40b9fff10983a0e66a17887e4725943cf5b8604185",
+      "media_type": "text/csv"
+    },
+    {
+      "relative_name": "no-stream.csv",
+      "byte_length": 204,
+      "sha256": "5c844760999e838c50633e68028e64d7b4d84da10d3ec64ac5fca50855adb421",
+      "media_type": "text/csv"
+    },
+    {
+      "relative_name": "row-problems.csv",
+      "byte_length": 398,
+      "sha256": "dadb81fce85185bd6d4313b28bfaad5a651224a80ea8347caf047f4f29ab2a88",
+      "media_type": "text/csv"
+    },
+    {
+      "relative_name": "time-no-unit.csv",
+      "byte_length": 271,
+      "sha256": "c77a57630b0b135645b29501b9038ab5182d3c1827f226427b0ca3877bb3909c",
+      "media_type": "text/csv"
+    },
+    {
+      "relative_name": "unit-mismatch.csv",
+      "byte_length": 279,
+      "sha256": "8630b46362bcfce2a6c24397c4a886fa7fcc7b7b080f9f275d2ad361afc7e912",
+      "media_type": "text/csv"
+    },
+    {
+      "relative_name": "unknown-column.csv",
+      "byte_length": 307,
+      "sha256": "54c494fa2e200baef513a7a8b9e26121289bade3fea394089876767d2233fd6c",
+      "media_type": "text/csv"
+    },
+    {
+      "relative_name": "unregistered.csv",
+      "byte_length": 19,
+      "sha256": "781ac802fc2d80dea9ffbbeff8102748c7bdfed9d8ca0194df94b7998922ba4f",
+      "media_type": "text/csv"
+    }
+  ],
+  "annotation_method": "hand-authored synthetic values shaped like a frame-time export; no real tool, game or capture produced these bytes",
+  "known_limitations": [
+    "no real PresentMon or other capture tool sample; the format is an offline fixture only",
+    "no process start time, swapchain id or CPU busy column"
+  ]
+}

@@ -1,0 +1,6 @@
+EventNumber,ProcessId,Time (ms),MsBetweenPresents (ms),FrameType,MsGPUActive (ms),FrameStream,FrameGeneration
+1,4242,0.0,,Application,0.0,application_present,off
+2,4242,16.7,16.7,Application,7.5,application_present,off
+3,4242,33.4,16.7,Application,8.1,application_present,off
+4,4242,50.1,16.7,Application,7.9,application_present,off
+5,4242,66.8,16.7,Application,8.3,application_present,off

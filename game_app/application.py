@@ -151,11 +151,11 @@ class Application:
     def associate_log(self, request: Any, context: MutationContext, **kwargs: Any):
         return self.performance.associate_log(request, context, **kwargs)
 
-    def get_session(self, session_id: str):
-        return self.performance.get_session(session_id)
+    def get_session(self, session_id: str, user_scope_id: str):
+        return self.performance.get_session(session_id, user_scope_id)
 
-    def get_segment(self, segment_id: str):
-        return self.performance.get_segment(segment_id)
+    def get_segment(self, segment_id: str, user_scope_id: str):
+        return self.performance.get_segment(segment_id, user_scope_id)
 
 
 __all__ = ["Application"]

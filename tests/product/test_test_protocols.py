@@ -23,6 +23,7 @@ from game_app.contracts.primitives import utc_now
 from game_app.repository import ProductRepository, canonical_json
 from tests.product.support.configuration import (
     GAME_ID,
+    USER,
     context_key,
     setup,
     store_raw,
@@ -361,7 +362,7 @@ def test_a_child_version_keeps_the_parent_and_old_session_reference(tmp_path):
     assert child.series_id == parent.series_id
     assert child.note == "corrected plan"
     assert repository.get_object("TestProtocol", parent.id).payload_bytes == before
-    assert service.get_session(session.refs[1].entity_id).test_protocol_id == parent.id
+    assert service.get_session(session.refs[1].entity_id, USER).test_protocol_id == parent.id
 
 
 def test_a_parent_from_another_game_is_refused(tmp_path):

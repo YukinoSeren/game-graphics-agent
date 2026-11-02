@@ -186,32 +186,49 @@ class PerformanceService:
         # default registry does not claim PresentMon support.
         self.log_registry = log_registry or default_registry()
 
-    # -- reads --------------------------------------------------------------
-    def get_session(self, session_id: str) -> PlaySession:
+    # -- reads (every read resolves the caller's ownership) ------------------
+    def get_session(self, session_id: str, user_scope_id: str) -> PlaySession:
         with self.repository.unit_of_work() as uow:
-            return self._load_session(uow, session_id)
+            session = self._load_session(uow, session_id)
+            self._require_session_owner(uow, session, user_scope_id)
+            return session
 
-    def get_segment(self, segment_id: str) -> SessionSegment:
+    def get_segment(self, segment_id: str, user_scope_id: str) -> SessionSegment:
         with self.repository.unit_of_work() as uow:
-            return self._load_segment(uow, segment_id)
+            segment = self._load_segment(uow, segment_id)
+            session = self._load_session(uow, segment.session_id)
+            self._require_session_owner(uow, session, user_scope_id)
+            return segment
 
-    def get_binding(self, segment_id: str, binding_revision: int) -> ConfigurationBinding:
+    def get_binding(
+        self, segment_id: str, binding_revision: int, user_scope_id: str
+    ) -> ConfigurationBinding:
         with self.repository.unit_of_work() as uow:
-            return self._load_binding(uow, segment_id, binding_revision)
+            segment = self._load_segment(uow, segment_id)
+            session = self._load_session(uow, segment.session_id)
+            self._require_session_owner(uow, session, user_scope_id)
+            return self._load_binding(uow, segment.id, binding_revision)
 
-    def require_analyzeable(self, binding_ref: BindingRef) -> None:
-        """Only a closed segment and a closed binding revision may be analyzed."""
+    def require_analyzeable(
+        self, binding_ref: BindingRef, user_scope_id: str
+    ) -> None:
+        """Only the *named* closed segment and closed binding may be analyzed.
+
+        The requested revisions are not compared with the head: a later rebind
+        must not invalidate an artifact that was captured in an earlier, closed
+        revision (04 §4.3 fixes the BindingRef at capture time).
+        """
         with self.repository.unit_of_work() as uow:
             segment = self._load_segment(uow, binding_ref.segment_id)
-            self._require_current_revisions(
-                segment,
-                expected_segment_revision=binding_ref.segment_revision,
-                expected_binding_revision=binding_ref.binding_revision,
+            session = self._load_session(uow, segment.session_id)
+            self._require_session_owner(uow, session, user_scope_id)
+            named = self._load_segment_revision(
+                uow, segment.id, binding_ref.segment_revision
             )
-            if segment.lifecycle is not SessionLifecycle.ended:
+            if named.lifecycle is not SessionLifecycle.ended or named.end_s is None:
                 raise ContractError(
                     ErrorCode.PRECONDITION_UNVERIFIED,
-                    "an open segment cannot be analyzed; end it first",
+                    "an open segment revision cannot be analyzed; end it first",
                 )
             binding = self._load_binding(uow, segment.id, binding_ref.binding_revision)
             if binding.effective_range.end is None:
@@ -282,6 +299,12 @@ class PerformanceService:
         self._require_declaration_installation(request.run_declaration, request.installation_id)
         self._refuse_unverifiable_configuration(
             request.applied_id, request.configuration_state, request.run_declaration.fields
+        )
+        # Field rules run before anything is staged: an invalid submission must
+        # not leave a frozen file that a corrected same-key retry then collides
+        # with (error-conventions §4.2).
+        _validate_condition_fields(
+            request.run_declaration.fields, "run_declaration.fields", allow_scenario=True
         )
 
     def _write_creation(
@@ -460,10 +483,7 @@ class PerformanceService:
         route = SEGMENT_SPLIT_ROUTE.format(segment_id=request.ending.segment_id)
         request_hash = _request_hash(route, request_schema_version, request)
         if not self._has_registered(context, route):
-            self._refuse_unverifiable_configuration(
-                request.new_applied_id, request.configuration_state,
-                request.run_declaration.fields,
-            )
+            self._validate_split(request, context.user_scope_id)
         ids = {
             role: _deterministic_id(
                 context.user_scope_id, route, context.idempotency_key, request_hash, role,
@@ -494,6 +514,33 @@ class PerformanceService:
             hooks=hooks,
         )
         return ResourceResult(refs=[ObjectRef.model_validate(ref) for ref in published.refs])
+
+    def _validate_split(
+        self, request: SplitSegmentRequest, user_scope_id: str
+    ) -> None:
+        """Every guard runs before staging, so a conflict leaves the key free."""
+        with self.repository.unit_of_work() as uow:
+            old, session = self._segment_and_session(
+                uow, request.ending.segment_id, user_scope_id
+            )
+            self._require_active_segment(old, request.ending)
+            self._require_declaration_installation(
+                request.run_declaration, session.installation_id
+            )
+            if request.new_applied_id is not None and self._applied_by_installation(
+                uow, request.new_applied_id, session.installation_id
+            ) is None:
+                raise ContractError(
+                    ErrorCode.REFERENCE_INVALID,
+                    "the applied configuration does not belong to this installation",
+                )
+        self._refuse_unverifiable_configuration(
+            request.new_applied_id, request.configuration_state,
+            request.run_declaration.fields,
+        )
+        _validate_condition_fields(
+            request.run_declaration.fields, "run_declaration.fields", allow_scenario=True
+        )
 
     def _write_split(
         self,
@@ -1057,17 +1104,9 @@ class PerformanceService:
         return ids
 
     def _validate_conditions(self, request: CreateTestProtocolRequest) -> None:
-        fields = request.condition_fields
-        for key in fields:
-            if key in _PROTOCOL_CONDITIONS:
-                continue
-            if key.startswith("scene.") and key[len("scene."):].strip():
-                continue
-            raise _invalid(
-                "condition_fields", "enum",
-                f"field {key!r} is not an allowed test-protocol condition",
-            )
-        _check_condition_types(fields, "condition_fields")
+        _validate_condition_fields(
+            request.condition_fields, "condition_fields", allow_scenario=False
+        )
 
     def _validate_controlled(self, request: CreateTestProtocolRequest) -> None:
         fields = request.condition_fields
@@ -1750,6 +1789,29 @@ class PerformanceService:
         self._require_session_owner(uow, session, user_scope_id)
         return segment, session
 
+    def _load_segment_revision(
+        self, uow: UnitOfWork, segment_id: str, revision: int
+    ) -> SessionSegment:
+        if uow.get_head("SessionSegment", segment_id) is None:
+            stored = uow.find_object("SessionSegment", segment_id)
+            if stored is None:
+                raise ContractError(
+                    ErrorCode.RESOURCE_NOT_FOUND, "the requested segment is not available"
+                )
+            return SessionSegment.model_validate_json(stored.payload_bytes)
+        try:
+            payload = uow.get_snapshot("SessionSegment", segment_id, revision)
+        except ContractError as error:
+            raise ContractError(
+                ErrorCode.REFERENCE_INVALID,
+                "the requested segment revision does not exist",
+                field_errors=[FieldError(
+                    path="segment_revision", code="reference",
+                    message="no such stored revision",
+                )],
+            ) from error
+        return SessionSegment.model_validate_json(canonical_json(payload))
+
     def _load_segment(self, uow: UnitOfWork, segment_id: str) -> SessionSegment:
         head = uow.execute(
             "SELECT * FROM session_segments WHERE segment_id=?", (segment_id,)
@@ -2414,20 +2476,28 @@ def _check_condition_types(fields: Mapping[str, Scalar], path: str) -> None:
         raise _invalid(path, "type", "upscaling must be a non-blank string")
 
 
-def _build_run_conditions(
-    fields: Mapping[str, Scalar], evidence: EvidenceRef, now: str
-) -> tuple[RunConditions, FieldValue[str]]:
+def _validate_condition_fields(
+    fields: Mapping[str, Scalar], path: str, *, allow_scenario: bool
+) -> None:
+    allowed = _FIXED_CONDITIONS if allow_scenario else _PROTOCOL_CONDITIONS
     for key in fields:
-        if key in _FIXED_CONDITIONS:
+        if key in allowed:
             continue
         if key.startswith("scene.") and key[len("scene."):].strip():
             continue
-        raise _invalid("run_declaration.fields", "enum", f"field {key!r} is not a run condition")
-    _check_condition_types(fields, "run_declaration.fields")
-    if "scenario" in fields and (
-        type(fields["scenario"]) is not str or not fields["scenario"].strip()
-    ):
-        raise _invalid("run_declaration.fields", "type", "scenario must be a non-blank string")
+        raise _invalid(path, "enum", f"field {key!r} is not an allowed condition")
+    _check_condition_types(fields, path)
+    if "scenario" in fields:
+        if not allow_scenario:
+            raise _invalid(path, "enum", "scenario is a separate field, not a condition")
+        if type(fields["scenario"]) is not str or not fields["scenario"].strip():
+            raise _invalid(path, "type", "scenario must be a non-blank string")
+
+
+def _build_run_conditions(
+    fields: Mapping[str, Scalar], evidence: EvidenceRef, now: str
+) -> tuple[RunConditions, FieldValue[str]]:
+    _validate_condition_fields(fields, "run_declaration.fields", allow_scenario=True)
 
     def resolution(prefix: str) -> FieldValue[Resolution]:
         if f"{prefix}_width" in fields:

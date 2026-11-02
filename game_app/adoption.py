@@ -344,7 +344,7 @@ class AdoptionService:
         self._device_snapshot(uow, request.device_snapshot_id, user_scope_id)
         # A historical record must not be a way to smuggle in today's state.
         self._evidence_problems(uow, request.evidence_refs)
-        segment_check = self._segment_check(uow, request)
+        segment_check = self._segment_check(uow, request, user_scope_id)
 
         now = self.clock()
         evidence = self._declaration_evidence(managed[0])
@@ -1102,73 +1102,99 @@ class AdoptionService:
                     )
 
     def _segment_check(
-        self, uow: UnitOfWork, request: HistoricalConfigurationInput
+        self,
+        uow: UnitOfWork,
+        request: HistoricalConfigurationInput,
+        user_scope_id: str,
     ) -> CheckResult:
         # PERF-T02 owns the segment projection; a real ended segment is read
         # from it (objects only carry the creation snapshot).
         row = uow.query(
-            "SELECT revision, lifecycle, binding_revision FROM session_segments"
-            " WHERE segment_id=?",
+            "SELECT revision, lifecycle, binding_revision, session_id"
+            " FROM session_segments WHERE segment_id=?",
             (request.segment_ref.segment_id,),
         )
-        if row:
-            current = row[0]
-            if current["lifecycle"] != "ended":
+        if not row:
+            if uow.find_object("SessionSegment", request.segment_ref.segment_id) is None:
                 raise ContractError(
-                    ErrorCode.PRECONDITION_UNVERIFIED,
-                    "a historical configuration needs an ended segment",
+                    ErrorCode.REFERENCE_INVALID,
+                    "the referenced segment does not exist",
+                    field_errors=[FieldError(
+                        path="segment_ref.segment_id", code="reference",
+                        message="unknown segment",
+                    )],
                 )
-            errors = []
-            if current["revision"] != request.segment_ref.segment_revision:
-                errors.append(FieldError(
-                    path="segment_ref.segment_revision", code="conflict",
-                    message=f"current revision is {current['revision']}",
-                ))
-            if current["binding_revision"] != request.segment_ref.binding_revision:
-                errors.append(FieldError(
-                    path="segment_ref.binding_revision", code="conflict",
-                    message=f"current binding revision is {current['binding_revision']}",
-                ))
-            if errors:
-                raise ContractError(
-                    ErrorCode.BINDING_REVISION_CONFLICT,
-                    "the segment changed; re-read it before registering a historical configuration",
-                    field_errors=errors,
-                )
-            return _check(
-                "applied.segment",
-                CheckStatus.pass_,
-                "the segment revision and binding revision match and the segment is ended",
+            # An object without a projection row cannot be verified for
+            # ownership or current revision; that is not a pass.
+            raise ContractError(
+                ErrorCode.PRECONDITION_UNVERIFIED,
+                "the segment carries no revision projection; it cannot back a"
+                " historical configuration",
             )
-        stored = uow.find_object("SessionSegment", request.segment_ref.segment_id)
-        if stored is None:
-            # PERF-T02 owns session storage; until it lands the segment cannot be
-            # verified, and that limit is recorded instead of assumed.
-            return _check(
-                "applied.segment",
-                CheckStatus.not_run,
-                "session segments are not stored yet (PERF-T02); the segment reference"
-                " could not be verified",
+        current = row[0]
+        session = self._session_payload(uow, current["session_id"])
+        installation = uow.latest_for_series(
+            "GameInstallation", session.get("installation_id") or ""
+        )
+        if (
+            installation is None
+            or installation.payload.get("user_scope_id") != user_scope_id
+        ):
+            # Another user's segment is indistinguishable from a missing one.
+            raise ContractError(
+                ErrorCode.RESOURCE_NOT_FOUND,
+                "the referenced segment is not available",
             )
-        payload = stored.payload
-        if payload.get("lifecycle") != "ended":
+        if session.get("installation_id") != request.installation_id:
+            raise ContractError(
+                ErrorCode.REFERENCE_INVALID,
+                "the referenced segment belongs to another installation",
+                field_errors=[FieldError(
+                    path="segment_ref.segment_id", code="reference",
+                    message="cross-installation segment",
+                )],
+            )
+        if current["lifecycle"] != "ended":
             raise ContractError(
                 ErrorCode.PRECONDITION_UNVERIFIED,
                 "a historical configuration needs an ended segment",
             )
-        # SessionSegment is an aggregate: its contract field is `revision`.
-        revision = payload.get("revision", payload.get("version"))
-        if revision != request.segment_ref.segment_revision:
+        errors = []
+        if current["revision"] != request.segment_ref.segment_revision:
+            errors.append(FieldError(
+                path="segment_ref.segment_revision", code="conflict",
+                message=f"current revision is {current['revision']}",
+            ))
+        if current["binding_revision"] != request.segment_ref.binding_revision:
+            errors.append(FieldError(
+                path="segment_ref.binding_revision", code="conflict",
+                message=f"current binding revision is {current['binding_revision']}",
+            ))
+        if errors:
             raise ContractError(
                 ErrorCode.BINDING_REVISION_CONFLICT,
                 "the segment changed; re-read it before registering a historical configuration",
+                field_errors=errors,
             )
         return _check(
             "applied.segment",
             CheckStatus.pass_,
-            "the segment revision matches and the segment is ended;"
-            " binding revision and period containment stay with PERF-T02",
+            "the segment belongs to this user and installation, its revisions match"
+            " and it is ended",
         )
+
+    @staticmethod
+    def _session_payload(uow: UnitOfWork, session_id: str) -> Mapping[str, Any]:
+        head = uow.get_head("PlaySession", session_id)
+        if head is None:
+            stored = uow.find_object("PlaySession", session_id)
+            if stored is None:
+                raise ContractError(
+                    ErrorCode.PRECONDITION_UNVERIFIED,
+                    "the segment names no stored session",
+                )
+            return stored.payload
+        return uow.get_snapshot("PlaySession", session_id, head)
 
 
 # -- pure helpers -------------------------------------------------------------

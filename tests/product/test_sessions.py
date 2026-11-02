@@ -84,9 +84,9 @@ def test_create_without_configuration_opens_a_segment_and_first_binding(tmp_path
     assert [ref.entity_type for ref in result.refs] == [
         "PlayerDeclaration", "PlaySession", "SessionSegment", "ConfigurationBinding", "ManagedFile",
     ]
-    session = service.get_session(result.refs[1].entity_id)
-    segment = service.get_segment(result.refs[2].entity_id)
-    binding = service.get_binding(segment.id, 1)
+    session = service.get_session(result.refs[1].entity_id, USER)
+    segment = service.get_segment(result.refs[2].entity_id, USER)
+    binding = service.get_binding(segment.id, 1, USER)
     assert session.revision == 1
     assert session.lifecycle.value == "active"
     assert session.ended_at is None
@@ -136,13 +136,13 @@ def test_end_segment_closes_with_a_new_binding_revision_and_keeps_the_old_one(tm
     result = service.end_segment(_end(segment_id), context_key("end-1"))
 
     assert [ref.entity_type for ref in result.refs] == ["SessionSegment", "ConfigurationBinding"]
-    segment = service.get_segment(segment_id)
+    segment = service.get_segment(segment_id, USER)
     assert segment.end_s == 12.5
     assert segment.lifecycle.value == "ended"
     assert segment.revision == 2
     assert segment.binding_revision == 2
-    assert service.get_binding(segment_id, 1).effective_range.end is None
-    closed = service.get_binding(segment_id, 2)
+    assert service.get_binding(segment_id, 1, USER).effective_range.end is None
+    closed = service.get_binding(segment_id, 2, USER)
     assert closed.effective_range.start == 0.0
     assert closed.effective_range.end == 12.5
     assert closed.supersedes_revision == 1
@@ -163,8 +163,8 @@ def test_stale_segment_revision_conflicts_with_zero_writes(tmp_path):
 
     assert caught.value.code is ErrorCode.BINDING_REVISION_CONFLICT
     assert caught.value.field_errors[0].path == "segment_revision"
-    assert service.get_segment(segment_id).revision == 1
-    assert service.get_segment(segment_id).end_s is None
+    assert service.get_segment(segment_id, USER).revision == 1
+    assert service.get_segment(segment_id, USER).end_s is None
     with repository.unit_of_work() as uow:
         assert uow.query("SELECT COUNT(*) AS n FROM idempotency")[0]["n"] == 1  # creation only
 
@@ -230,9 +230,9 @@ def test_split_shares_the_boundary_and_freezes_the_old_segment(tmp_path):
         SplitSegmentRequest.model_validate_json(canonical_json(payload)), context_key("split-1")
     )
 
-    old = service.get_segment(old_id)
+    old = service.get_segment(old_id, USER)
     new_id = result.refs[2].entity_id
-    new = service.get_segment(new_id)
+    new = service.get_segment(new_id, USER)
     assert old.end_s == 10
     assert old.lifecycle.value == "ended"
     assert new.start_s == old.end_s
@@ -268,8 +268,8 @@ def test_end_session_requires_the_exact_active_segment_set(tmp_path):
         )
 
     assert caught.value.code is ErrorCode.INPUT_VALIDATION_FAILED
-    assert service.get_segment(segment_id).end_s is None
-    assert service.get_session(created.refs[1].entity_id).lifecycle.value == "active"
+    assert service.get_segment(segment_id, USER).end_s is None
+    assert service.get_session(created.refs[1].entity_id, USER).lifecycle.value == "active"
 
 
 def test_end_session_closes_every_segment_and_writes_one_session_event(tmp_path):
@@ -307,12 +307,12 @@ def test_end_session_closes_every_segment_and_writes_one_session_event(tmp_path)
     )
 
     assert result.refs[0].entity_type == "PlaySession"
-    session = service.get_session(session_id)
+    session = service.get_session(session_id, USER)
     assert session.lifecycle.value == "ended"
     assert session.revision == 2
     assert session.ended_at is not None
-    assert service.get_segment(first).end_s == 10
-    assert service.get_segment(second).end_s == 17
+    assert service.get_segment(first, USER).end_s == 10
+    assert service.get_segment(second, USER).end_s == 17
     with repository.unit_of_work() as uow:
         events = uow.query(
             "SELECT * FROM domain_events WHERE target_type='PlaySession' AND target_id=?",
@@ -363,11 +363,11 @@ def test_bind_configuration_appends_without_moving_the_current_pointer(tmp_path)
     result = service.bind_configuration(request, context_key("bind-1"))
 
     assert [ref.entity_type for ref in result.refs] == ["ConfigurationBinding", "SessionSegment"]
-    segment = service.get_segment(segment_id)
+    segment = service.get_segment(segment_id, USER)
     assert segment.revision == 3
     assert segment.binding_revision == 3
     assert segment.end_s == 20
-    bound = service.get_binding(segment_id, 3)
+    bound = service.get_binding(segment_id, 3, USER)
     assert bound.applied_id == applied_id
     assert bound.configuration_state.value == "bound"
     assert bound.effective_range.start == 2.0
@@ -376,7 +376,7 @@ def test_bind_configuration_appends_without_moving_the_current_pointer(tmp_path)
     with repository.unit_of_work() as uow:
         assert uow.query("SELECT COUNT(*) AS n FROM current_applied")[0]["n"] == 0
     assert files.read_managed_file(declaration_file_id) == before_bytes
-    assert service.get_session(session_id).revision == 1
+    assert service.get_session(session_id, USER).revision == 1
 
 
 def test_an_open_revision_cannot_be_analyzed(tmp_path):
@@ -389,12 +389,16 @@ def test_an_open_revision_cannot_be_analyzed(tmp_path):
     segment_id = created.refs[2].entity_id
 
     with pytest.raises(ContractError) as caught:
-        service.require_analyzeable(BindingRef(segment_id=segment_id, segment_revision=1, binding_revision=1))
+        service.require_analyzeable(
+            BindingRef(segment_id=segment_id, segment_revision=1, binding_revision=1), USER,
+        )
     assert caught.value.code is ErrorCode.PRECONDITION_UNVERIFIED
 
     clock.advance(5)
     service.end_segment(_end(segment_id), context_key("end-1"))
-    service.require_analyzeable(BindingRef(segment_id=segment_id, segment_revision=2, binding_revision=2))
+    service.require_analyzeable(
+        BindingRef(segment_id=segment_id, segment_revision=2, binding_revision=2), USER,
+    )
 
 
 def test_create_session_replays_the_same_response_and_rejects_changed_content(tmp_path):
@@ -448,7 +452,7 @@ def test_undeclared_run_conditions_stay_unknown(tmp_path):
         context_key("create-1"),
     )
 
-    session = service.get_session(created.refs[1].entity_id)
+    session = service.get_session(created.refs[1].entity_id, USER)
     conditions = session.run_conditions
     assert conditions.output_resolution.value_state.value == "unknown"
     assert conditions.output_resolution.value is None
@@ -477,7 +481,7 @@ def test_another_users_segment_is_not_found(tmp_path):
         service.end_segment(_end(segment_id), other)
 
     assert caught.value.code is ErrorCode.RESOURCE_NOT_FOUND
-    assert service.get_segment(segment_id).end_s is None
+    assert service.get_segment(segment_id, USER).end_s is None
 
 
 def test_concurrent_end_segment_lets_exactly_one_write(tmp_path):
@@ -514,7 +518,7 @@ def test_concurrent_end_segment_lets_exactly_one_write(tmp_path):
     second.close()
 
     assert sorted(outcomes) == ["BINDING_REVISION_CONFLICT", "ok"]
-    assert service.get_segment(segment_id).revision == 2
+    assert service.get_segment(segment_id, USER).revision == 2
     with repository.unit_of_work() as uow:
         assert uow.query(
             "SELECT COUNT(*) AS n FROM configuration_bindings WHERE segment_id=?", (segment_id,)
@@ -550,8 +554,8 @@ def test_end_session_requires_the_current_session_revision(tmp_path):
 
     assert caught.value.code is ErrorCode.BINDING_REVISION_CONFLICT
     assert caught.value.field_errors[0].path == "session_revision"
-    assert service.get_segment(segment_id).end_s is None
-    assert service.get_session(created.refs[1].entity_id).lifecycle.value == "active"
+    assert service.get_segment(segment_id, USER).end_s is None
+    assert service.get_session(created.refs[1].entity_id, USER).lifecycle.value == "active"
 
 
 def test_end_session_rejects_a_duplicate_or_unknown_segment(tmp_path):
@@ -605,7 +609,7 @@ def test_another_users_session_is_not_found_for_end_session(tmp_path):
         )
 
     assert caught.value.code is ErrorCode.RESOURCE_NOT_FOUND
-    assert service.get_segment(segment_id).end_s is None
+    assert service.get_segment(segment_id, USER).end_s is None
 
 
 def test_binding_needs_an_ended_segment_and_evidence(tmp_path):
@@ -706,7 +710,7 @@ def test_an_unknown_binding_revision_is_not_found(tmp_path):
     segment_id = created.refs[2].entity_id
 
     with pytest.raises(ContractError) as caught:
-        service.get_binding(segment_id, 9)
+        service.get_binding(segment_id, 9, USER)
 
     assert caught.value.code is ErrorCode.RESOURCE_NOT_FOUND
 
@@ -739,7 +743,7 @@ def test_split_declaration_must_name_the_session_installation(tmp_path):
     assert caught.value.code is ErrorCode.INPUT_VALIDATION_FAILED
     assert _count(repository, "SessionSegment") == 1
     assert _count(repository, "PlayerDeclaration") == 1
-    assert service.get_segment(segment_id).end_s is None
+    assert service.get_segment(segment_id, USER).end_s is None
 
 
 def test_end_segment_replays_the_same_response(tmp_path):
@@ -756,7 +760,7 @@ def test_end_segment_replays_the_same_response(tmp_path):
     replay = service.end_segment(_end(segment_id), context_key("end-key"))
 
     assert [ref.model_dump() for ref in replay.refs] == [ref.model_dump() for ref in first.refs]
-    assert service.get_segment(segment_id).revision == 2
+    assert service.get_segment(segment_id, USER).revision == 2
 
 
 # --- integration with the 01 historical registration path --------------------
@@ -836,10 +840,209 @@ def test_the_application_layer_exposes_the_performance_entries(tmp_path):
     assert [ref.entity_type for ref in created.refs] == [
         "PlayerDeclaration", "PlaySession", "SessionSegment", "ConfigurationBinding", "ManagedFile",
     ]
-    assert app.get_session(created.refs[1].entity_id).id == created.refs[1].entity_id
-    assert app.get_segment(created.refs[2].entity_id).id == created.refs[2].entity_id
+    assert app.get_session(created.refs[1].entity_id, USER).id == created.refs[1].entity_id
+    assert app.get_segment(created.refs[2].entity_id, USER).id == created.refs[2].entity_id
     page = app.list_metric_definitions(MetricCatalogQuery(frame_stream_kind=None))
     assert len(page.choices) == 4
 
 
 
+
+
+# --- review follow-ups: ownership on reads, conflict ordering, revisions -----
+
+
+def _other_user(repository):
+    from game_app.contracts.device import GameInstallation
+    from game_app.contracts.primitives import utc_now
+    from tests.product.support.configuration import unknown_platform
+
+    other = uid(930)
+    installation_id = uid(931)
+    with repository.unit_of_work() as uow:
+        uow.insert_versioned("GameInstallation", GameInstallation(
+            id=installation_id,
+            schema_version="product-contract/0.4",
+            created_at=utc_now(),
+            created_by_task_id=None,
+            series_id=installation_id,
+            version=1,
+            revision=1,
+            user_scope_id=other,
+            game_id="b" * 32,
+            origin="user_provided",
+            platform=unknown_platform(),
+            private_path_ref=None,
+        ))
+    context_id = store_raw(repository, "GameContext", {
+        "id": uid(932), "installation_id": installation_id, "game_id": "b" * 32,
+    })
+    device_id = store_raw(repository, "DeviceSnapshot", {
+        "id": uid(933), "user_scope_id": other,
+    })
+    return other, installation_id, context_id, device_id
+
+
+def test_reads_and_analysis_require_the_owner(tmp_path):
+    repository, files, installation_id, context_id, device_id = setup(tmp_path)
+    clock = FakeClock()
+    service = _service(repository, files, clock)
+    created = service.create_session(
+        _request(installation_id, context_id, device_id), context_key("create-1")
+    )
+    session_id = created.refs[1].entity_id
+    segment_id = created.refs[2].entity_id
+    clock.advance(4)
+    service.end_segment(_end(segment_id), context_key("end-1"))
+    foreign = uid(999)
+
+    for call in (
+        lambda: service.get_session(session_id, foreign),
+        lambda: service.get_segment(segment_id, foreign),
+        lambda: service.get_binding(segment_id, 2, foreign),
+        lambda: service.require_analyzeable(
+            BindingRef(segment_id=segment_id, segment_revision=2, binding_revision=2),
+            foreign,
+        ),
+    ):
+        with pytest.raises(ContractError) as caught:
+            call()
+        assert caught.value.code is ErrorCode.RESOURCE_NOT_FOUND
+
+    assert service.get_session(session_id, USER).id == session_id
+    assert service.get_segment(segment_id, USER).id == segment_id
+    service.require_analyzeable(
+        BindingRef(segment_id=segment_id, segment_revision=2, binding_revision=2), USER,
+    )
+
+
+def test_analysis_of_a_closed_earlier_revision_is_allowed(tmp_path):
+    repository, files, installation_id, context_id, device_id = setup(tmp_path)
+    clock = FakeClock()
+    service = _service(repository, files, clock)
+    created = service.create_session(
+        _request(installation_id, context_id, device_id), context_key("create-1")
+    )
+    segment_id = created.refs[2].entity_id
+    clock.advance(10)
+    service.end_segment(_end(segment_id), context_key("end-1"))
+    applied_id = store_raw(repository, "AppliedConfiguration", {
+        "id": uid(520), "user_scope_id": USER, "installation_id": installation_id,
+        "series_id": uid(521), "version": 1,
+    })
+    evidence_file = files.store_artifact(b"basis\n", relative_name="basis.txt", stable_key="basis-3")
+    evidence_hash = repository.get_object("ManagedFile", evidence_file).payload["manifest"]["sha256"]
+    service.bind_configuration(
+        BindConfigurationRequest.model_validate_json(canonical_json({
+            "segment_id": segment_id,
+            "expected_segment_revision": 2,
+            "expected_binding_revision": 2,
+            "applied_id": applied_id,
+            "effective_range": {"start": 1.0, "end": 5.0, "time_basis": "session", "unit": "s"},
+            "evidence_refs": [{
+                "kind": "artifact", "file_id": evidence_file,
+                "content_hash": evidence_hash, "locator": "basis.txt",
+            }],
+        })),
+        context_key("bind-1"),
+    )
+
+    assert service.get_segment(segment_id, USER).binding_revision == 3
+    service.require_analyzeable(
+        BindingRef(segment_id=segment_id, segment_revision=2, binding_revision=2), USER,
+    )
+
+
+def test_create_session_invalid_condition_does_not_consume_the_key(tmp_path):
+    repository, files, installation_id, context_id, device_id = setup(tmp_path)
+    clock = FakeClock()
+    service = _service(repository, files, clock)
+
+    with pytest.raises(ContractError) as caught:
+        service.create_session(
+            _request(installation_id, context_id, device_id, fields={"output_width": 1920}),
+            context_key("same-key"),
+        )
+    assert caught.value.code is ErrorCode.INPUT_VALIDATION_FAILED
+
+    result = service.create_session(
+        _request(
+            installation_id, context_id, device_id,
+            fields={"output_width": 1920, "output_height": 1080},
+        ),
+        context_key("same-key"),
+    )
+
+    assert result.refs[1].entity_type == "PlaySession"
+    assert _count(repository, "PlaySession") == 1
+
+
+def test_split_with_a_stale_revision_does_not_consume_the_key(tmp_path):
+    repository, files, installation_id, context_id, device_id = setup(tmp_path)
+    clock = FakeClock()
+    service = _service(repository, files, clock)
+    created = service.create_session(
+        _request(installation_id, context_id, device_id), context_key("create-1")
+    )
+    segment_id = created.refs[2].entity_id
+    clock.advance(6)
+
+    def split_payload(segment_revision):
+        return SplitSegmentRequest.model_validate_json(canonical_json({
+            "ending": {
+                "segment_id": segment_id,
+                "expected_segment_revision": segment_revision,
+                "expected_binding_revision": 1,
+            },
+            "new_applied_id": None,
+            "configuration_state": "unverified",
+            "run_declaration": {
+                "installation_id": installation_id, "fields": {}, "raw_text": "",
+            },
+        }))
+
+    with pytest.raises(ContractError) as caught:
+        service.split_segment(split_payload(9), context_key("split-key"))
+    assert caught.value.code is ErrorCode.BINDING_REVISION_CONFLICT
+
+    result = service.split_segment(split_payload(1), context_key("split-key"))
+
+    assert result.refs[2].entity_type == "SessionSegment"
+    assert _count(repository, "SessionSegment") == 2
+
+
+def test_historical_configuration_cannot_use_another_users_segment(tmp_path):
+    repository, files, installation_id, context_id, device_id = setup(tmp_path)
+    clock = FakeClock()
+    service = _service(repository, files, clock)
+    created = service.create_session(
+        _request(installation_id, context_id, device_id), context_key("create-1")
+    )
+    segment_id = created.refs[2].entity_id
+    clock.advance(10)
+    service.end_segment(_end(segment_id), context_key("end-1"))
+    other, other_installation, other_context, other_device = _other_user(repository)
+    evidence_file = files.store_artifact(b"past\n", relative_name="past.txt", stable_key="past-9")
+    evidence_hash = repository.get_object("ManagedFile", evidence_file).payload["manifest"]["sha256"]
+    evidence = {
+        "kind": "artifact", "file_id": evidence_file,
+        "content_hash": evidence_hash, "locator": "past.txt",
+    }
+    other_key = context_key("hist-foreign").model_copy(update={"user_scope_id": other})
+
+    for segment_revision in (2, 1):
+        with pytest.raises(ContractError) as caught:
+            AdoptionService(repository, files).record_historical_configuration(
+                _historical(
+                    other_installation, other_context, other_device,
+                    {"segment_id": segment_id,
+                     "segment_revision": segment_revision,
+                     "binding_revision": 2},
+                    evidence,
+                ),
+                other_key.model_copy(update={"idempotency_key": f"hist-foreign-{segment_revision}"}),
+            )
+        assert caught.value.code is ErrorCode.RESOURCE_NOT_FOUND
+        assert "current revision" not in caught.value.message
+        assert caught.value.field_errors == []
+    assert _count(repository, "AppliedConfiguration") == 0

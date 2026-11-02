@@ -18,7 +18,7 @@ from game_app.errors import ContractError, ErrorCode
 from game_app.files import PublishHooks
 from game_app.performance import PerformanceService
 from game_app.repository import canonical_json
-from tests.product.support.configuration import context_key, setup, uid
+from tests.product.support.configuration import USER, context_key, setup, uid
 from tests.product.test_sessions import FakeClock
 
 SAMPLE_DIR = (
@@ -194,25 +194,25 @@ def test_historical_association_creates_an_ended_session_and_closed_binding(tmp_
     assert artifact["time_mapping"]["offset"] == 0.0
     assert artifact["quality"] == "valid"
     assert artifact["options"] == {}
-    session = service.get_session(artifact["session_id"])
+    session = service.get_session(artifact["session_id"], USER)
     assert session.lifecycle.value == "ended"
     assert session.started_at == "2026-10-01T12:00:00+00:00"
     assert session.ended_at == "2026-10-01T12:00:00.066800+00:00"
     assert session.configuration_state.value == "unverified"
     assert session.initial_applied_id is None
-    segment = service.get_segment(artifact["segment_ids"][0])
+    segment = service.get_segment(artifact["segment_ids"][0], USER)
     assert segment.lifecycle.value == "ended"
     assert segment.start_s == 0.0
     assert abs(segment.end_s - 0.0668) < 1e-9
     assert segment.configuration_state.value == "unverified"
     assert segment.stream_selection.frame_stream_kind.value == "application_present"
-    binding = service.get_binding(segment.id, 1)
+    binding = service.get_binding(segment.id, 1, USER)
     assert binding.applied_id is None
     assert binding.effective_range.end == segment.end_s
     assert binding.supersedes_revision is None
     service.require_analyzeable(BindingRef(
         segment_id=segment.id, segment_revision=1, binding_revision=1,
-    ))
+    ), USER)
     with repository.unit_of_work() as uow:
         assert uow.query("SELECT COUNT(*) AS n FROM current_applied")[0]["n"] == 0
         events = uow.query(
@@ -378,14 +378,14 @@ def test_existing_open_segment_closes_at_the_declared_point(tmp_path):
     )
 
     artifact = repository.get_object("CaptureArtifact", result.refs[0].entity_id).payload
-    segment = service.get_segment(segment_id)
+    segment = service.get_segment(segment_id, USER)
     assert segment.lifecycle.value == "ended"
     assert segment.end_s == 0.5
     assert segment.revision == 2
-    assert service.get_binding(segment_id, 2).effective_range.end == 0.5
+    assert service.get_binding(segment_id, 2, USER).effective_range.end == 0.5
     assert artifact["session_id"] == session_id
     assert artifact["segment_ids"] == [segment_id]
-    assert service.get_session(session_id).lifecycle.value == "active"
+    assert service.get_session(session_id, USER).lifecycle.value == "active"
 
 
 def test_existing_closed_segment_keeps_its_boundary_and_rejects_a_close_point(tmp_path):
@@ -431,7 +431,7 @@ def test_existing_closed_segment_keeps_its_boundary_and_rejects_a_close_point(tm
     )
 
     assert result.refs[0].entity_type == "CaptureArtifact"
-    segment = service.get_segment(segment_id)
+    segment = service.get_segment(segment_id, USER)
     assert segment.end_s == 1.0
     assert segment.revision == 2
 
@@ -484,7 +484,7 @@ def test_a_stale_segment_revision_writes_no_artifact(tmp_path):
     assert caught.value.code is ErrorCode.BINDING_REVISION_CONFLICT
     assert caught.value.field_errors[0].path == "segment_revision"
     assert _count(repository, "CaptureArtifact") == 0
-    assert service.get_segment(segment_id).revision == 1
+    assert service.get_segment(segment_id, USER).revision == 1
 
 
 def test_another_users_session_cannot_be_targeted(tmp_path):

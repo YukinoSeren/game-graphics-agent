@@ -67,6 +67,46 @@ def _historical(installation_id, context_id, device_id, evidence, **overrides):
     )
 
 
+
+def _ended_segment(repository, files, installation_id, context_id, device_id):
+    """A real ended segment from the PERF-T02 projection (revisions 2/2)."""
+    from game_app.contracts.performance import CreateSessionRequest, EndSegmentRequest
+    from game_app.performance import PerformanceService
+    from tests.product.test_sessions import FakeClock
+
+    clock = FakeClock()
+    service = PerformanceService(repository, files, clock=clock)
+    payload = {
+        "installation_id": installation_id,
+        "device_snapshot_id": device_id,
+        "game_context_id": context_id,
+        "applied_id": None,
+        "configuration_state": "unverified",
+        "run_declaration": {
+            "installation_id": installation_id, "fields": {}, "raw_text": "",
+        },
+        "test_protocol_id": None,
+        "recommendation_id": None,
+    }
+    created = service.create_session(
+        CreateSessionRequest.model_validate_json(canonical_json(payload)),
+        context_key("hist-session"),
+    )
+    clock.advance(600)
+    service.end_segment(
+        EndSegmentRequest.model_validate_json(canonical_json({
+            "segment_id": created.refs[2].entity_id,
+            "expected_segment_revision": 1,
+            "expected_binding_revision": 1,
+        })),
+        context_key("hist-segment-end"),
+    )
+    return {
+        "segment_id": created.refs[2].entity_id,
+        "segment_revision": 2,
+        "binding_revision": 2,
+    }
+
 def _count(repository, entity_type) -> int:
     with repository.unit_of_work() as uow:
         return len(uow.iter_objects(entity_type))
@@ -91,9 +131,11 @@ def test_historical_record_is_an_independent_family_and_keeps_the_pointer(tmp_pa
     with repository.unit_of_work() as uow:
         events_before = len(uow.query("SELECT 1 FROM current_applied_events"))
 
+    segment_ref = _ended_segment(repository, files, installation_id, context_id, device_id)
     result = service.record_historical_configuration(
         _historical(
             installation_id, context_id, device_id, _evidence(files),
+            segment_ref=segment_ref,
             declared_settings=[declaration(historical_def, value=2)],
         ),
         context_key("historical"),
@@ -122,9 +164,11 @@ def test_historical_adopted_at_stays_null_when_there_is_no_basis(tmp_path):
     definition, _ = definitions.new("过去")
     service = AdoptionService(repository, files)
 
+    segment_ref = _ended_segment(repository, files, installation_id, context_id, device_id)
     result = service.record_historical_configuration(
         _historical(
             installation_id, context_id, device_id, _evidence(files),
+            segment_ref=segment_ref,
             adopted_at=None,
             declared_settings=[declaration(definition, value=2)],
         ),
@@ -165,25 +209,23 @@ def test_historical_record_needs_evidence_for_its_period(tmp_path):
     assert _count(repository, "PlayerDeclaration") == 0
 
 
-def test_missing_segment_storage_is_recorded_as_not_run(tmp_path):
+def test_a_missing_segment_cannot_back_a_historical_record(tmp_path):
     repository, files, installation_id, context_id, device_id = setup(tmp_path)
     definitions = Definitions(repository, installation_id)
     definition, _ = definitions.new("过去")
     service = AdoptionService(repository, files)
 
-    result = service.record_historical_configuration(
-        _historical(
-            installation_id, context_id, device_id, _evidence(files),
-            declared_settings=[declaration(definition, value=2)],
-        ),
-        context_key("no-segment"),
-    )
+    with pytest.raises(ContractError) as caught:
+        service.record_historical_configuration(
+            _historical(
+                installation_id, context_id, device_id, _evidence(files),
+                declared_settings=[declaration(definition, value=2)],
+            ),
+            context_key("no-segment"),
+        )
 
-    applied = service.get_applied(result.refs[1].entity_id)
-    segment = next(check for check in applied.checks if check.check_id == "applied.segment")
-    assert segment.status is CheckStatus.not_run
-    assert "PERF-T02" in (segment.note or "")
-    assert segment.checked_at is None
+    assert caught.value.code is ErrorCode.REFERENCE_INVALID
+    assert _count(repository, "AppliedConfiguration") == 0
 
 
 def test_an_active_segment_cannot_back_a_historical_record(tmp_path):
@@ -214,10 +256,12 @@ def test_two_historical_registrations_are_separate_families(tmp_path):
     first_def, _ = definitions.new("过去甲")
     second_def, _ = definitions.new("过去乙")
     service = AdoptionService(repository, files)
+    segment_ref = _ended_segment(repository, files, installation_id, context_id, device_id)
 
     first = service.record_historical_configuration(
         _historical(
             installation_id, context_id, device_id, _evidence(files),
+            segment_ref=segment_ref,
             declared_settings=[declaration(first_def, value=1)],
         ),
         context_key("h-1"),
@@ -225,6 +269,7 @@ def test_two_historical_registrations_are_separate_families(tmp_path):
     second = service.record_historical_configuration(
         _historical(
             installation_id, context_id, device_id, _evidence(files),
+            segment_ref=segment_ref,
             declared_settings=[declaration(second_def, value=2)],
         ),
         context_key("h-2"),
@@ -264,9 +309,11 @@ def test_period_coverage_is_not_claimed_from_mere_existence(tmp_path):
     definition, _ = definitions.new("过去")
     service = AdoptionService(repository, files)
 
+    segment_ref = _ended_segment(repository, files, installation_id, context_id, device_id)
     result = service.record_historical_configuration(
         _historical(
             installation_id, context_id, device_id, _evidence(files),
+            segment_ref=segment_ref,
             declared_settings=[declaration(definition, value=2)],
         ),
         context_key("period"),
@@ -281,7 +328,7 @@ def test_period_coverage_is_not_claimed_from_mere_existence(tmp_path):
     assert coverage.status is CheckStatus.unknown
 
 
-def test_contract_shaped_segment_revision_is_accepted(tmp_path):
+def test_an_object_only_segment_cannot_be_verified(tmp_path):
     repository, files, installation_id, context_id, device_id = setup(tmp_path)
     definitions = Definitions(repository, installation_id)
     definition, _ = definitions.new("过去")
@@ -290,17 +337,18 @@ def test_contract_shaped_segment_revision_is_accepted(tmp_path):
         "id": uid(800), "revision": 1, "lifecycle": "ended",
     })
 
-    result = service.record_historical_configuration(
-        _historical(
-            installation_id, context_id, device_id, _evidence(files),
-            declared_settings=[declaration(definition, value=2)],
-        ),
-        context_key("segment"),
-    )
+    with pytest.raises(ContractError) as caught:
+        service.record_historical_configuration(
+            _historical(
+                installation_id, context_id, device_id, _evidence(files),
+                declared_settings=[declaration(definition, value=2)],
+            ),
+            context_key("segment"),
+        )
 
-    applied = service.get_applied(result.refs[1].entity_id)
-    segment = next(check for check in applied.checks if check.check_id == "applied.segment")
-    assert segment.status is CheckStatus.pass_
+    # No projection row means no verifiable owner or current revision.
+    assert caught.value.code is ErrorCode.PRECONDITION_UNVERIFIED
+    assert _count(repository, "AppliedConfiguration") == 0
 
 
 def test_historical_registration_replays_the_same_ids(tmp_path):
@@ -308,8 +356,10 @@ def test_historical_registration_replays_the_same_ids(tmp_path):
     definitions = Definitions(repository, installation_id)
     definition, _ = definitions.new("过去")
     service = AdoptionService(repository, files)
+    segment_ref = _ended_segment(repository, files, installation_id, context_id, device_id)
     request = _historical(
         installation_id, context_id, device_id, _evidence(files),
+        segment_ref=segment_ref,
         declared_settings=[declaration(definition, value=2)],
     )
 

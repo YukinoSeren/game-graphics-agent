@@ -18,6 +18,7 @@
 
 复制下面整段，把 `{{批次任务清单}}` 替换为 §2 中对应批次的内容。
 
+<!-- MASTER-BEGIN -->
 ````text
 你是本仓库的执行代理。目标：把指定批次的产品实现任务一次性完成——包括编码、测试、评审、修复与推送——中途不向我确认。
 
@@ -103,6 +104,9 @@
 
 ## 8. 最终报告格式
 
+把这份报告同时写入 `.superpowers/batch-runs/report-<批次字母>.md`（该目录是 git 忽略的暂存区）；
+驱动脚本会把上一批的报告原文交给下一批。
+
 ```
 批次：<name>
 基线：<commit> (<N> passed, 1 skipped)
@@ -124,6 +128,7 @@ Blocked：<Q1/Q2/G-* 相关跳过项>
 
 现在开始。先执行 §0 与 §1，然后按 §9 逐项执行，全程不要向我确认。
 ````
+<!-- MASTER-END -->
 
 ---
 
@@ -133,6 +138,7 @@ Blocked：<Q1/Q2/G-* 相关跳过项>
 顺序不能打乱：`PERF-T02` 会往 task union 加 `LogImportInput`，`KNW-T02` 依赖批次 2D
 之后才可达的 `published`。
 
+<!-- BATCH-A-BEGIN -->
 ### 批次 A — 性能
 
 ```text
@@ -152,6 +158,9 @@ Blocked：<Q1/Q2/G-* 相关跳过项>
 禁用：任何真实采集适配器、真实游戏进程、真实 GPU 查询。
 ```
 
+<!-- BATCH-A-END -->
+
+<!-- BATCH-B-BEGIN -->
 ### 批次 B — 知识
 
 ```text
@@ -170,6 +179,9 @@ Blocked：<Q1/Q2/G-* 相关跳过项>
    - 产物：tests/product/test_impacts.py
 ```
 
+<!-- BATCH-B-END -->
+
+<!-- BATCH-C-BEGIN -->
 ### 批次 C — 推荐
 
 ```text
@@ -184,6 +196,9 @@ Blocked：<Q1/Q2/G-* 相关跳过项>
 R03 仍是建议而非已确认规则：不得据其宣布 readiness 或 actionable。
 ```
 
+<!-- BATCH-C-END -->
+
+<!-- BATCH-D-BEGIN -->
 ### 批次 D — 反馈与效果
 
 ```text
@@ -200,6 +215,9 @@ R03 仍是建议而非已确认规则：不得据其宣布 readiness 或 actiona
 效果结论最多到 offline_fixture；local_effect 必须有真实会话证据才可声明。
 ```
 
+<!-- BATCH-D-END -->
+
+<!-- BATCH-E-BEGIN -->
 ### 批次 E — 入口与页面（受 Q1 门禁）
 
 ```text
@@ -216,6 +234,9 @@ R03 仍是建议而非已确认规则：不得据其宣布 readiness 或 actiona
 并在最终报告的 Blocked 段中写明。
 ```
 
+<!-- BATCH-E-END -->
+
+<!-- BATCH-F-BEGIN -->
 ### 批次 F — 验证与交付
 
 ```text
@@ -232,6 +253,8 @@ R03 仍是建议而非已确认规则：不得据其宣布 readiness 或 actiona
 ```
 
 ---
+
+<!-- BATCH-F-END -->
 
 ## 3. 使用要点
 

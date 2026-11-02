@@ -558,6 +558,101 @@ def test_import_records_claim_their_four_part_keys(tmp_path):
     }
 
 
+def test_context_of_another_user_is_not_importable(tmp_path):
+    """A caller must not publish against someone else's installation context."""
+    files, repository = _service(tmp_path)
+    context_id = _owned_context(repository)
+    group = _freeze(files, tmp_path, "foreign-context", _run_files(
+        records=[_record("cfg-0001", "configurations", {"name": "P", "settings": []})],
+    ))
+    publisher = _publisher(repository, files)
+
+    with pytest.raises(ContractError) as caught:
+        publisher.publish(
+            frozen=group,
+            game_context_id=context_id,
+            mapping_version="collector-import/1",
+            identity_mapping_ids=[],
+            user_scope_id=_uid(4242),
+            idempotency_key="k-foreign",
+        )
+
+    assert caught.value.code is ErrorCode.RESOURCE_NOT_FOUND
+    assert _count(repository, "ImportSnapshot") == 0
+    # Only the pre-existing frozen originals are managed; no declaration exists.
+    assert _count(repository, "ManagedFile") == len(group.file_ids)
+
+
+def _owned_context(repository: ProductRepository) -> str:
+    """A context bound to an installation that belongs to ``SCOPE``."""
+    installation_id = _uid(730)
+    with repository.unit_of_work() as uow:
+        uow.insert_object_bytes(
+            "GameInstallation",
+            schema_version="product-contract/0.4",
+            raw=canonical_json({
+                "id": installation_id,
+                "schema_version": "product-contract/0.4",
+                "created_at": utc_now(),
+                "created_by_task_id": None,
+                "series_id": installation_id,
+                "version": 1,
+                "revision": 1,
+                "user_scope_id": SCOPE,
+                "game_id": _uid(731),
+                "origin": "user_provided",
+                "platform": {
+                    "value_state": "unknown", "value": None,
+                    "unknown_reason": "not_provided", "candidates": [],
+                    "provenance": [], "acquisition_status": "not_attempted",
+                    "attempts": [], "applicability_note": None, "resolution": None,
+                },
+                "private_path_ref": None,
+            }),
+            object_id=installation_id,
+            series_id=installation_id,
+            version=1,
+        )
+    context_id = _uid(732)
+    with repository.unit_of_work() as uow:
+        uow.insert_object_bytes(
+            "GameContext",
+            schema_version="product-contract/0.4",
+            raw=canonical_json({
+                "id": context_id,
+                "schema_version": "product-contract/0.4",
+                "created_at": utc_now(),
+                "created_by_task_id": None,
+                "series_id": context_id,
+                "version": 1,
+                "game_id": _uid(731),
+                "game_revision_id": _uid(733),
+                "installation_id": installation_id,
+                "platform": {
+                    "value_state": "unknown", "value": None,
+                    "unknown_reason": "not_provided", "candidates": [],
+                    "provenance": [], "acquisition_status": "not_attempted",
+                    "attempts": [], "applicability_note": None, "resolution": None,
+                },
+                "build_identifiers": [],
+                "process_candidates": [],
+                "selected_process": None,
+                "adapter_id": None,
+                "adapter_version": None,
+                "capabilities": {
+                    "can_identify": _not_run("adapter.identify"),
+                    "can_read_config": _not_run("adapter.read_config"),
+                    "can_bind_capture": _not_run("adapter.bind_capture"),
+                },
+                "checks": [],
+            }),
+            object_id=context_id,
+            series_id=context_id,
+            version=1,
+        )
+    return context_id
+
+
 def test_import_never_calls_a_provider_and_is_not_the_original_run(tmp_path):
     files, repository = _service(tmp_path)
     context_id = _stored_context(repository)

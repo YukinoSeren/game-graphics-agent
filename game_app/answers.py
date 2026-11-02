@@ -206,6 +206,7 @@ class AnswerService:
                 return replay
 
             request = self._load_request(uow, response_input.request_id)
+            self._require_task_owner(uow, request.source_task_id, context.user_scope_id)
             if response_input.expected_request_version != request.version:
                 raise ContractError(
                     ErrorCode.INFORMATION_REQUEST_VERSION_CONFLICT,
@@ -375,6 +376,12 @@ class AnswerService:
                 "this question predates the fixed-root contract and cannot be extended",
             ) from error
 
+    @staticmethod
+    def _require_task_owner(
+        uow: UnitOfWork, task_id: str, user_scope_id: str
+    ) -> None:
+        _require_task_owner(uow, task_id, user_scope_id)
+
     def _write_request_version(
         self,
         uow: UnitOfWork,
@@ -479,6 +486,7 @@ class AmendmentService:
         if not self._has_registered(context):
             with self.repository.unit_of_work() as uow:
                 source = self._load_request(uow, request.source_request_id)
+                _require_task_owner(uow, source.source_task_id, context.user_scope_id)
                 self._check_source(uow, source, request)
                 root, _root_version = self._root(uow, source)
                 self._selected_fields(root, request.field_paths)
@@ -506,6 +514,7 @@ class AmendmentService:
                 request=request,
                 ids=ids,
                 managed=managed,
+                user_scope_id=context.user_scope_id,
             ),
             hooks=hooks,
         )
@@ -518,8 +527,10 @@ class AmendmentService:
         request: CreateInformationAmendmentRequest,
         ids: Mapping[str, str],
         managed: Sequence[Any],
+        user_scope_id: str,
     ) -> list[ObjectRef]:
         source = self._load_request(uow, request.source_request_id)
+        _require_task_owner(uow, source.source_task_id, user_scope_id)
         self._check_source(uow, source, request)
         root, root_version = self._root(uow, source)
         fields = self._selected_fields(root, request.field_paths)
@@ -729,6 +740,24 @@ class AmendmentService:
 
 
 # -- pure helpers -------------------------------------------------------------
+
+
+def _require_task_owner(
+    uow: UnitOfWork, task_id: str, user_scope_id: str
+) -> None:
+    """Only the owner of the asking task may read or extend its question.
+
+    Another user's question is indistinguishable from a missing one, so neither
+    its existence nor its content leaks.  This also protects the wake path: a
+    stranger can never change someone else's task input, state or events.
+    """
+    rows = uow.query("SELECT user_scope_id FROM tasks WHERE task_id=?", (task_id,))
+    if not rows or rows[0]["user_scope_id"] != user_scope_id:
+        raise ContractError(
+            ErrorCode.RESOURCE_NOT_FOUND,
+            "the requested question is not available",
+        )
+
 
 _ID_NAMESPACE = UUID("9c1d2e3f-4a5b-4c6d-8e7f-0a1b2c3d4e5f")
 

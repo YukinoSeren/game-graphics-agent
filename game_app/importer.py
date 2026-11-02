@@ -1456,7 +1456,7 @@ class ImportPublisher:
         created_by_task_id: str | None = None,
     ) -> ImportPublishResult:
         mappings = [self._identity_mapping(mapping_id) for mapping_id in identity_mapping_ids]
-        self._require_game_context(game_context_id)
+        self._require_game_context(game_context_id, user_scope_id)
         fingerprint = import_fingerprint(frozen.manifest)
         context_hash = mapping_context_hash(mapping_version, identity_mapping_ids)
         snapshot_id = _snapshot_id(fingerprint, mapping_version, context_hash)
@@ -1729,7 +1729,16 @@ class ImportPublisher:
             )
         return IdentityMapping.model_validate_json(stored.payload_bytes)
 
-    def _require_game_context(self, game_context_id: str) -> None:
+    def _require_game_context(
+        self, game_context_id: str, user_scope_id: str
+    ) -> None:
+        """The context must exist *and* be consumable by this user.
+
+        A context bound to an installation belongs to that installation's
+        owner; another user's context is indistinguishable from a missing one.
+        A context with no installation is a public-collection context and is
+        readable by anyone, exactly as the game catalog is.
+        """
         stored = self.repository.find_object("GameContext", game_context_id)
         if stored is None:
             raise ContractError(
@@ -1738,6 +1747,25 @@ class ImportPublisher:
                 field_errors=[FieldError(
                     path="game_context_id", code="reference", message="unknown context",
                 )],
+            )
+        installation_id = stored.payload.get("installation_id")
+        if installation_id is None:
+            return
+        with self.repository.unit_of_work() as uow:
+            installation = uow.latest_for_series("GameInstallation", installation_id)
+        if installation is None:
+            raise ContractError(
+                ErrorCode.REFERENCE_INVALID,
+                "the context names an installation that does not exist",
+                field_errors=[FieldError(
+                    path="game_context_id", code="reference",
+                    message="unknown installation",
+                )],
+            )
+        if installation.payload.get("user_scope_id") != user_scope_id:
+            raise ContractError(
+                ErrorCode.RESOURCE_NOT_FOUND,
+                "the referenced game context is not available",
             )
 
     def _legacy_run_id(self, frozen: FrozenGroup) -> str | None:

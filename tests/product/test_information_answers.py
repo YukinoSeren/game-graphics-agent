@@ -469,6 +469,58 @@ def test_cancel_first_then_late_answer_does_not_revive_the_task(tmp_path):
     assert updated.fields[0].answer_state is AnswerState.answered
 
 
+def test_another_users_question_cannot_be_answered(tmp_path):
+    """Answering someone else's question must not wake their task either."""
+    probe = StubProbe(values={"cpu": "Example CPU"}, failures={"device_form": "PROBE_FAILED"})
+    repository, files, device, tasks, answers, _ = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "device_form"])
+    tasks.run_once()
+    request = _request(repository, _request_ids(repository, accepted.task_id)[0])
+    before = _counts(repository, accepted.task_id)
+    stranger = MutationContext(
+        user_scope_id="b" * 32, idempotency_key="stranger", request_id=_uid(998),
+    )
+
+    with pytest.raises(ContractError) as caught:
+        answers.answer_information(
+            _answer_input(request, answers={"device_form": "Desktop PC"}), stranger
+        )
+
+    assert caught.value.code is ErrorCode.RESOURCE_NOT_FOUND
+    with repository.unit_of_work() as uow:
+        assert len(uow.iter_objects("InformationResponse")) == 0
+    assert _counts(repository, accepted.task_id) == before
+
+
+def test_another_users_handled_question_cannot_be_amended(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU"}, failures={"device_form": "PROBE_FAILED"})
+    repository, files, device, tasks, answers, amendments = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "device_form"])
+    tasks.run_once()
+    request = _request(repository, _request_ids(repository, accepted.task_id)[0])
+    _answer(answers, request, answers={"device_form": "Desktop PC"}, key="answer-root")
+    resolved = _request(repository, request.id)
+    stranger = MutationContext(
+        user_scope_id="b" * 32, idempotency_key="stranger", request_id=_uid(997),
+    )
+
+    with pytest.raises(ContractError) as caught:
+        amendments.create_information_amendment(
+            {
+                "source_request_id": resolved.id,
+                "expected_request_version": resolved.version,
+                "expected_context_revision": resolved.expected_context_revision,
+                "field_paths": ["device_form"],
+                "reason": "not my question",
+            },
+            stranger,
+        )
+
+    assert caught.value.code is ErrorCode.RESOURCE_NOT_FOUND
+    with repository.unit_of_work() as uow:
+        assert len(uow.iter_objects("InformationAmendment")) == 0
+
+
 def test_answer_replays_the_same_key(tmp_path):
     probe = StubProbe(values={"cpu": "Example CPU"}, failures={"device_form": "PROBE_FAILED"})
     repository, files, device, tasks, answers, _ = _env(tmp_path, probe)

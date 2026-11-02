@@ -217,6 +217,26 @@ CREATE TABLE IF NOT EXISTS configuration_bindings (
 > 会话、协议等版本对象仍走 `objects`/`aggregate_snapshots`；上表只存段/绑定的可重建投影。
 > 若实现需要额外列，追加在本迁移内并在此文档同步说明。
 
+### 6.1 A-2 落地时的存储补充
+
+`configuration_bindings` 追加三列（迁移 `0010` 内，仍只追加）：
+
+- `binding_id`：不可变 `ConfigurationBinding` 记录的 object id；主键仍是 `(segment_id, binding_revision)`。
+- `time_basis`、`unit`：重建 `BindingRange` 所需，`unit` 限 `s`/`ms`。
+
+`session_segments.segment_id` 同时是 `SessionSegment` 的对象 id：`objects` 保存首个 revision，
+每个 revision 另存一条 `aggregate_snapshots`（`(SessionSegment, id, revision)`）。
+`PlaySession` 同样以 `objects` 行 + `aggregate_snapshots` 保存，当前 revision 由 `aggregate_heads` 给出；
+读取一律经 `model_validate_json`。
+
+`MetricDefinition` 的惰性登记复用迁移 `0002` 已有的
+`metric_definition_rules(metric_key, registry_version, rule_hash)` 唯一键：`registry_version` 为
+`project-metrics/1`，`definition_version` 为 `v1`，目录 key 为 `metric_key/definition_version`。
+同一规则 hash 在同一 registry 下复用一个定义 ID；不新增第二套规则表。
+
+段的结束点由后台时钟差（`started_at` → 当前后台 `clock()`）计算，浏览器时间、导入时间与日志时钟
+都不参与；差值非有限或不大于 `start_s` 时返回 `PRECONDITION_UNVERIFIED`，段保持开放。
+
 ---
 
 ## 7. 完成定义

@@ -561,6 +561,64 @@ class TaskService:
             return accepted
 
     # -- checkpoints ---------------------------------------------------------
+    def append_input_revision_and_wake(
+        self,
+        uow: UnitOfWork,
+        task_id: str,
+        *,
+        cause_ref: ObjectRef,
+        related: Sequence[ObjectRef] = (),
+        cause: str = "input_supplied",
+    ) -> bool:
+        """Append a merged input revision and queue a waiting task.
+
+        Called inside the answer's transaction with its ``uow``: the input, the
+        new revision, the state change and the event commit together.  A
+        terminal task is never revived and no write happens for it.
+        """
+        row = self._task_row(uow, task_id)
+        state = TaskState(row["state"])
+        if state in TERMINAL_TASK_STATES:
+            return False
+        if state is not TaskState.waiting_input:
+            return False
+        current = int(row["current_input_revision"])
+        input_row = uow.query(
+            "SELECT input FROM task_inputs WHERE task_id=? AND input_revision=?",
+            (task_id, current),
+        )
+        if not input_row:
+            raise ContractError(
+                ErrorCode.PRECONDITION_UNVERIFIED,
+                "the waiting task has no durable input to continue from",
+            )
+        new_revision = current + 1
+        now = self.clock()
+        uow.execute(
+            "INSERT INTO task_inputs(task_id, input_revision, input, supersedes_revision,"
+            " cause_ref, created_at) VALUES(?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                new_revision,
+                input_row[0]["input"],
+                current,
+                canonical_json(cause_ref.model_dump(mode="json")).decode("utf-8"),
+                now,
+            ),
+        )
+        uow.execute(
+            "UPDATE tasks SET current_input_revision=?, state='queued', revision=?,"
+            " updated_at=? WHERE task_id=?",
+            (new_revision, row["revision"] + 1, now, task_id),
+        )
+        self._append_event(
+            uow, task_id, self._next_sequence(uow, task_id), new_revision,
+            TaskState.waiting_input, TaskState.queued, cause,
+            related=related,
+            active_elapsed=row["active_elapsed_seconds"],
+        )
+        return True
+
     def record_checkpoint(self, task_id: str, completed_steps: Sequence[str]) -> str:
         with self.repository.unit_of_work() as uow:
             row = self._task_row(uow, task_id)

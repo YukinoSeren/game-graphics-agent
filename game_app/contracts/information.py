@@ -68,4 +68,87 @@ class InformationRequest(StrictModel):
         return self
 
 
-__all__ = ["RequestedField", "InformationRequest"]
+__all__ = [
+    "RequestedField",
+    "InformationRequest",
+    "InformationResponseInput",
+    "InformationResponse",
+    "CreateInformationAmendmentRequest",
+    "InformationAmendment",
+]
+
+
+class InformationResponseInput(StrictModel):
+    """A submitted answer set; the two expected revisions are both checked."""
+
+    request_id: ID
+    expected_request_version: Revision
+    expected_context_revision: Revision
+    answers: dict[str, Scalar]
+    skipped_fields: list[str]
+    raw_text: str
+    conflict_selections: dict[str, int]
+
+    @model_validator(mode="after")
+    def sets_do_not_cross(self) -> "InformationResponseInput":
+        overlap = set(self.answers) & set(self.skipped_fields)
+        if overlap:
+            raise ValueError(
+                "a field is either answered or skipped, never both: "
+                + ", ".join(sorted(overlap))
+            )
+        extra = set(self.conflict_selections) - set(self.answers)
+        if extra:
+            raise ValueError(
+                "a conflict selection belongs to an answered field: "
+                + ", ".join(sorted(extra))
+            )
+        if any(index < 0 for index in self.conflict_selections.values()):
+            raise ValueError("conflict selection indexes are non-negative")
+        return self
+
+
+class InformationResponse(StrictModel):
+    id: ID
+    schema_version: str
+    created_at: Timestamp
+    created_by_task_id: ID | None
+    request_id: ID
+    expected_request_version: Revision
+    expected_context_revision: Revision
+    answers: dict[str, Scalar]
+    skipped_fields: list[str]
+    raw_text: str
+    conflict_selections: dict[str, int]
+    submitted_at: Timestamp
+    result_refs: list[ObjectRef]
+    post_request_version: Revision
+    post_context_revision: Revision
+
+
+class CreateInformationAmendmentRequest(StrictModel):
+    source_request_id: ID
+    expected_request_version: Revision
+    expected_context_revision: Revision
+    field_paths: list[str]
+    reason: str
+
+    @model_validator(mode="after")
+    def fields_are_distinct_and_a_reason_is_given(self) -> "CreateInformationAmendmentRequest":
+        if not self.field_paths:
+            raise ValueError("an amendment names at least one field")
+        if len(set(self.field_paths)) != len(self.field_paths):
+            raise ValueError("an amendment names each field once")
+        if not self.reason.strip():
+            raise ValueError("an amendment states a reason")
+        return self
+
+
+class InformationAmendment(StrictModel):
+    id: ID
+    schema_version: str
+    created_at: Timestamp
+    created_by_task_id: ID | None
+    input: CreateInformationAmendmentRequest
+    new_request_id: ID
+    declaration_file_id: ID

@@ -1,0 +1,727 @@
+"""DEV-T04: answer normalisation, waiting-task continuation and amendments."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import threading
+
+import pytest
+from pydantic import ValidationError
+
+from game_app.answers import AmendmentService, AnswerService
+from game_app.contracts.common import (
+    EvidenceRef,
+    FieldCandidate,
+    FieldValue,
+    MutationContext,
+    Provenance,
+)
+from game_app.contracts.device import (
+    AdapterCapabilities,
+    DeviceSnapshot,
+    DisplayContext,
+    GpuSnapshot,
+    Resolution,
+)
+from game_app.contracts.enums import (
+    AcquisitionMethod,
+    AcquisitionStatus,
+    AnswerState,
+    CheckStatus,
+    InformationContinuationMode,
+    InformationRequestState,
+    TaskState,
+    ValueState,
+)
+from game_app.contracts.information import (
+    InformationRequest,
+    InformationResponseInput,
+    RequestedField,
+)
+from game_app.contracts.primitives import (
+    InformationRequestRevisionRef,
+    ObjectRef,
+    VersionRef,
+    utc_now,
+)
+from game_app.device import DeviceService, ProbeReading
+from game_app.errors import ContractError, ErrorCode
+from game_app.files import FileService
+from game_app.repository import ProductRepository, canonical_json
+from game_app.tasks import TaskService
+from tests.product.support.spies import SpyProvider
+
+USER = "a" * 32
+
+
+def _uid(value: int) -> str:
+    return f"{value:032x}"
+
+
+def _ctx(key: str = "answer-1") -> MutationContext:
+    return MutationContext(user_scope_id=USER, idempotency_key=key, request_id=_uid(991))
+
+
+class StubProbe:
+    def __init__(self, values=None, failures=None):
+        self.values = values or {}
+        self.failures = failures or {}
+        self.calls = []
+
+    def probe(self, field_paths, *, timeout):
+        self.calls.append(list(field_paths))
+        readings = []
+        for path in field_paths:
+            if path in self.failures:
+                readings.append(ProbeReading(
+                    field_path=path, status="failed", raw=b"",
+                    error_code=self.failures[path],
+                ))
+                continue
+            value = self.values.get(path)
+            if value is None:
+                readings.append(ProbeReading(
+                    field_path=path, status="failed", raw=b"",
+                    error_code="PROBE_UNAVAILABLE",
+                ))
+            else:
+                readings.append(ProbeReading(
+                    field_path=path, status="succeeded",
+                    raw=str(value).encode("utf-8"), text=str(value),
+                ))
+        return readings
+
+
+def _env(tmp_path, probe):
+    repository = ProductRepository(tmp_path / "product.sqlite3")
+    repository.migrate()
+    files = FileService(repository, tmp_path / "managed")
+    device = DeviceService(repository, files, probe)
+    tasks = TaskService(repository, provider=SpyProvider(), files=files)
+    tasks.handlers["device_scan"] = device.handle
+    answers = AnswerService(repository, files, tasks=tasks)
+    amendments = AmendmentService(repository, files)
+    return repository, files, device, tasks, answers, amendments
+
+
+def _scan(tasks, field_paths, *, key="scan-key"):
+    return tasks.register_task(
+        {"kind": "device_scan", "game_context_id": None, "field_paths": field_paths},
+        _ctx(key),
+    )
+
+
+def _request_ids(repository, task_id):
+    with repository.unit_of_work() as uow:
+        row = uow.query("SELECT * FROM tasks WHERE task_id=?", (task_id,))[0]
+    refs = json.loads(row["result_refs"] or "[]")
+    return [ref["entity_id"] for ref in refs if ref["entity_type"] == "InformationRequest"]
+
+
+def _request(repository, request_id) -> InformationRequest:
+    with repository.unit_of_work() as uow:
+        head = uow.get_head("InformationRequest", request_id)
+        if head is None:
+            stored = uow.find_object("InformationRequest", request_id)
+            return InformationRequest.model_validate_json(stored.payload_bytes)
+        payload = uow.get_snapshot("InformationRequest", request_id, head)
+    return InformationRequest.model_validate_json(canonical_json(payload))
+
+
+def _task_row(repository, task_id):
+    with repository.unit_of_work() as uow:
+        return uow.query("SELECT * FROM tasks WHERE task_id=?", (task_id,))[0]
+
+
+def _counts(repository, task_id):
+    with repository.unit_of_work() as uow:
+        inputs = uow.query(
+            "SELECT COUNT(*) AS n FROM task_inputs WHERE task_id=?", (task_id,)
+        )[0]["n"]
+        events = uow.query(
+            "SELECT COUNT(*) AS n FROM task_events WHERE task_id=?", (task_id,)
+        )[0]["n"]
+        row = uow.query("SELECT revision FROM tasks WHERE task_id=?", (task_id,))[0]
+    return inputs, events, row["revision"]
+
+
+def _answer_input(request, answers=None, *, skipped=None, selections=None,
+                  version=None, context=None, raw_text=""):
+    return InformationResponseInput.model_validate_json(canonical_json({
+        "request_id": request.id,
+        "expected_request_version": request.version if version is None else version,
+        "expected_context_revision": (
+            request.expected_context_revision if context is None else context
+        ),
+        "answers": answers or {},
+        "skipped_fields": skipped or [],
+        "raw_text": raw_text,
+        "conflict_selections": selections or {},
+    }))
+
+
+def _answer(service, request, *, key="answer-1", **kwargs):
+    return service.answer_information(_answer_input(request, **kwargs), _ctx(key))
+
+
+def _snapshot_ref(request) -> VersionRef:
+    return next(
+        ref for ref in request.context_refs if ref.entity_type == "DeviceSnapshot"
+    )
+
+
+def _snapshot(repository, request) -> DeviceSnapshot:
+    stored = repository.get_object("DeviceSnapshot", _snapshot_ref(request).entity_id)
+    return DeviceSnapshot.model_validate_json(stored.payload_bytes)
+
+
+def _latest_snapshot(repository, series_id) -> DeviceSnapshot:
+    with repository.unit_of_work() as uow:
+        stored = uow.latest_for_series("DeviceSnapshot", series_id)
+    return DeviceSnapshot.model_validate_json(stored.payload_bytes)
+
+
+# --- answers -----------------------------------------------------------------
+
+
+def test_partial_answer_keeps_unanswered_fields_and_the_task_waiting(tmp_path):
+    probe = StubProbe(
+        values={"cpu": "Example CPU"},
+        failures={
+            "gpus.0.raw_name": "PROBE_FAILED",
+            "device_form": "PROBE_FAILED",
+            "memory_bytes": "PROBE_FAILED",
+        },
+    )
+    repository, files, device, tasks, answers, _ = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "gpus.0.raw_name", "device_form", "memory_bytes"])
+    tasks.run_once()
+    request = _request(repository, _request_ids(repository, accepted.task_id)[0])
+
+    _answer(answers, request, answers={"gpus.0.raw_name": "Synthetic GPU"})
+
+    updated = _request(repository, request.id)
+    states = {field.field_path: field.answer_state for field in updated.fields}
+    assert states["gpus.0.raw_name"] is AnswerState.answered
+    assert states["device_form"] is AnswerState.unanswered
+    assert states["memory_bytes"] is AnswerState.unanswered
+    assert updated.state is InformationRequestState.partially_answered
+    assert updated.version == 2
+    assert updated.expected_context_revision == 2
+    assert _task_row(repository, accepted.task_id)["state"] == "waiting_input"
+    snapshot = _latest_snapshot(repository, _snapshot(repository, request).series_id)
+    assert snapshot.version == 2
+    assert snapshot.gpus[0].raw_name.value == "Synthetic GPU"
+
+
+def test_a_value_that_cannot_be_normalised_stays_unresolved(tmp_path):
+    probe = StubProbe(
+        values={"cpu": "Example CPU"},
+        failures={"memory_bytes": "PROBE_FAILED"},
+    )
+    repository, files, device, tasks, answers, _ = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "memory_bytes"])
+    tasks.run_once()
+    request = _request(repository, _request_ids(repository, accepted.task_id)[0])
+
+    _answer(answers, request, answers={"memory_bytes": "16 GB"})
+
+    updated = _request(repository, request.id)
+    field = next(item for item in updated.fields if item.field_path == "memory_bytes")
+    assert field.answer_state is AnswerState.unresolved
+    assert field.value.value_state is ValueState.unknown
+    assert field.value.value is None
+    # The player's words are preserved in the response, never in a known field.
+    with repository.unit_of_work() as uow:
+        stored = uow.iter_objects("InformationResponse")[-1]
+    assert stored.payload["answers"]["memory_bytes"] == "16 GB"
+    assert updated.state is InformationRequestState.partially_answered
+
+
+def test_conflict_selection_resolves_the_value_and_keeps_old_evidence(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU"}, failures={"device_form": "PROBE_FAILED"})
+    repository, files, device, tasks, answers, _ = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "device_form"])
+    tasks.run_once()
+
+    evidence_data = b"two conflicting probe originals"
+    file_id = files.store_artifact(
+        evidence_data, relative_name="probe/conflict.txt", stable_key="probe:conflict"
+    )
+    evidence = EvidenceRef(
+        kind="artifact",
+        file_id=file_id,
+        content_hash=hashlib.sha256(evidence_data).hexdigest(),
+        locator="probe/conflict.txt",
+    )
+    provenance = Provenance(
+        method=AcquisitionMethod.system_probe,
+        observed_at=None,
+        recorded_at=utc_now(),
+        evidence_refs=[evidence],
+        note="probe reading",
+    )
+    conflicting = FieldValue[str](
+        value_state=ValueState.conflicting,
+        value=None,
+        candidates=[
+            FieldCandidate[str](value="Desktop PC", provenance=[provenance]),
+            FieldCandidate[str](value="Laptop", provenance=[provenance]),
+        ],
+        provenance=[],
+        acquisition_status=AcquisitionStatus.succeeded,
+    )
+    unknown = FieldValue[str](
+        value_state=ValueState.unknown,
+        value=None,
+        unknown_reason="not_provided",
+        acquisition_status=AcquisitionStatus.not_attempted,
+    )
+    snapshot = DeviceSnapshot(
+        id=_uid(600),
+        schema_version="product-contract/0.4",
+        created_at=utc_now(),
+        created_by_task_id=None,
+        series_id=_uid(601),
+        version=1,
+        device_series_id=_uid(602),
+        captured_at=utc_now(),
+        gpus=[],
+        selected_gpu_id=None,
+        cpu=unknown,
+        memory_bytes=unknown,
+        device_form=conflicting,
+        os_version=unknown,
+        display=DisplayContext(
+            desktop_resolution=FieldValue[Resolution](
+                value_state=ValueState.unknown, value=None,
+                unknown_reason="not_provided",
+                acquisition_status=AcquisitionStatus.not_attempted,
+            ),
+            refresh_hz=FieldValue[float](
+                value_state=ValueState.unknown, value=None,
+                unknown_reason="not_provided",
+                acquisition_status=AcquisitionStatus.not_attempted,
+            ),
+        ),
+        power_context={},
+        checks=[],
+    )
+    request = InformationRequest(
+        id=_uid(603),
+        schema_version="product-contract/0.4",
+        created_at=utc_now(),
+        created_by_task_id=None,
+        source_task_id=accepted.task_id,
+        version=1,
+        context_refs=[VersionRef(
+            entity_type="DeviceSnapshot", entity_id=snapshot.id,
+            series_id=snapshot.series_id, version=snapshot.version,
+        )],
+        expected_context_revision=1,
+        fields=[RequestedField(
+            field_path="device_form",
+            purpose="device form conflict",
+            required_for=[],
+            candidates=["Desktop PC", "Laptop"],
+            answer_state=AnswerState.unanswered,
+            value=conflicting,
+        )],
+        state=InformationRequestState.open,
+        result_refs=[],
+        superseded_by_request_id=None,
+        continuation_mode=InformationContinuationMode.source_task,
+        amends_request_id=None,
+        amendment_root_ref=None,
+    )
+    with repository.unit_of_work() as uow:
+        uow.insert_versioned("DeviceSnapshot", snapshot)
+        uow.insert_object("InformationRequest", request)
+
+    _answer(answers, request, answers={"device_form": "Laptop"},
+            selections={"device_form": 1})
+
+    updated = _request(repository, request.id)
+    field = updated.fields[0]
+    assert field.answer_state is AnswerState.answered
+    assert field.value.value_state is ValueState.known
+    assert field.value.value == "Laptop"
+    assert len(field.value.candidates) == 2
+    assert field.value.resolution is not None
+    assert field.value.resolution.prior_object_ref.entity_id == snapshot.id
+    assert field.value.resolution.selected_provenance_indexes == [0]
+    derived = _latest_snapshot(repository, snapshot.series_id)
+    assert derived.version == 2
+    assert derived.device_form.value == "Laptop"
+    assert derived.device_form.resolution is not None
+    assert len(derived.device_form.candidates) == 2
+
+
+def test_skipping_the_last_field_marks_skipped_and_wakes_the_task(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU"},
+                      failures={"gpus.0.raw_name": "PROBE_FAILED",
+                                "memory_bytes": "PROBE_FAILED"})
+    repository, files, device, tasks, answers, _ = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "gpus.0.raw_name", "memory_bytes"])
+    tasks.run_once()
+    request = _request(repository, _request_ids(repository, accepted.task_id)[0])
+    inputs_before, events_before, revision_before = _counts(repository, accepted.task_id)
+
+    _answer(
+        answers, request,
+        skipped=["gpus.0.raw_name", "memory_bytes"],
+    )
+
+    updated = _request(repository, request.id)
+    assert updated.state is InformationRequestState.skipped
+    assert all(field.answer_state is AnswerState.skipped for field in updated.fields)
+    row = _task_row(repository, accepted.task_id)
+    assert row["state"] == "queued"
+    inputs_after, events_after, revision_after = _counts(repository, accepted.task_id)
+    assert inputs_after == inputs_before + 1
+    assert events_after == events_before + 1
+    assert revision_after == revision_before + 1
+    with repository.unit_of_work() as uow:
+        newest = uow.query(
+            "SELECT * FROM task_inputs WHERE task_id=? ORDER BY input_revision DESC LIMIT 1",
+            (accepted.task_id,),
+        )[0]
+        event = uow.query(
+            "SELECT * FROM task_events WHERE task_id=? ORDER BY sequence DESC LIMIT 1",
+            (accepted.task_id,),
+        )[0]
+    assert newest["input_revision"] == inputs_before + 1
+    assert newest["supersedes_revision"] == inputs_before
+    assert json.loads(newest["cause_ref"])["entity_type"] == "InformationResponse"
+    assert event["from_state"] == "waiting_input"
+    assert event["to_state"] == "queued"
+
+
+def test_stale_versions_are_rejected_without_any_write(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU"}, failures={"device_form": "PROBE_FAILED"})
+    repository, files, device, tasks, answers, _ = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "device_form"])
+    tasks.run_once()
+    request = _request(repository, _request_ids(repository, accepted.task_id)[0])
+
+    for overrides, expected in (
+        ({"version": 99}, ErrorCode.INFORMATION_REQUEST_VERSION_CONFLICT),
+        ({"context": 99}, ErrorCode.INFORMATION_CONTEXT_CHANGED),
+    ):
+        with pytest.raises(ContractError) as caught:
+            _answer(answers, request, answers={"device_form": "Desktop PC"}, **overrides)
+        assert caught.value.code is expected
+
+    assert _request(repository, request.id) == request
+    with repository.unit_of_work() as uow:
+        assert len(uow.iter_objects("InformationResponse")) == 0
+    assert _task_row(repository, accepted.task_id)["state"] == "waiting_input"
+
+
+def test_answers_and_skips_cannot_cross_or_name_unknown_fields(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU"}, failures={"device_form": "PROBE_FAILED"})
+    repository, files, device, tasks, answers, _ = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "device_form"])
+    tasks.run_once()
+    request = _request(repository, _request_ids(repository, accepted.task_id)[0])
+
+    with pytest.raises(ValidationError):
+        _answer_input(
+            request,
+            answers={"device_form": "Desktop PC"},
+            skipped=["device_form"],
+        )
+    with pytest.raises(ContractError) as caught:
+        _answer(answers, request, answers={"gpus.0.raw_name": "GPU"})
+    assert caught.value.code is ErrorCode.INPUT_VALIDATION_FAILED
+
+
+def test_answering_first_then_cancelling_stops_the_queued_task(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU"}, failures={"device_form": "PROBE_FAILED"})
+    repository, files, device, tasks, answers, _ = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "device_form"], key="scan-a")
+    tasks.run_once()
+    request = _request(repository, _request_ids(repository, accepted.task_id)[0])
+
+    _answer(answers, request, answers={"device_form": "Desktop PC"}, key="answer-a")
+    assert _task_row(repository, accepted.task_id)["state"] == "queued"
+
+    tasks.cancel_task(accepted.task_id, _ctx("cancel-a"))
+    assert _task_row(repository, accepted.task_id)["state"] == "cancelled"
+
+
+def test_cancel_first_then_late_answer_does_not_revive_the_task(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU"}, failures={"device_form": "PROBE_FAILED"})
+    repository, files, device, tasks, answers, _ = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "device_form"], key="scan-b")
+    tasks.run_once()
+    request = _request(repository, _request_ids(repository, accepted.task_id)[0])
+    tasks.cancel_task(accepted.task_id, _ctx("cancel-b"))
+    before = _counts(repository, accepted.task_id)
+
+    _answer(answers, request, answers={"device_form": "Desktop PC"}, key="answer-b")
+
+    row = _task_row(repository, accepted.task_id)
+    assert row["state"] == "cancelled"
+    assert _counts(repository, accepted.task_id) == before
+    updated = _request(repository, request.id)
+    assert updated.fields[0].answer_state is AnswerState.answered
+
+
+def test_answer_replays_the_same_key(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU"}, failures={"device_form": "PROBE_FAILED"})
+    repository, files, device, tasks, answers, _ = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "device_form"])
+    tasks.run_once()
+    request = _request(repository, _request_ids(repository, accepted.task_id)[0])
+    response_input = _answer_input(request, answers={"device_form": "Desktop PC"})
+
+    first = answers.answer_information(response_input, _ctx("same"))
+    second = answers.answer_information(response_input, _ctx("same"))
+
+    assert [ref.entity_id for ref in first.refs] == [ref.entity_id for ref in second.refs]
+    with repository.unit_of_work() as uow:
+        assert len(uow.iter_objects("InformationResponse")) == 1
+
+
+# --- amendments --------------------------------------------------------------
+
+
+def test_facts_only_amendment_writes_no_source_task_rows(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU"},
+                      failures={"gpus.0.raw_name": "PROBE_FAILED",
+                                "gpus.0.vram_bytes": "PROBE_FAILED"})
+    repository, files, device, tasks, answers, amendments = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "gpus.0.raw_name", "gpus.0.vram_bytes"])
+    tasks.run_once()
+    request = _request(repository, _request_ids(repository, accepted.task_id)[0])
+    _answer(
+        answers, request,
+        answers={"gpus.0.raw_name": "Synthetic GPU", "gpus.0.vram_bytes": 8},
+        key="answer-root",
+    )
+    resolved = _request(repository, request.id)
+    assert resolved.state is InformationRequestState.resolved
+    before = _counts(repository, accepted.task_id)
+
+    amendment = amendments.create_information_amendment(
+        {
+            "source_request_id": resolved.id,
+            "expected_request_version": resolved.version,
+            "expected_context_revision": resolved.expected_context_revision,
+            "field_paths": ["gpus.0.raw_name"],
+            "reason": "clarify the GPU name",
+        },
+        _ctx("amend-1"),
+    )
+
+    assert _counts(repository, accepted.task_id) == before
+    new_request_id = amendment.refs[1].entity_id
+    new_request = _request(repository, new_request_id)
+    assert new_request.version == 1
+    assert new_request.expected_context_revision == 1
+    assert new_request.continuation_mode is InformationContinuationMode.facts_only
+    assert new_request.amends_request_id == resolved.id
+    assert new_request.source_task_id == accepted.task_id
+    assert new_request.amendment_root_ref == InformationRequestRevisionRef(
+        request_id=resolved.id, version=resolved.version
+    )
+    assert new_request.state is InformationRequestState.open
+    assert new_request.fields[0].answer_state is AnswerState.unanswered
+
+    _answer(answers, new_request, answers={"gpus.0.raw_name": "Synthetic GPU"}, key="answer-2")
+
+    assert _counts(repository, accepted.task_id) == before
+
+
+def test_two_round_amendment_reaches_fields_outside_the_direct_source(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU"},
+                      failures={"gpus.0.raw_name": "PROBE_FAILED",
+                                "gpus.0.vram_bytes": "PROBE_FAILED"})
+    repository, files, device, tasks, answers, amendments = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "gpus.0.raw_name", "gpus.0.vram_bytes"])
+    tasks.run_once()
+    root = _request(repository, _request_ids(repository, accepted.task_id)[0])
+    _answer(
+        answers, root,
+        answers={"gpus.0.raw_name": "Synthetic GPU", "gpus.0.vram_bytes": 8},
+        key="answer-root",
+    )
+    root = _request(repository, root.id)
+    first = amendments.create_information_amendment(
+        {
+            "source_request_id": root.id,
+            "expected_request_version": root.version,
+            "expected_context_revision": root.expected_context_revision,
+            "field_paths": ["gpus.0.raw_name"],
+            "reason": "correct the GPU name",
+        },
+        _ctx("amend-a"),
+    )
+    first_request = _request(repository, first.refs[1].entity_id)
+    _answer(answers, first_request,
+            answers={"gpus.0.raw_name": "Corrected GPU"}, key="answer-a")
+    first_request = _request(repository, first_request.id)
+
+    second = amendments.create_information_amendment(
+        {
+            "source_request_id": first_request.id,
+            "expected_request_version": first_request.version,
+            "expected_context_revision": first_request.expected_context_revision,
+            "field_paths": ["gpus.0.vram_bytes"],
+            "reason": "add the VRAM figure",
+        },
+        _ctx("amend-b"),
+    )
+
+    second_request = _request(repository, second.refs[1].entity_id)
+    assert [field.field_path for field in second_request.fields] == ["gpus.0.vram_bytes"]
+    # The root domain is still the original question, so the second round is
+    # reachable even though the direct source only asked about the GPU name.
+    assert second_request.amendment_root_ref == InformationRequestRevisionRef(
+        request_id=root.id, version=root.version
+    )
+    assert {field.field_path for field in _request(repository, root.id).fields} == {
+        "gpus.0.raw_name", "gpus.0.vram_bytes",
+    }
+    # The first correction still stands as its own fact.
+    assert _request(repository, first_request.id).fields[0].answer_state is AnswerState.answered
+
+
+def test_one_direct_successor_per_source_request(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU"}, failures={"device_form": "PROBE_FAILED"})
+    repository, files, device, tasks, answers, amendments = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "device_form"])
+    tasks.run_once()
+    request = _request(repository, _request_ids(repository, accepted.task_id)[0])
+    _answer(answers, request, answers={"device_form": "Desktop PC"}, key="answer-root")
+    resolved = _request(repository, request.id)
+
+    payload = {
+        "source_request_id": resolved.id,
+        "expected_request_version": resolved.version,
+        "expected_context_revision": resolved.expected_context_revision,
+        "field_paths": ["device_form"],
+        "reason": "correct the device form",
+    }
+    successes: list[str] = []
+    failures: list[ContractError] = []
+    barrier = threading.Barrier(2)
+
+    def submit(key: str):
+        try:
+            barrier.wait(timeout=5)
+            result = amendments.create_information_amendment(payload, _ctx(key))
+            successes.append(result.refs[1].entity_id)
+        except ContractError as error:
+            failures.append(error)
+
+    threads = [
+        threading.Thread(target=submit, args=("amend-1",)),
+        threading.Thread(target=submit, args=("amend-2",)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=20)
+
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert failures[0].code is ErrorCode.INFORMATION_CONTEXT_CHANGED
+    assert failures[0].details.replacement_resource_ref is not None
+    assert failures[0].details.replacement_resource_ref.entity_id == successes[0]
+    with repository.unit_of_work() as uow:
+        assert len(uow.iter_objects("InformationAmendment")) == 1
+        assert len(uow.query("SELECT 1 FROM information_amendment_links")) == 1
+
+
+def test_amendment_requires_a_handled_source_request(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU"}, failures={"device_form": "PROBE_FAILED"})
+    repository, files, device, tasks, answers, amendments = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "device_form"])
+    tasks.run_once()
+    request = _request(repository, _request_ids(repository, accepted.task_id)[0])
+
+    with pytest.raises(ContractError) as caught:
+        amendments.create_information_amendment(
+            {
+                "source_request_id": request.id,
+                "expected_request_version": request.version,
+                "expected_context_revision": request.expected_context_revision,
+                "field_paths": ["device_form"],
+                "reason": "too early",
+            },
+            _ctx("amend-open"),
+        )
+    assert caught.value.code is ErrorCode.INFORMATION_REQUEST_STATE_CONFLICT
+
+
+def test_amendment_field_must_belong_to_the_root_domain(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU"}, failures={"device_form": "PROBE_FAILED"})
+    repository, files, device, tasks, answers, amendments = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "device_form"])
+    tasks.run_once()
+    request = _request(repository, _request_ids(repository, accepted.task_id)[0])
+    _answer(answers, request, answers={"device_form": "Desktop PC"}, key="answer-root")
+    resolved = _request(repository, request.id)
+
+    with pytest.raises(ContractError) as caught:
+        amendments.create_information_amendment(
+            {
+                "source_request_id": resolved.id,
+                "expected_request_version": resolved.version,
+                "expected_context_revision": resolved.expected_context_revision,
+                "field_paths": ["gpus.0.raw_name"],
+                "reason": "not asked here",
+            },
+            _ctx("amend-domain"),
+        )
+    assert caught.value.code is ErrorCode.INPUT_VALIDATION_FAILED
+
+
+def test_an_old_chain_without_a_root_snapshot_is_refused(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU"}, failures={"device_form": "PROBE_FAILED"})
+    repository, files, device, tasks, answers, amendments = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu", "device_form"])
+    tasks.run_once()
+    request = _request(repository, _request_ids(repository, accepted.task_id)[0])
+
+    with repository.unit_of_work() as uow:
+        uow.insert_object_bytes(
+            "InformationRequest",
+            schema_version="product-contract/0.3",
+            raw=canonical_json({
+                "id": _uid(700),
+                "schema_version": "product-contract/0.3",
+                "created_at": utc_now(),
+                "created_by_task_id": None,
+                "source_task_id": accepted.task_id,
+                "version": 2,
+                "context_refs": [ref.model_dump(mode="json") for ref in request.context_refs],
+                "expected_context_revision": 2,
+                "fields": [field.model_dump(mode="json") for field in request.fields],
+                "state": "resolved",
+                "result_refs": [],
+                "superseded_by_request_id": None,
+                "continuation_mode": "facts_only",
+                "amends_request_id": request.id,
+                "amendment_root_ref": None,
+            }),
+            object_id=_uid(700),
+        )
+
+    with pytest.raises(ContractError) as caught:
+        amendments.create_information_amendment(
+            {
+                "source_request_id": _uid(700),
+                "expected_request_version": 2,
+                "expected_context_revision": 2,
+                "field_paths": ["device_form"],
+                "reason": "legacy chain",
+            },
+            _ctx("amend-legacy"),
+        )
+    assert caught.value.code is ErrorCode.PRECONDITION_UNVERIFIED
+    with repository.unit_of_work() as uow:
+        assert len(uow.iter_objects("InformationAmendment")) == 0

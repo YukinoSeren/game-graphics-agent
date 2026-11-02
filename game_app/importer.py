@@ -870,6 +870,31 @@ def _map_sources(
     for row in rows:
         source_id = row["id"]
         revision_id = row["revision_id"]
+        document = row.get("document")
+        if document is not None and not isinstance(document, dict):
+            raise ContractError(
+                ErrorCode.IMPORT_SNAPSHOT_INCONSISTENT,
+                f"source {source_id!r} has a document that is not an object",
+            )
+        content_hash = None
+        truncated = False
+        capture_method = "collector_run_metadata"
+        document_note = (
+            "the frozen group carries no source document; only its metadata was captured"
+        )
+        if isinstance(document, dict):
+            content_hash = document.get("content_hash")
+            truncated = bool(document.get("truncated", False))
+            retrieval_method = document.get("retrieval_method")
+            if isinstance(retrieval_method, str) and retrieval_method.strip():
+                capture_method = retrieval_method
+            # The inline document is already preserved verbatim inside the
+            # frozen sources.json original.  Registering a second ManagedFile
+            # would only leave an ownerless file when the import is rejected.
+            document_note = (
+                "the inline document exists only inside the frozen sources.json"
+                " original; it is not registered as a separate managed file"
+            )
         source = Source(
             id=_import_id(import_snapshot_id, "source", source_id),
             schema_version="product-contract/0.4",
@@ -891,9 +916,9 @@ def _map_sources(
             source_id=source.id,
             retrieved_at=row["retrieved_at"],
             upstream_revision_id=revision_id,
-            content_hash=None,
+            content_hash=content_hash,
             document_file_id=None,
-            capture_method="collector_run_metadata",
+            capture_method=capture_method,
             capture_scope=source_id,
             metadata=SourceMetadata(
                 author=None,
@@ -902,12 +927,8 @@ def _map_sources(
                 test_date=None,
                 original_source_url=None,
             ),
-            truncated=False,
-            checks=[_check(
-                "source.document",
-                CheckStatus.not_run,
-                "the frozen group carries no source document; only its metadata was captured",
-            )],
+            truncated=truncated,
+            checks=[_check("source.document", CheckStatus.not_run, document_note)],
         )
         sources.append(source)
         revisions.append(revision)
@@ -917,8 +938,8 @@ def _map_sources(
 
 def _source_limitations(revisions: Sequence[SourceRevision]) -> list[str]:
     return [
-        f"source revision {revision.capture_scope!r} has no managed document;"
-        " its text cannot be re-read from this import"
+        f"source revision {revision.capture_scope!r} has no separately managed document;"
+        " its content is not addressable as a ManagedFile"
         for revision in revisions
         if revision.document_file_id is None
     ]
@@ -1486,7 +1507,10 @@ class ImportPublisher:
             # and it does not re-validate references that have since changed.
             return self._result(existing["import_snapshot_id"])
 
-        mappings = [self._identity_mapping(mapping_id) for mapping_id in identity_mapping_ids]
+        mappings = [
+            self._identity_mapping(mapping_id, user_scope_id)
+            for mapping_id in identity_mapping_ids
+        ]
         self._require_game_context(game_context_id, user_scope_id)
 
         mapped: ScopedImport | None = None
@@ -1784,7 +1808,9 @@ class ImportPublisher:
             )
         return rows[0] if rows else None
 
-    def _identity_mapping(self, mapping_id: str) -> IdentityMapping:
+    def _identity_mapping(
+        self, mapping_id: str, user_scope_id: str
+    ) -> IdentityMapping:
         stored = self.repository.find_object("IdentityMapping", mapping_id)
         if stored is None:
             raise ContractError(
@@ -1794,7 +1820,18 @@ class ImportPublisher:
                     path="identity_mapping_ids", code="reference", message="unknown mapping",
                 )],
             )
-        return IdentityMapping.model_validate_json(stored.payload_bytes)
+        mapping = IdentityMapping.model_validate_json(stored.payload_bytes)
+        if (
+            mapping.declared_by_user_scope_id is not None
+            and mapping.declared_by_user_scope_id != user_scope_id
+        ):
+            # Another player's declaration is indistinguishable from a missing
+            # one; a null scope is a public (verified) mapping.
+            raise ContractError(
+                ErrorCode.RESOURCE_NOT_FOUND,
+                "the referenced identity mapping is not available",
+            )
+        return mapping
 
     def _require_game_context(
         self, game_context_id: str, user_scope_id: str

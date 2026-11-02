@@ -695,3 +695,61 @@ def test_mapping_writes_no_product_fact(tmp_path):
 def _objects(repository, entity_type: str) -> list:
     with repository.unit_of_work() as uow:
         return uow.iter_objects(entity_type)
+
+
+# --- 2D-C: inline source document facts --------------------------------------
+
+
+def _managed_file_count(repository) -> int:
+    return len(_objects(repository, "ManagedFile"))
+
+
+def _source_with_document(content_hash: str) -> dict:
+    row = _source()
+    row["document"] = {
+        "content_hash": content_hash,
+        "truncated": True,
+        "retrieval_method": "http_fetch",
+    }
+    return row
+
+
+def test_inline_document_facts_reach_the_source_revision(tmp_path):
+    files, repository = _service(tmp_path)
+    content_hash = "c" * 64
+    group = _freeze(files, tmp_path, "document", _run_files(
+        sources=[_source_with_document(content_hash)],
+        records=[],
+    ))
+    before = _managed_file_count(repository)
+
+    result = _map(files, group, import_id=_uid(1))
+
+    revision = result.source_revisions[0]
+    assert revision.content_hash == content_hash
+    assert revision.truncated is True
+    assert revision.capture_method == "http_fetch"
+    # The inline document stays inside the frozen sources.json original; it is
+    # never registered as a second managed file.
+    assert revision.document_file_id is None
+    check = next(item for item in revision.checks if item.check_id == "source.document")
+    assert check.status.value == "not_run"
+    assert "frozen" in (check.note or "")
+    assert _managed_file_count(repository) == before
+
+
+def test_a_source_without_a_document_keeps_the_not_run_check(tmp_path):
+    files, _ = _service(tmp_path)
+    group = _freeze(files, tmp_path, "no-document", _run_files(
+        sources=[_source()],
+        records=[],
+    ))
+
+    result = _map(files, group, import_id=_uid(1))
+
+    revision = result.source_revisions[0]
+    assert revision.content_hash is None
+    assert revision.truncated is False
+    assert revision.capture_method == "collector_run_metadata"
+    check = next(item for item in revision.checks if item.check_id == "source.document")
+    assert check.status.value == "not_run"

@@ -16,6 +16,7 @@ from game_app.contracts.common import (
     CheckResult,
     EvidenceRef,
     FieldValue,
+    MutationContext,
     Provenance,
     ResourceResult,
 )
@@ -38,6 +39,7 @@ from game_app.contracts.knowledge import (
     GameSelectionRequest,
     IdentityMapping,
     IdentityResolution,
+    ImportIdentityMappingRequest,
     KnowledgePackage,
     ReuseDecision,
 )
@@ -48,7 +50,9 @@ from game_app.repository import ProductRepository, StoredObject, UnitOfWork, can
 
 PRODUCT_CONTRACT_VERSION = "product-contract/0.4"
 SELECTION_ROUTE = "/api/game-selections"
+IMPORT_IDENTITY_ROUTE = "/api/import-identity-mappings"
 SELECTION_RULE_VERSION = "game-selection/0.4"
+IDENTITY_RULE_VERSION = "identity-mapping/0.4"
 _SELECTION_FILE = "selection/request.json"
 
 
@@ -496,6 +500,7 @@ class IdentityService:
                     legacy_namespace=legacy_namespace,
                     legacy_value=legacy_value,
                     target_game_id=verified.series_id,
+                    declared_by_user_scope_id=None,
                     checks=list(checks),
                 ))
         return IdentityResolution(
@@ -503,6 +508,153 @@ class IdentityService:
             checks=list(checks),
             reason="identity verified with located evidence",
         )
+
+    # -- player-declared import identity (2D-C) ------------------------------
+    def declare_import_identity(
+        self,
+        request: Any,
+        context: MutationContext,
+        *,
+        request_schema_version: str = PRODUCT_CONTRACT_VERSION,
+    ) -> ResourceResult:
+        """Let a player name the game one collector run belongs to.
+
+        The declaration is a scoped, auditable mapping: it names the declarer,
+        carries a pass check that says it is not external verification, and is
+        usable only by that player's imports.
+        """
+        if isinstance(request, ImportIdentityMappingRequest):
+            typed = request
+        else:
+            typed = ImportIdentityMappingRequest.model_validate_json(
+                canonical_json(request)
+            )
+        request_hash = hashlib.sha256(canonical_json({
+            "schema_version": request_schema_version,
+            "method": "POST",
+            "route": IMPORT_IDENTITY_ROUTE,
+            "request": typed.model_dump(mode="json"),
+        })).hexdigest()
+        with self.repository.unit_of_work() as uow:
+            existing = uow.find_idempotency(
+                context.user_scope_id,
+                "POST",
+                IMPORT_IDENTITY_ROUTE,
+                context.idempotency_key,
+            )
+            if existing is not None:
+                if existing.lifecycle.value == "tombstoned":
+                    raise ContractError(
+                        ErrorCode.RESOURCE_GONE,
+                        "this declaration was cleaned up; start a new submission",
+                    )
+                if (
+                    existing.request_schema_version != request_schema_version
+                    or existing.request_hash != request_hash
+                ):
+                    raise ContractError(
+                        ErrorCode.IDEMPOTENCY_CONFLICT,
+                        "the same key was already used with different declaration content",
+                        field_errors=[FieldError(
+                            path="idempotency_key", code="conflict",
+                            message="different request hash",
+                        )],
+                    )
+                return ResourceResult.model_validate(json.loads(existing.response_body))
+
+            game = self._declarable_game(
+                uow, typed.game_revision_id, context.user_scope_id
+            )
+            namespace = f"collector_run:{typed.run_id}"
+            existing_mappings = [
+                IdentityMapping.model_validate_json(stored.payload_bytes)
+                for stored in uow.iter_objects("IdentityMapping")
+                if stored.payload.get("legacy_namespace") == namespace
+                and stored.payload.get("legacy_value") == typed.legacy_game_id
+            ]
+            if existing_mappings:
+                if {item.target_game_id for item in existing_mappings} != {game.series_id}:
+                    # Never overwrite: the run's identity is a fact, and the
+                    # player must start a new run instead.
+                    raise ContractError(
+                        ErrorCode.REFERENCE_INVALID,
+                        "this collector run already names another game;"
+                        " the existing mapping is not overwritten",
+                        field_errors=[FieldError(
+                            path="legacy_game_id", code="conflict",
+                            message="mapping already points at another game",
+                        )],
+                    )
+                mapping = existing_mappings[0]
+            else:
+                mapping = IdentityMapping(
+                    id=new_id(),
+                    schema_version=PRODUCT_CONTRACT_VERSION,
+                    created_at=utc_now(),
+                    legacy_namespace=namespace,
+                    legacy_value=typed.legacy_game_id,
+                    target_game_id=game.series_id,
+                    declared_by_user_scope_id=context.user_scope_id,
+                    checks=[CheckResult(
+                        check_id="identity.declared",
+                        definition_version=IDENTITY_RULE_VERSION,
+                        status=CheckStatus.pass_,
+                        input_refs=[],
+                        evidence_refs=[],
+                        checked_at=utc_now(),
+                        method="player declaration",
+                        note="the player specified this game for the import;"
+                        " this is not an externally verified identity",
+                    )],
+                )
+                uow.insert_object("IdentityMapping", mapping)
+            result = ResourceResult(refs=[
+                ObjectRef(entity_type="IdentityMapping", entity_id=mapping.id)
+            ])
+            uow.insert_idempotency(
+                user_scope_id=context.user_scope_id,
+                method="POST",
+                canonical_route=IMPORT_IDENTITY_ROUTE,
+                key=context.idempotency_key,
+                request_schema_version=request_schema_version,
+                request_hash=request_hash,
+                response_status=201,
+                response_body=canonical_json(result.model_dump(mode="json")),
+                result_refs=[ref.model_dump(mode="json") for ref in result.refs],
+            )
+            return result
+
+    def _declarable_game(
+        self, uow: UnitOfWork, game_revision_id: str, user_scope_id: str
+    ) -> Game:
+        stored = uow.find_object("Game", game_revision_id)
+        if stored is None:
+            raise ContractError(
+                ErrorCode.REFERENCE_INVALID,
+                "the game revision does not exist",
+                field_errors=[FieldError(
+                    path="game_revision_id", code="reference",
+                    message="unknown game revision",
+                )],
+            )
+        game = Game.model_validate_json(stored.payload_bytes)
+        if game.identity_status is GameIdentityStatus.legacy_unverified:
+            raise ContractError(
+                ErrorCode.REFERENCE_INVALID,
+                "a legacy unverified read view cannot be used to declare a new mapping",
+                field_errors=[FieldError(
+                    path="game_revision_id", code="enum",
+                    message="legacy_unverified",
+                )],
+            )
+        if (
+            game.identity_status is GameIdentityStatus.provisional
+            and game.declaring_user_scope_id != user_scope_id
+        ):
+            raise ContractError(
+                ErrorCode.RESOURCE_NOT_FOUND, "the game revision is not available"
+            )
+        return game
 
     def _unresolved_evidence(
         self, uow: UnitOfWork, evidence_refs: Sequence[EvidenceRef]
@@ -738,4 +890,10 @@ class IdentityService:
         )
 
 
-__all__ = ["IdentityService", "SELECTION_ROUTE", "SELECTION_RULE_VERSION"]
+__all__ = [
+    "IDENTITY_RULE_VERSION",
+    "IMPORT_IDENTITY_ROUTE",
+    "IdentityService",
+    "SELECTION_ROUTE",
+    "SELECTION_RULE_VERSION",
+]

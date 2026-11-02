@@ -358,6 +358,7 @@ def _store_identity_mapping(repository) -> str:
         legacy_namespace="collector_run:run-1",
         legacy_value="0123456789abcdef",
         target_game_id=series_id,
+        declared_by_user_scope_id=None,
         checks=[],
     )
     with repository.unit_of_work() as uow:

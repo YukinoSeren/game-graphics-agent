@@ -112,7 +112,23 @@ class IdentityMapping(StrictModel):
     legacy_namespace: str
     legacy_value: LegacyID
     target_game_id: ID | None
+    declared_by_user_scope_id: ID | None
     checks: list[CheckResult]
+
+
+class ImportIdentityMappingRequest(StrictModel):
+    """A player names the game a collector run belongs to (02a §5)."""
+
+    run_id: str
+    legacy_game_id: str
+    game_revision_id: ID
+
+    @field_validator("run_id", "legacy_game_id")
+    @classmethod
+    def not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("run_id and legacy_game_id must not be blank")
+        return value
 
 
 # -- IMP-T02: capture-scoped import records ----------------------------------
@@ -479,6 +495,7 @@ __all__ = [
     "GameAlias",
     "Game",
     "IdentityMapping",
+    "ImportIdentityMappingRequest",
     "SourceMetadata",
     "Source",
     "SourceRevision",

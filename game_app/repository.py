@@ -1145,6 +1145,64 @@ class UnitOfWork:
         ).fetchone()
         return None if row is None else row["platform_key"]
 
+    # -- imported record keys ------------------------------------------------
+    def claim_imported_record_key(
+        self,
+        *,
+        record_snapshot_id: str,
+        import_snapshot_id: str,
+        capture_scope_id: str,
+        record_type: str,
+        local_record_id: str,
+        usable: bool,
+    ) -> None:
+        """Claim the four-part record key.
+
+        The unique index covers usable records only: an isolated record keeps
+        its own identity and envelope, while two usable rows may never share
+        ``(snapshot, scope, type, local id)``.  There is no last-write-wins.
+        """
+        for value, name in (
+            (record_snapshot_id, "record_snapshot_id"),
+            (import_snapshot_id, "import_snapshot_id"),
+        ):
+            _require_id(value, name)
+        if not isinstance(capture_scope_id, str) or not capture_scope_id:
+            raise ContractError(
+                ErrorCode.INPUT_VALIDATION_FAILED, "capture_scope_id must not be empty"
+            )
+        if not isinstance(record_type, str) or not record_type:
+            raise ContractError(
+                ErrorCode.INPUT_VALIDATION_FAILED, "record_type must not be empty"
+            )
+        if not isinstance(local_record_id, str) or not local_record_id:
+            raise ContractError(
+                ErrorCode.INPUT_VALIDATION_FAILED, "local_record_id must not be empty"
+            )
+        try:
+            self.connection.execute(
+                "INSERT INTO imported_record_keys(record_snapshot_id, import_snapshot_id,"
+                " capture_scope_id, record_type, local_record_id, usable)"
+                " VALUES(?, ?, ?, ?, ?, ?)",
+                (
+                    record_snapshot_id,
+                    import_snapshot_id,
+                    capture_scope_id,
+                    record_type,
+                    local_record_id,
+                    1 if usable else 0,
+                ),
+            )
+        except sqlite3.IntegrityError as error:
+            raise ContractError(
+                ErrorCode.IMPORT_SNAPSHOT_INCONSISTENT,
+                "this capture scope already has a usable record with this type and local id",
+                field_errors=[FieldError(
+                    path="local_record_id", code="conflict",
+                    message=f"duplicate {record_type} record {local_record_id!r}",
+                )],
+            ) from error
+
     # -- metric rule registry ----------------------------------------------
     def record_metric_rule(
         self, *, metric_key: str, registry_version: str, rule_hash: str, definition_id: str

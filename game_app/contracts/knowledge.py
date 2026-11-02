@@ -6,7 +6,7 @@ coverage evaluator and package builder; the shapes here are the shared ones.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 
@@ -19,9 +19,11 @@ from game_app.contracts.enums import (
     GameIdentityStatus,
     GapPriority,
     GapStatus,
+    LegacyRecordState,
     PublicationStatus,
 )
 from game_app.contracts.primitives import (
+    Hash,
     ID,
     LegacyID,
     NonNegativeInt,
@@ -110,6 +112,136 @@ class IdentityMapping(StrictModel):
     legacy_namespace: str
     legacy_value: LegacyID
     target_game_id: ID | None
+    checks: list[CheckResult]
+
+
+# -- IMP-T02: capture-scoped import records ----------------------------------
+
+
+class SourceMetadata(StrictModel):
+    """The collector's own metadata block, preserved field for field."""
+
+    author: str | None
+    published_date: str | None
+    updated_date: str | None
+    test_date: str | None
+    original_source_url: str | None
+
+
+class Source(StrictModel):
+    id: ID
+    schema_version: str
+    created_at: Timestamp
+    created_by_task_id: ID | None
+    original_url: str
+    canonical_url: str
+    identity_checks: list[CheckResult]
+
+    @field_validator("original_url", "canonical_url")
+    @classmethod
+    def url_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("a source url must not be blank")
+        return value
+
+
+class SourceRevision(StrictModel):
+    """One captured revision.  A failed capture may have neither document nor hash."""
+
+    id: ID
+    schema_version: str
+    created_at: Timestamp
+    created_by_task_id: ID | None
+    source_id: ID
+    retrieved_at: Timestamp
+    upstream_revision_id: LegacyID | None
+    content_hash: Hash | None
+    document_file_id: ID | None
+    capture_method: str
+    capture_scope: str
+    metadata: SourceMetadata
+    truncated: bool
+    checks: list[CheckResult]
+
+    @field_validator("capture_method", "capture_scope")
+    @classmethod
+    def not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("capture method and scope must not be blank")
+        return value
+
+
+class BoundarySemantics(StrictModel):
+    """Strictness of a legacy numeric bound; null means the artifact is silent."""
+
+    lower_inclusive: bool | None
+    upper_inclusive: bool | None
+    evidence_refs: list[EvidenceRef]
+    status: CheckStatus
+
+
+class RecordExtension(StrictModel):
+    boundary_semantics: BoundarySemantics | None
+    setting_identity_ref: ID | None
+    checks: list[CheckResult]
+
+
+class ImportedRecord(StrictModel):
+    """One read-only record in a capture scope; it is never a package fact."""
+
+    id: ID
+    schema_version: str
+    created_at: Timestamp
+    created_by_task_id: ID | None
+    record_snapshot_id: ID
+    import_snapshot_id: ID
+    capture_scope_id: LegacyID
+    local_record_id: LegacyID
+    legacy_record_id: LegacyID
+    source_revision_id: ID
+    record_type: str
+    payload: Any
+    payload_hash: Hash
+    upstream_status: LegacyRecordState
+    upstream_envelope: dict[str, Any]
+    checks: list[CheckResult]
+    extension: RecordExtension
+
+    @model_validator(mode="after")
+    def one_identity(self) -> "ImportedRecord":
+        if self.record_snapshot_id != self.id:
+            raise ValueError("record_snapshot_id is the entity id; it is never a second identity")
+        return self
+
+
+class ImportedExtraction(StrictModel):
+    """A legacy extraction read-only view.
+
+    It is deliberately not an ``ExternalCallRecord``: the old output proves
+    which model was *requested*, never which one answered, so ``returned_model``
+    can only be null.
+    """
+
+    id: ID
+    schema_version: str
+    created_at: Timestamp
+    created_by_task_id: ID | None
+    import_snapshot_id: ID
+    source_revision_id: ID | None
+    legacy_source_id: LegacyID
+    status: str | None
+    model_requested: str | None
+    returned_model: Literal[None]
+    upstream_envelope: dict[str, Any]
+    checks: list[CheckResult]
+    limitations: list[str]
+
+
+class ImportValidation(StrictModel):
+    """Local staging result (02a §5); all fields R."""
+
+    accepted_record_ids: list[ID]
+    diagnostic_record_ids: list[ID]
     checks: list[CheckResult]
 
 
@@ -294,6 +426,14 @@ __all__ = [
     "GameAlias",
     "Game",
     "IdentityMapping",
+    "SourceMetadata",
+    "Source",
+    "SourceRevision",
+    "BoundarySemantics",
+    "RecordExtension",
+    "ImportedRecord",
+    "ImportedExtraction",
+    "ImportValidation",
     "CoverageCell",
     "KnowledgeGap",
     "KnowledgePackage",

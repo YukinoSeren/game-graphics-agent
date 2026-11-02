@@ -155,6 +155,9 @@ class FixtureLoader:
         fixture_id, _, version_text = spec.initial_fixture.partition("@")
         if not version_text.isdigit():
             raise ValueError("initial_fixture must use '<fixture_id>@<version>'")
+        # A case result is evidence only if the fixture it names was actually
+        # present and matched its recorded bytes.
+        self.load_fixture(fixture_id, int(version_text))
         status, observed_files, failure_notes = runner(spec)
         return CaseResult(
             case_id=spec.case_id,

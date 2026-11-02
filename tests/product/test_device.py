@@ -438,3 +438,75 @@ def test_device_questions_reference_the_snapshot_they_are_about(tmp_path):
     assert [ref.entity_type for ref in request.context_refs] == ["DeviceSnapshot"]
     assert request.context_refs[0].entity_id == snapshot.id
     assert request.context_refs[0].version == snapshot.version
+
+
+# --- review fix pass 2: per-field resolution honesty -------------------------
+
+
+def test_a_known_resolution_axis_is_not_asked_again(tmp_path):
+    probe = StubProbe(
+        values={"display.desktop_resolution.width": "2560"},
+        failures={"display.desktop_resolution.height": "PROBE_FAILED"},
+    )
+    repo, files, device, tasks = _env(tmp_path, probe)
+    accepted = _scan(
+        tasks,
+        ["display.desktop_resolution.width", "display.desktop_resolution.height"],
+    )
+    outcome = tasks.run_once()
+
+    assert outcome.state.value == "partial"
+    request = _request(repo, accepted.task_id)
+    assert [field.field_path for field in request.fields] == [
+        "display.desktop_resolution.height"
+    ]
+    snapshot = _snapshot(repo, accepted.task_id)
+    # The composite resolution still needs both halves.
+    assert snapshot.display.desktop_resolution.value is None
+
+
+def test_a_single_known_resolution_axis_completes_without_a_question(tmp_path):
+    probe = StubProbe(values={"display.desktop_resolution.width": "2560"})
+    repo, files, device, tasks = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["display.desktop_resolution.width"])
+    outcome = tasks.run_once()
+
+    assert outcome.state.value == "completed"
+    assert _request(repo, accepted.task_id) is None
+
+
+def test_an_unrequested_gpu_group_is_marked_not_checked(tmp_path):
+    probe = StubProbe(values={"cpu": "Example CPU"})
+    repo, files, device, tasks = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["cpu"])
+    tasks.run_once()
+
+    snapshot = _snapshot(repo, accepted.task_id)
+    assert snapshot.gpus == []
+    group = [check for check in snapshot.checks if check.check_id == "probe.gpus"]
+    assert group, "the empty GPU list must be explained by a check"
+    assert group[0].status is CheckStatus.not_run
+
+
+def test_a_failed_question_write_does_not_leave_an_orphan_snapshot(tmp_path, monkeypatch):
+    from game_app.repository import UnitOfWork
+
+    probe = StubProbe(failures={"gpus.0.raw_name": "PROBE_FAILED"})
+    repo, files, device, tasks = _env(tmp_path, probe)
+    original = UnitOfWork.insert_object
+
+    def boom(self, entity_type, entity):
+        if entity_type == "InformationRequest":
+            raise RuntimeError("injected question write failure")
+        return original(self, entity_type, entity)
+
+    monkeypatch.setattr(UnitOfWork, "insert_object", boom)
+    accepted = _scan(tasks, ["gpus.0.raw_name"])
+    outcome = tasks.run_once()
+
+    assert outcome.state.value == "failed"
+    with repo.unit_of_work() as uow:
+        snapshots = uow.query(
+            "SELECT COUNT(*) AS n FROM objects WHERE entity_type='DeviceSnapshot'"
+        )[0]["n"]
+    assert snapshots == 0

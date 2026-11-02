@@ -356,3 +356,145 @@ def test_duplicate_references_are_rejected_by_the_database(tmp_path):
     # A different relation to the same target remains legal.
     with repo.unit_of_work() as uow:
         uow.insert_reference(child.id, "mirror", target)
+
+
+# --- review fix pass 2: local setting directory ------------------------------
+
+
+def test_a_renamed_local_setting_releases_its_old_located_slot(tmp_path):
+    repo = _repo(tmp_path)
+    install = _uid(10)
+    repo.register_local_setting(
+        installation_id=install,
+        namespace="player",
+        raw_name="Quality",
+        menu_path=["Graphics"],
+        local_setting_id=_uid(1000),
+        series_id=_uid(2000),
+    )
+    repo.register_local_setting(
+        installation_id=install,
+        namespace="player",
+        raw_name="Graphics Quality",
+        menu_path=["Graphics"],
+        local_setting_id=_uid(1001),
+        series_id=_uid(2000),
+        version=2,
+        parent_definition_id=_uid(1000),
+    )
+
+    # The old name no longer owns the position...
+    assert repo.get_local_setting_slot(install, "player", "Quality", ["Graphics"]) is None
+    assert repo.get_local_setting_slot(
+        install, "player", "Graphics Quality", ["Graphics"]
+    ) == _uid(2000)
+    # ...so a different entry may take it without a false conflict.
+    other = repo.register_local_setting(
+        installation_id=install,
+        namespace="player",
+        raw_name="Quality",
+        menu_path=["Graphics"],
+        local_setting_id=_uid(1002),
+        series_id=_uid(2002),
+    )
+    assert other.series_id == _uid(2002)
+
+
+def test_a_correction_cannot_move_a_definition_to_another_installation(tmp_path):
+    repo = _repo(tmp_path)
+    install_a, install_b = _uid(10), _uid(11)
+    repo.register_local_setting(
+        installation_id=install_a,
+        namespace="player",
+        raw_name="Brightness",
+        menu_path=["Display"],
+        local_setting_id=_uid(1002),
+        series_id=_uid(2002),
+    )
+
+    with pytest.raises(ContractError) as caught:
+        repo.register_local_setting(
+            installation_id=install_b,
+            namespace="player",
+            raw_name="Brightness",
+            menu_path=["Display"],
+            local_setting_id=_uid(1003),
+            series_id=_uid(2002),
+            version=2,
+            parent_definition_id=_uid(1002),
+        )
+    assert caught.value.code is ErrorCode.REFERENCE_INVALID
+
+    # Nothing was created in B and A keeps its head and slot.
+    assert repo.list_local_setting_heads(install_b) == []
+    assert repo.get_local_setting_slot(
+        install_a, "player", "Brightness", ["Display"]
+    ) == _uid(2002)
+    assert repo.get_local_setting_slot(
+        install_b, "player", "Brightness", ["Display"]
+    ) is None
+
+
+def test_a_locked_database_raises_the_stable_storage_error(tmp_path):
+    path = tmp_path / "product.sqlite3"
+    repo = ProductRepository(path, timeout=0.2)
+    repo.migrate()
+    blocker = sqlite3.connect(path, isolation_level=None, timeout=0.2)
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(ContractError) as caught:
+            repo.get_object("Game", _uid(1))
+        assert caught.value.code is ErrorCode.STORAGE_COMMIT_FAILED
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+        repo.close()
+
+
+def test_known_field_value_requires_provenance():
+    from game_app.contracts.common import FieldValue
+    from game_app.contracts.enums import AcquisitionStatus, ValueState
+
+    with pytest.raises(ValidationError):
+        FieldValue[int](
+            value_state=ValueState.known,
+            value=5,
+            acquisition_status=AcquisitionStatus.succeeded,
+        )
+
+
+def test_wrapper_timestamps_and_check_evidence_are_strict():
+    from game_app.contracts.common import CheckResult, EvidenceRef, Provenance
+    from game_app.contracts.enums import AcquisitionMethod, CheckStatus
+
+    evidence = EvidenceRef(
+        kind="artifact",
+        file_id=_uid(9),
+        content_hash="a" * 64,
+        locator="objects/x",
+    )
+    with pytest.raises(ValidationError):
+        Provenance(
+            method=AcquisitionMethod.system_probe,
+            observed_at=None,
+            recorded_at="not a time",
+            evidence_refs=[evidence],
+        )
+    with pytest.raises(ValidationError):
+        Provenance(
+            method=AcquisitionMethod.system_probe,
+            observed_at="yesterday",
+            recorded_at="2026-11-02T00:00:00+00:00",
+            evidence_refs=[evidence],
+        )
+    # A passing check must record when it ran.
+    with pytest.raises(ValidationError):
+        CheckResult(
+            check_id="check",
+            definition_version="checks/0.4",
+            status=CheckStatus.pass_,
+            input_refs=[],
+            evidence_refs=[],
+            checked_at=None,
+            method="deterministic rule",
+        )

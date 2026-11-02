@@ -373,3 +373,53 @@ def test_backup_refuses_when_a_published_file_is_missing(tmp_path):
     with pytest.raises(ContractError) as caught:
         service.backup(tmp_path / "backups" / "001")
     assert caught.value.code is ErrorCode.STORAGE_COMMIT_FAILED
+
+
+def test_concurrent_publish_writers_do_not_share_a_temp_file(tmp_path, monkeypatch):
+    """Two same-key writers must not collide on one temporary file name."""
+    import threading
+
+    import game_app.files as files_module
+
+    repo = ProductRepository(tmp_path / "product.sqlite3")
+    repo.migrate()
+    service = FileService(repo, tmp_path / "managed")
+
+    a_wrote_temp = threading.Event()
+    release_a = threading.Event()
+    real_write = files_module._write_private
+
+    def controlled_write(path, data):
+        real_write(path, data)
+        if threading.current_thread().name == "writer-a" and path.name.startswith("."):
+            a_wrote_temp.set()
+            release_a.wait(timeout=10)
+
+    monkeypatch.setattr(files_module, "_write_private", controlled_write)
+
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    def submit(name: str) -> None:
+        try:
+            if name == "writer-b":
+                assert a_wrote_temp.wait(timeout=10)
+            results.append(_publish(service))
+            if name == "writer-b":
+                release_a.set()
+        except BaseException as error:
+            errors.append(error)
+            release_a.set()
+
+    threads = [
+        threading.Thread(target=submit, args=(name,), name=name)
+        for name in ("writer-a", "writer-b")
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=20)
+
+    assert not errors
+    assert len({tuple(result.file_ids) for result in results}) == 1
+    assert len({result.operation_id for result in results}) == 1

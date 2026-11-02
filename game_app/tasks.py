@@ -136,6 +136,9 @@ class TaskContext:
         self.service = service
         self.task_id = task_id
         self.suspended = False
+        # Succeeded calls inherited through the resume checkpoint; this task may
+        # reuse each of them once instead of sending it again.
+        self.reusable_calls: list[Any] = []
 
     @property
     def task_input(self) -> Any:
@@ -177,6 +180,7 @@ class TaskContext:
             requested_model=requested_model,
             prompt_version=prompt_version,
             output_schema_version=output_schema_version,
+            reusable_calls=self.reusable_calls,
         )
 
     def checkpoint(self, completed_steps: Sequence[str]) -> str:
@@ -269,10 +273,28 @@ class TaskService:
 
     def _view(self, uow: UnitOfWork, row: Any) -> TaskViewResult:
         task = self._task_from_row(row)
-        last = uow.query(
-            "SELECT created_at FROM task_events WHERE task_id=? ORDER BY sequence DESC LIMIT 1",
+        events = uow.query(
+            "SELECT created_at, related_refs FROM task_events WHERE task_id=?"
+            " ORDER BY sequence",
             (task.id,),
         )
+        # Questions raised by this task are recorded on its events and in its
+        # result refs; the task row itself keeps no list, so project them here.
+        request_ids: list[str] = []
+        references = [
+            ref for ref in task.result_refs
+        ] + [
+            ObjectRef.model_validate(ref)
+            for event in events
+            for ref in json.loads(event["related_refs"] or "[]")
+        ]
+        for ref in references:
+            if ref.entity_type != "InformationRequest":
+                continue
+            if ref.entity_id not in request_ids:
+                request_ids.append(ref.entity_id)
+        if request_ids:
+            task = task.model_copy(update={"information_request_ids": request_ids})
         completed_steps: list[str] = []
         if task.checkpoint_id is not None:
             checkpoint = uow.query(
@@ -283,11 +305,11 @@ class TaskService:
                 completed_steps = json.loads(checkpoint[0]["completed_steps"])
         return TaskViewResult(
             task=task,
-            error=None,
+            error=_error_envelope(task.last_error_code, task.id),
             result_refs=task.result_refs,
             progress=TaskProgress(
                 phase=_phase_for(task.state),
-                last_activity_at=last[0]["created_at"] if last else None,
+                last_activity_at=events[-1]["created_at"] if events else None,
                 completed_steps=completed_steps,
             ),
         )
@@ -472,7 +494,7 @@ class TaskService:
                 " current_input_revision, budget, calls, checkpoint_id, domain_result, stop_reason,"
                 " result_refs, cancel_requested, last_error_code, active_elapsed_seconds,"
                 " resume_blocked_unknown_call, created_at, updated_at)"
-                " VALUES(?, ?, ?, ?, 1, 'queued', 1, ?, ?, ?, NULL, NULL, '[]', 0, NULL, 0, ?, ?, ?)",
+                " VALUES(?, ?, ?, ?, 1, 'queued', 1, ?, ?, NULL, NULL, NULL, '[]', 0, NULL, 0, ?, ?, ?)",
                 (
                     task_id,
                     parent["type"],
@@ -480,12 +502,27 @@ class TaskService:
                     resume.parent_task_id,
                     resume.budget.model_dump_json(),
                     CallCounters().model_dump_json(),
-                    resume.checkpoint_id,
                     int(blocked),
                     now,
                     now,
                 ),
             )
+            if resume.checkpoint_id is not None:
+                # The resumed task owns its own copy: a checkpoint row belongs to
+                # exactly one task, and the parent's row stays read-only.  Without
+                # the copy the new task could never be resumed again.
+                inherited_checkpoint = new_id()
+                uow.execute(
+                    "INSERT INTO task_checkpoints(checkpoint_id, task_id, input_revision,"
+                    " completed_steps, artifact_refs, call_ids, created_at)"
+                    " SELECT ?, ?, 1, completed_steps, artifact_refs, call_ids, ?"
+                    " FROM task_checkpoints WHERE checkpoint_id=?",
+                    (inherited_checkpoint, task_id, now, resume.checkpoint_id),
+                )
+                uow.execute(
+                    "UPDATE tasks SET checkpoint_id=? WHERE task_id=?",
+                    (inherited_checkpoint, task_id),
+                )
             uow.execute(
                 "INSERT INTO task_inputs(task_id, input_revision, input, supersedes_revision,"
                 " cause_ref, created_at) VALUES(?, 1, ?, NULL, ?, ?)",
@@ -563,6 +600,9 @@ class TaskService:
 
         handler = self.handlers.get(task_type.value) or (lambda ctx: HandlerOutcome.completed())
         context = TaskContext(self, task_id)
+        # Only calls that a *checkpoint inherited from the parent* already
+        # completed may be reused; calls made during this run never are.
+        context.reusable_calls = self._inherited_succeeded_calls(task_id)
         try:
             outcome = handler(context)
         except _SuspendExecution:
@@ -736,6 +776,7 @@ class TaskService:
         requested_model: str | None = None,
         prompt_version: str | None = None,
         output_schema_version: str | None = None,
+        reusable_calls: list[Any] | None = None,
     ) -> dict[str, Any]:
         if kind not in _COUNTER_LIMITS:
             raise ContractError(
@@ -765,7 +806,26 @@ class TaskService:
             "kind": kind,
             "payload": dict(payload),
         }
-        input_hash = hashlib.sha256(canonical_json(request)).hexdigest()
+        # The input hash identifies the *request content*, not this call
+        # instance: a resumed task must be able to recognise an already
+        # completed step instead of sending it again.
+        input_hash = _call_input_hash(
+            kind, requested_model, prompt_version, output_schema_version, payload
+        )
+        reused = self._take_reusable_call(
+            reusable_calls or [], kind=kind, input_hash=input_hash
+        )
+        if reused is not None:
+            return self._record_reused_call(
+                task_id,
+                reused,
+                kind=kind,
+                input_hash=input_hash,
+                provider_name=provider_name,
+                requested_model=requested_model,
+                prompt_version=prompt_version,
+                output_schema_version=output_schema_version,
+            )
         with self.repository.unit_of_work() as uow:
             row = self._task_row(uow, task_id)
             if row["cancel_requested"]:
@@ -866,9 +926,8 @@ class TaskService:
     def _task_from_row(self, row: Any) -> TaskRun:
         domain_result = None
         if row["domain_result"]:
-            raw = json.loads(row["domain_result"])
-            raw["domain"] = TaskType(raw["domain"])
-            domain_result = DomainResult.model_validate(raw)
+            # JSON mode: the stored payload holds enum *values*, not instances.
+            domain_result = DomainResult.model_validate_json(row["domain_result"])
         stop_reason = None
         if row["stop_reason"]:
             stop_reason = TaskStopReason.model_validate_json(row["stop_reason"])
@@ -962,6 +1021,93 @@ class TaskService:
             parent = uow.query("SELECT parent_id FROM tasks WHERE task_id=?", (current,))
             current = parent[0]["parent_id"] if parent else None
         return False
+
+    def _inherited_succeeded_calls(self, task_id: str) -> list[Any]:
+        """Succeeded calls named by the checkpoint this task inherited."""
+        with self.repository.unit_of_work() as uow:
+            row = self._task_row(uow, task_id)
+            if row["checkpoint_id"] is None:
+                return []
+            checkpoint = uow.query(
+                "SELECT call_ids FROM task_checkpoints WHERE checkpoint_id=?",
+                (row["checkpoint_id"],),
+            )
+            if not checkpoint:
+                return []
+            call_ids = json.loads(checkpoint[0]["call_ids"] or "[]")
+            if not call_ids:
+                return []
+            placeholders = ",".join("?" for _ in call_ids)
+            rows = uow.query(
+                "SELECT * FROM external_calls WHERE call_id IN (" + placeholders + ")"
+                " AND call_state='succeeded'",
+                tuple(call_ids),
+            )
+        return list(rows)
+
+    def _take_reusable_call(
+        self, pool: list[Any], *, kind: str, input_hash: str
+    ) -> Any | None:
+        for index, call in enumerate(pool):
+            if (
+                call["kind"] == kind
+                and call["input_hash"] == input_hash
+                and call["response_file_id"]
+            ):
+                return pool.pop(index)
+        return None
+
+    def _record_reused_call(
+        self,
+        task_id: str,
+        reused: Any,
+        *,
+        kind: str,
+        input_hash: str,
+        provider_name: str,
+        requested_model: str | None,
+        prompt_version: str | None,
+        output_schema_version: str | None,
+    ) -> dict[str, Any]:
+        """Attach an inherited original to this task without sending anything."""
+        reply = self._read_stored_reply(reused["response_file_id"])
+        with self.repository.unit_of_work() as uow:
+            row = self._task_row(uow, task_id)
+            if row["cancel_requested"]:
+                raise _TaskCancelled()
+            if TaskState(row["state"]) is not TaskState.running:
+                raise ContractError(ErrorCode.TASK_STATE_CONFLICT, "the task is not running")
+            now = self.clock()
+            uow.execute(
+                "INSERT INTO external_calls(call_id, task_id, input_revision, kind, call_state,"
+                " provider, requested_model, returned_model, prompt_version, output_schema_version,"
+                " input_hash, intent_saved_at, sent_at, finished_at, provider_request_id,"
+                " response_file_id, usage, billing_state, error_code)"
+                " VALUES(?, ?, ?, ?, 'succeeded', ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?,"
+                " 'not_applicable', NULL)",
+                (
+                    new_id(),
+                    task_id,
+                    row["current_input_revision"],
+                    kind,
+                    provider_name,
+                    requested_model,
+                    reused["returned_model"],
+                    prompt_version,
+                    output_schema_version,
+                    input_hash,
+                    now,
+                    now,
+                    reused["provider_request_id"],
+                    reused["response_file_id"],
+                    reused["usage"],
+                ),
+            )
+        return reply
+
+    def _read_stored_reply(self, response_file_id: str) -> dict[str, Any]:
+        stored = json.loads(self.files.read_managed_file(response_file_id))
+        return dict(stored["response"])
 
     def _replay_control(
         self,
@@ -1090,6 +1236,34 @@ def _validate_task_input(task_input: Any) -> Any:
                 for item in error.errors()
             ],
         ) from error
+
+
+def _error_envelope(error_code: str | None, task_id: str) -> ErrorEnvelope | None:
+    """Build the task's error view from its persisted code; never re-generate."""
+    if not error_code:
+        return None
+    try:
+        code = ErrorCode(error_code)
+    except ValueError:
+        return None
+    return ContractError(code, f"the task stopped with {code.value}").to_envelope(task_id)
+
+
+def _call_input_hash(
+    kind: str,
+    requested_model: str | None,
+    prompt_version: str | None,
+    output_schema_version: str | None,
+    payload: Mapping[str, Any],
+) -> str:
+    """Content identity of one provider request, stable across call instances."""
+    return hashlib.sha256(canonical_json({
+        "kind": kind,
+        "requested_model": requested_model,
+        "prompt_version": prompt_version,
+        "output_schema_version": output_schema_version,
+        "payload": dict(payload),
+    })).hexdigest()
 
 
 def _control_hash(schema_version: str, method: str, route: str) -> str:

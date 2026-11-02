@@ -179,3 +179,24 @@ def test_fixture_bytes_are_not_rewritten_by_loading():
     before = hashlib.sha256(target.read_bytes()).hexdigest()
     FixtureLoader(FIXTURES).load_fixture("smoke-inputs", 1)
     assert hashlib.sha256(target.read_bytes()).hexdigest() == before
+
+
+# --- review fix pass 2: a case cannot run against an unverified fixture ------
+
+
+def test_run_case_refuses_a_missing_fixture(tmp_path):
+    loader = FixtureLoader(FIXTURES)
+    spec = _case("case-missing").model_copy(update={"initial_fixture": "no-such-fixture@7"})
+    with pytest.raises(FixtureIntegrityError):
+        loader.run_case(spec, _run_manifest("run-1"), lambda case: ("passed", [], []))
+
+
+def test_run_case_refuses_a_corrupted_fixture(tmp_path):
+    copied = tmp_path / "fixtures"
+    shutil.copytree(FIXTURES, copied)
+    target = copied / "smoke-inputs" / "v1" / "inputs" / "context.json"
+    target.write_bytes(b"{}\n")
+
+    loader = FixtureLoader(copied)
+    with pytest.raises(FixtureIntegrityError):
+        loader.run_case(_case(), _run_manifest("run-1"), lambda case: ("passed", [], []))

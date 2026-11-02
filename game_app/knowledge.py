@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import unicodedata
 from typing import Any, Callable, Iterable, Sequence
 
 from game_app.contracts.common import (
@@ -35,6 +36,7 @@ from game_app.contracts.knowledge import (
     GameChoicePage,
     GameSelection,
     GameSelectionRequest,
+    IdentityMapping,
     IdentityResolution,
     KnowledgePackage,
     ReuseDecision,
@@ -63,7 +65,17 @@ def _unknown_check(check_id: str, method: str) -> CheckResult:
 
 
 def _norm(value: str) -> str:
+    """Display/search normalisation: collapses internal whitespace."""
     return " ".join(value.split()).casefold()
+
+
+def _exact(value: str) -> str:
+    """Exact-name normalisation: NFC, trim, casefold — nothing else.
+
+    Automatic identity matching must not treat a differently spaced name as the
+    same declaration; the declaration slot uses the same rule.
+    """
+    return unicodedata.normalize("NFC", value).strip().casefold()
 
 
 class IdentityService:
@@ -422,6 +434,8 @@ class IdentityService:
         platform_scope: Sequence[str],
         evidence_refs: Sequence[EvidenceRef],
         checks: Sequence[CheckResult],
+        legacy_namespace: str | None = None,
+        legacy_value: str | None = None,
     ) -> IdentityResolution:
         passing = [check for check in checks if check.status is CheckStatus.pass_]
         if not evidence_refs or not passing or not platform_scope:
@@ -430,7 +444,34 @@ class IdentityService:
                 checks=list(checks),
                 reason="identity evidence is insufficient; the series stays provisional",
             )
+        if (legacy_namespace is None) != (legacy_value is None):
+            raise ContractError(
+                ErrorCode.INPUT_VALIDATION_FAILED,
+                "a legacy identity mapping needs both a namespace and a value",
+                field_errors=[FieldError(
+                    path="legacy_namespace", code="required", message="namespace and value pair",
+                )],
+            )
+        if legacy_namespace is not None and (
+            not legacy_namespace.strip() or not legacy_value.strip()
+        ):
+            raise ContractError(
+                ErrorCode.INPUT_VALIDATION_FAILED,
+                "a legacy identity mapping needs a non-empty namespace and value",
+                field_errors=[FieldError(
+                    path="legacy_namespace", code="required", message="blank mapping identity",
+                )],
+            )
         with self.repository.unit_of_work() as uow:
+            problems = self._unresolved_evidence(uow, evidence_refs)
+            if problems:
+                # Evidence that cannot be located is not evidence: keep the
+                # series provisional and report exactly what is missing.
+                return IdentityResolution(
+                    game_ref=None,
+                    checks=list(checks),
+                    reason="; ".join(problems),
+                )
             latest = uow.latest_for_series("Game", series_id)
             if latest is None:
                 raise ContractError(
@@ -447,11 +488,51 @@ class IdentityService:
                 "declaring_user_scope_id": None,
             })
             uow.insert_versioned("Game", verified)
+            if legacy_namespace is not None:
+                uow.insert_object("IdentityMapping", IdentityMapping(
+                    id=new_id(),
+                    schema_version=PRODUCT_CONTRACT_VERSION,
+                    created_at=utc_now(),
+                    legacy_namespace=legacy_namespace,
+                    legacy_value=legacy_value,
+                    target_game_id=verified.series_id,
+                    checks=list(checks),
+                ))
         return IdentityResolution(
             game_ref=ObjectRef(entity_type="Game", entity_id=verified.id),
             checks=list(checks),
             reason="identity verified with located evidence",
         )
+
+    def _unresolved_evidence(
+        self, uow: UnitOfWork, evidence_refs: Sequence[EvidenceRef]
+    ) -> list[str]:
+        """Return one message per evidence reference that cannot be located."""
+        problems: list[str] = []
+        for index, ref in enumerate(evidence_refs):
+            try:
+                if ref.kind == "artifact":
+                    stored = uow.find_object("ManagedFile", ref.file_id)
+                    if stored is None:
+                        problems.append(f"evidence[{index}]: artifact file does not exist")
+                    elif stored.payload.get("file_status") != PublicationStatus.published.value:
+                        problems.append(f"evidence[{index}]: artifact file is not published")
+                    elif stored.payload.get("manifest", {}).get("sha256") != ref.content_hash:
+                        problems.append(f"evidence[{index}]: artifact hash does not match the file")
+                elif ref.kind == "source_location":
+                    if uow.find_object("SourceRevision", ref.source_revision_id) is None:
+                        problems.append(f"evidence[{index}]: source revision does not exist")
+                elif ref.kind == "local":
+                    if uow.find_object(ref.entity_type, ref.entity_id) is None:
+                        problems.append(f"evidence[{index}]: local record does not exist")
+                else:
+                    if uow.find_object("KnowledgePackage", ref.record.package_id) is None:
+                        problems.append(f"evidence[{index}]: knowledge package does not exist")
+                    elif uow.find_object("ImportedRecord", ref.record.record_snapshot_id) is None:
+                        problems.append(f"evidence[{index}]: imported record does not exist")
+            except ContractError:
+                problems.append(f"evidence[{index}]: reference points at another entity type")
+        return problems
 
     # -- reuse ---------------------------------------------------------------
     def assess_reuse(
@@ -617,14 +698,14 @@ class IdentityService:
         )
 
     def _matches(self, game: Game, request: GameSelectionRequest) -> bool:
-        name = _norm(request.raw_name)
+        name = _exact(request.raw_name)
         if not self._platform_ok_game(game, request.platform):
             return False
-        if _norm(game.canonical_name) == name:
+        if _exact(game.canonical_name) == name:
             return True
         return any(
             alias.status is CheckStatus.pass_
-            and _norm(alias.name) == name
+            and _exact(alias.name) == name
             and (alias.platform is None or request.platform is None
                  or _norm(alias.platform) == _norm(request.platform))
             for alias in game.aliases

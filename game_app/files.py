@@ -290,7 +290,7 @@ class FileService:
         if final.is_file():
             _verify_file(final, entry)
         else:
-            temporary = self.objects_dir / f".{file_id}.tmp"
+            temporary = self.objects_dir / f".{file_id}.{new_id()}.tmp"
             try:
                 _write_private(temporary, data)
                 os.replace(temporary, final)
@@ -593,7 +593,9 @@ class FileService:
                     ErrorCode.IMPORT_SNAPSHOT_INCONSISTENT,
                     "staged bytes no longer match the manifest",
                 )
-            temporary = self.objects_dir / f".{file_id}.tmp"
+            # Each writer uses its own temporary name: two same-key submissions
+            # may race here, and a shared name lets one delete the other's file.
+            temporary = self.objects_dir / f".{file_id}.{new_id()}.tmp"
             try:
                 if hooks.before_write is not None:
                     hooks.before_write(final)

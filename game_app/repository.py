@@ -302,16 +302,39 @@ class UnitOfWork:
     def __enter__(self) -> "UnitOfWork":
         if self.connection.in_transaction:
             raise RuntimeError("nested UnitOfWork is not supported")
-        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as error:
+            # Lock contention is a storage failure with a stable code; callers
+            # retry the same submission, they never start a second one.
+            raise ContractError(
+                ErrorCode.STORAGE_COMMIT_FAILED,
+                "the product database is busy; retry the same submission",
+            ) from error
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         if self.connection.in_transaction:
             if exc_type is None:
-                self.connection.execute("COMMIT")
+                try:
+                    self.connection.execute("COMMIT")
+                except sqlite3.OperationalError as error:
+                    self._discard_transaction()
+                    raise ContractError(
+                        ErrorCode.STORAGE_COMMIT_FAILED,
+                        "the product database could not commit; retry the same submission",
+                    ) from error
             else:
-                self.connection.execute("ROLLBACK")
+                self._discard_transaction()
         return False
+
+    def _discard_transaction(self) -> None:
+        """Roll back; if that is impossible, drop the connection entirely."""
+        try:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            self.repository.close()
 
     # -- raw access for module-owned tables ------------------------------
     def execute(self, sql: str, params: Sequence[Any] = ()) -> sqlite3.Cursor:
@@ -788,12 +811,24 @@ class UnitOfWork:
 
         if parent_definition_id is not None:
             parent = self.connection.execute(
-                "SELECT series_id, version FROM local_setting_heads WHERE local_setting_id=?",
+                "SELECT installation_id, series_id, version FROM local_setting_heads"
+                " WHERE local_setting_id=?",
                 (parent_definition_id,),
             ).fetchone()
             if parent is None:
                 raise ContractError(
                     ErrorCode.REFERENCE_INVALID, "the parent local setting definition is not current"
+                )
+            if parent["installation_id"] != installation_id:
+                # A directory correction stays inside its own installation; a
+                # different installation is a separate local record.
+                raise ContractError(
+                    ErrorCode.REFERENCE_INVALID,
+                    "the parent definition belongs to another installation",
+                    field_errors=[FieldError(
+                        path="supersedes_local_setting_id", code="reference",
+                        message="cross-installation correction",
+                    )],
                 )
             if parent["series_id"] != series_id or version != parent["version"] + 1:
                 raise ContractError(
@@ -812,13 +847,17 @@ class UnitOfWork:
                 ) from error
 
         old = self.connection.execute(
-            "SELECT menu_path, located FROM local_setting_heads WHERE series_id=?", (series_id,)
+            "SELECT installation_id, namespace, raw_name, menu_path, located"
+            " FROM local_setting_heads WHERE series_id=?",
+            (series_id,),
         ).fetchone()
         if old is not None:
+            # The slot belongs to the *previous* head's identity; a correction
+            # that renames or moves the entry must release exactly that slot.
             self.connection.execute(
                 "DELETE FROM local_setting_slots WHERE installation_id=? AND namespace=?"
                 " AND raw_name=? AND menu_path=?",
-                (installation_id, namespace, raw_name, old["menu_path"]),
+                (old["installation_id"], old["namespace"], old["raw_name"], old["menu_path"]),
             )
         self.connection.execute(
             "INSERT INTO local_setting_heads(series_id, local_setting_id, installation_id, namespace,"

@@ -26,6 +26,7 @@ from game_app.contracts.primitives import (
     Scalar,
     StrictModel,
     TimeRange,
+    Timestamp,
 )
 
 LegacyUnknownReason = Literal[
@@ -105,8 +106,8 @@ class EvidenceRef(StrictModel):
 
 class Provenance(StrictModel):
     method: AcquisitionMethod
-    observed_at: str | None = None
-    recorded_at: str
+    observed_at: Timestamp | None = None
+    recorded_at: Timestamp
     evidence_refs: list[EvidenceRef]
     note: str | None = None
 
@@ -124,16 +125,25 @@ class CheckResult(StrictModel):
     status: CheckStatus
     input_refs: list[ObjectRef] = Field(default_factory=list)
     evidence_refs: list[EvidenceRef] = Field(default_factory=list)
-    checked_at: str | None
+    checked_at: Timestamp | None
     method: str
     note: str | None = None
+
+    @model_validator(mode="after")
+    def checked_at_matches_status(self) -> "CheckResult":
+        if self.status in (CheckStatus.pass_, CheckStatus.fail):
+            if self.checked_at is None:
+                raise ValueError("a pass/fail check records when it ran")
+        if self.status is CheckStatus.not_run and self.checked_at is not None:
+            raise ValueError("a not_run check has no checked_at")
+        return self
 
 
 class AcquisitionAttempt(StrictModel):
     id: ID
     method: AcquisitionMethod
     status: AcquisitionStatus
-    attempted_at: str
+    attempted_at: Timestamp
     error_code: str | None = None
     information_response_id: ID | None = None
 
@@ -189,6 +199,8 @@ class FieldValue(StrictModel, Generic[T]):
                 raise ValueError("known values cannot be null")
             if self.unknown_reason is not None:
                 raise ValueError("known values cannot carry an unknown_reason")
+            if not self.provenance:
+                raise ValueError("known values require at least one provenance record")
         elif self.value_state is ValueState.unknown:
             if self.value is not None:
                 raise ValueError("unknown values must be null")

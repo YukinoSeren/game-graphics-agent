@@ -419,6 +419,7 @@ def test_verified_alias_matches_the_existing_series(identity):
 
 
 def test_resolve_game_identity_adds_a_verified_version_in_the_same_series(identity):
+    _insert_source_revision(identity.repository, 900)
     selected = _select(identity, _request(), "selection-key")
     provisional = identity.repository.get_object("Game", selected.refs[1].entity_id).payload
 
@@ -726,3 +727,105 @@ def test_declaration_slot_uses_the_specified_normalisation(identity):
     lower = _select(identity, _request("Platform Game", platform="steam"), "key-6")
     assert _selection(identity, upper.refs[0].entity_id).game_revision_id != \
         _selection(identity, lower.refs[0].entity_id).game_revision_id
+
+
+# --- review fix pass 2: exact automatic matching -----------------------------
+
+
+def test_automatic_matching_keeps_internal_whitespace_exact(identity):
+    with identity.repository.unit_of_work() as uow:
+        uow.insert_versioned("Game", _game(1, 101, "Two Spaces"))
+
+    exact = _select(identity, _request("Two Spaces", platform="steam"), "key-exact")
+    assert exact.refs[1].entity_id == _uid(1)
+
+    # A different internal spacing is not the same declared name: no automatic
+    # match, so a provisional identity is created instead.
+    variant = _select(identity, _request("Two  Spaces", platform="steam"), "key-variant")
+    assert variant.refs[1].entity_id != _uid(1)
+    assert _count(identity.repository, "Game") == 2
+
+
+# --- review fix pass 2: identity evidence and mapping ------------------------
+
+
+def _insert_source_revision(repo, revision_id: int) -> str:
+    from game_app.repository import canonical_json
+
+    with repo.unit_of_work() as uow:
+        uow.insert_object_bytes(
+            "SourceRevision",
+            schema_version="product-contract/0.4",
+            raw=canonical_json({"id": _uid(revision_id)}),
+            object_id=_uid(revision_id),
+        )
+    return _uid(revision_id)
+
+
+def _evidence_at(revision_id: int) -> EvidenceRef:
+    return EvidenceRef(
+        kind="source_location",
+        source_revision_id=_uid(revision_id),
+        block_id="block-1",
+        scope="section",
+        quote="Official launcher entry names the game.",
+        quote_hash="e" * 64,
+    )
+
+
+def test_resolve_game_identity_refuses_evidence_that_does_not_resolve(identity):
+    selected = _select(identity, _request(), "selection-key")
+    series = identity.repository.get_object("Game", selected.refs[1].entity_id).payload["series_id"]
+
+    resolution = identity.resolve_game_identity(
+        series_id=series,
+        platform_scope=["steam"],
+        evidence_refs=[_evidence_at(900)],  # no such SourceRevision exists
+        checks=[_check()],
+    )
+    assert resolution.game_ref is None
+    assert "source revision" in resolution.reason
+    assert _count(identity.repository, "Game") == 1
+
+
+def test_resolve_game_identity_records_a_legacy_mapping(identity):
+    _insert_source_revision(identity.repository, 900)
+    selected = _select(identity, _request(), "selection-key")
+    series = identity.repository.get_object("Game", selected.refs[1].entity_id).payload["series_id"]
+
+    resolution = identity.resolve_game_identity(
+        series_id=series,
+        platform_scope=["steam"],
+        evidence_refs=[_evidence_at(900)],
+        checks=[_check()],
+        legacy_namespace="collector_run:run-1",
+        legacy_value="legacy-game-id",
+    )
+    assert resolution.game_ref is not None
+
+    with identity.repository.unit_of_work() as uow:
+        mappings = uow.iter_objects("IdentityMapping")
+    assert len(mappings) == 1
+    payload = mappings[0].payload
+    assert payload["legacy_namespace"] == "collector_run:run-1"
+    assert payload["legacy_value"] == "legacy-game-id"
+    assert payload["target_game_id"] == series
+
+
+def test_a_legacy_mapping_requires_a_non_empty_namespace_and_value(identity):
+    _insert_source_revision(identity.repository, 900)
+    selected = _select(identity, _request(), "selection-key")
+    series = identity.repository.get_object("Game", selected.refs[1].entity_id).payload["series_id"]
+
+    with pytest.raises(ContractError) as caught:
+        identity.resolve_game_identity(
+            series_id=series,
+            platform_scope=["steam"],
+            evidence_refs=[_evidence_at(900)],
+            checks=[_check()],
+            legacy_namespace="collector_run:run-1",
+            legacy_value="   ",
+        )
+    assert caught.value.code is ErrorCode.INPUT_VALIDATION_FAILED
+    assert _count(identity.repository, "Game") == 1
+    assert _count(identity.repository, "IdentityMapping") == 0

@@ -139,15 +139,18 @@ class DeviceService:
         readings = self._read(paths)
         snapshot_id = new_id()
         artifacts = self._store_originals(snapshot_id, readings)
-        snapshot, gpus_by_index = self._assemble(snapshot_id, paths, readings, artifacts)
+        snapshot, gpus_by_index, field_values = self._assemble(
+            snapshot_id, paths, readings, artifacts
+        )
+        request = self._plan_questions(
+            context, task_input, snapshot, readings, gpus_by_index, field_values,
+            stored_context,
+        )
+        # The snapshot and the question about it are one fact: a consumer must
+        # never see a snapshot whose failures were not asked about.
         with self.repository.unit_of_work() as uow:
             uow.insert_versioned("DeviceSnapshot", snapshot)
-
-        request = self._plan_questions(
-            context, task_input, snapshot, readings, gpus_by_index, stored_context
-        )
-        if request is not None:
-            with self.repository.unit_of_work() as uow:
+            if request is not None:
                 uow.insert_object("InformationRequest", request)
 
         result_refs = [ObjectRef(entity_type="DeviceSnapshot", entity_id=snapshot.id)]
@@ -158,7 +161,8 @@ class DeviceService:
 
         critical_unknown = [
             path for path in paths
-            if is_critical(path) and not self._is_known(snapshot, path, gpus_by_index)
+            if is_critical(path)
+            and not self._is_known(snapshot, path, gpus_by_index, field_values)
         ]
         if critical_unknown and request is not None:
             # The player must answer before device matching can proceed; the
@@ -167,7 +171,10 @@ class DeviceService:
                 information_request_id=request.id, result_refs=result_refs
             )
 
-        known = [path for path in paths if self._is_known(snapshot, path, gpus_by_index)]
+        known = [
+            path for path in paths
+            if self._is_known(snapshot, path, gpus_by_index, field_values)
+        ]
         if not known:
             code = "unavailable"
             state = TaskState.failed
@@ -257,12 +264,17 @@ class DeviceService:
         paths: Sequence[str],
         readings: Sequence[ProbeReading],
         originals: dict[str, Any],
-    ) -> tuple[DeviceSnapshot, dict[int, GpuSnapshot]]:
+    ) -> tuple[DeviceSnapshot, dict[int, GpuSnapshot], dict[str, FieldValue]]:
         by_path = {reading.field_path: reading for reading in readings}
         captured = utc_now()
+        # Every probed path keeps its own value state: a composite such as the
+        # desktop resolution must not decide whether its halves were obtained.
+        field_values: dict[str, FieldValue] = {}
 
         def value_for(path: str, parser) -> FieldValue:
-            return self._field_value(path, by_path.get(path), originals.get(path), parser)
+            value = self._field_value(path, by_path.get(path), originals.get(path), parser)
+            field_values[path] = value
+            return value
 
         gpu_indices = sorted({
             int(_GPU_PATH.match(path).group(1))
@@ -317,6 +329,19 @@ class DeviceService:
             self._probe_check(path, by_path.get(path), originals.get(path))
             for path in paths
         ]
+        if not gpu_indices:
+            # An empty GPU list must never read as "this machine has no GPU":
+            # record that the group was not examined in this scan.
+            checks.append(CheckResult(
+                check_id="probe.gpus",
+                definition_version="probe-checks/0.4",
+                status=CheckStatus.not_run,
+                input_refs=[],
+                evidence_refs=[],
+                checked_at=None,
+                method="controlled probe",
+                note="no GPU field was requested; the empty list is not a finding",
+            ))
         return DeviceSnapshot(
             id=snapshot_id,
             schema_version=PRODUCT_CONTRACT_VERSION,
@@ -338,7 +363,7 @@ class DeviceService:
             ),
             power_context={},
             checks=checks,
-        ), gpus_by_index
+        ), gpus_by_index, field_values
 
     def _field_value(self, path: str, reading, original, parser) -> FieldValue:
         if reading is None:
@@ -437,12 +462,15 @@ class DeviceService:
         snapshot: DeviceSnapshot,
         readings: Sequence[ProbeReading],
         gpus_by_index: dict[int, GpuSnapshot],
+        field_values: dict[str, FieldValue],
         stored_context: Any,
     ) -> InformationRequest | None:
         unknown_paths = [
             reading.field_path
             for reading in readings
-            if not self._is_known(snapshot, reading.field_path, gpus_by_index)
+            if not self._is_known(
+                snapshot, reading.field_path, gpus_by_index, field_values
+            )
         ]
         if not unknown_paths:
             return None
@@ -497,16 +525,21 @@ class DeviceService:
 
     @staticmethod
     def _is_known(
-        snapshot: DeviceSnapshot, path: str, gpus_by_index: dict[int, GpuSnapshot]
+        snapshot: DeviceSnapshot,
+        path: str,
+        gpus_by_index: dict[int, GpuSnapshot],
+        field_values: dict[str, FieldValue],
     ) -> bool:
         if path in ("cpu", "memory_bytes", "os_version", "device_form"):
             return getattr(snapshot, path).value_state is ValueState.known
-        if path == "display.desktop_resolution.width":
-            return snapshot.display.desktop_resolution.value_state is ValueState.known
-        if path == "display.desktop_resolution.height":
-            return snapshot.display.desktop_resolution.value_state is ValueState.known
-        if path == "display.refresh_hz":
-            return snapshot.display.refresh_hz.value_state is ValueState.known
+        if path in (
+            "display.desktop_resolution.width",
+            "display.desktop_resolution.height",
+            "display.refresh_hz",
+        ):
+            # Each axis is judged on its own probe result, not on the composite.
+            value = field_values.get(path)
+            return value is not None and value.value_state is ValueState.known
         match = _GPU_PATH.match(path)
         if match is not None:
             index, attribute = int(match.group(1)), match.group(2)

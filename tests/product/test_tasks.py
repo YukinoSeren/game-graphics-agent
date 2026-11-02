@@ -8,6 +8,7 @@ import threading
 import pytest
 
 from game_app.contracts.common import MutationContext
+from game_app.contracts.enums import TaskState
 from game_app.errors import ContractError, ErrorCode
 from game_app.files import FileService
 from game_app.tasks import HandlerOutcome, TaskService
@@ -611,3 +612,168 @@ def test_same_cancel_key_with_a_different_task_conflicts(repo_factory):
     # with the same key is an independent submission and must still work.
     service.cancel_task(second.task_id, _ctx("cancel-key"))
     assert service.get_task(second.task_id).task.state.value == "cancelled"
+
+
+# --- review fix pass 2: task read/resume integrity ---------------------------
+
+
+def _domain_result(ctx, *, status=None):
+    from game_app.contracts.common import CheckResult
+    from game_app.contracts.enums import CheckStatus, TaskType
+    from game_app.contracts.tasks import DomainResult
+
+    return DomainResult(
+        domain=TaskType.knowledge,
+        code="completed_scope",
+        input_revision=ctx.task_input_revision,
+        checks=[CheckResult(
+            check_id="domain.check",
+            definition_version="checks/0.4",
+            status=status or CheckStatus.pass_,
+            input_refs=[],
+            evidence_refs=[],
+            checked_at="2026-11-02T00:00:00+00:00",
+            method="deterministic rule",
+        )],
+    )
+
+
+def test_get_task_reads_a_persisted_domain_result_with_checks(repo_factory):
+    repo = repo_factory()
+    service = _service(repo)
+
+    def handler(ctx):
+        return HandlerOutcome(state=TaskState.completed, domain_result=_domain_result(ctx))
+
+    service.handlers["knowledge"] = handler
+    accepted = service.register_task(_knowledge_input(), _ctx())
+    assert service.run_once().state.value == "completed"
+
+    view = service.get_task(accepted.task_id)
+    assert view.task.domain_result is not None
+    assert view.task.domain_result.checks[0].status.value == "pass"
+
+
+def test_a_resumed_task_owns_a_copy_of_its_inherited_checkpoint(repo_factory):
+    repo = repo_factory()
+    service = _service(repo)
+    parent = service.register_task(_knowledge_input(), _ctx("k1"))
+    parent_checkpoint = service.record_checkpoint(parent.task_id, ["acquire"])
+    service.recover_on_startup()
+
+    first = service.resume_task(
+        {"parent_task_id": parent.task_id, "checkpoint_id": parent_checkpoint, "budget": {}},
+        _ctx("k2"),
+    )
+    inherited = service.get_task(first.task_id).task.checkpoint_id
+    assert inherited is not None and inherited != parent_checkpoint
+    assert service.get_task(first.task_id).progress.completed_steps == ["acquire"]
+
+    service.recover_on_startup()
+    second = service.resume_task(
+        {"parent_task_id": first.task_id, "checkpoint_id": inherited, "budget": {}},
+        _ctx("k3"),
+    )
+    assert second.task_id != first.task_id
+    assert service.get_task(second.task_id).progress.completed_steps == ["acquire"]
+
+    # The parent's own checkpoint row and pointer are untouched.
+    assert service.get_task(parent.task_id).task.checkpoint_id == parent_checkpoint
+    with repo.unit_of_work() as uow:
+        row = uow.query(
+            "SELECT task_id FROM task_checkpoints WHERE checkpoint_id=?", (parent_checkpoint,)
+        )[0]
+    assert row["task_id"] == parent.task_id
+
+
+def test_resume_reuses_an_already_succeeded_call_instead_of_resending(repo_factory):
+    repo = repo_factory()
+    provider = SpyProvider()
+    service = _service(repo, provider)
+
+    def handler(ctx):
+        _invoke_model(ctx)
+        ctx.checkpoint(["acquire"])
+        return HandlerOutcome.completed()
+
+    service.handlers["knowledge"] = handler
+    parent = service.register_task(_knowledge_input(model_calls=2), _ctx("k1"))
+    assert service.run_once().state.value == "completed"
+    assert provider.sends == 1
+    checkpoint = service.get_task(parent.task_id).task.checkpoint_id
+
+    resumed = service.resume_task(
+        {"parent_task_id": parent.task_id, "checkpoint_id": checkpoint,
+         "budget": {"max_model_calls": 2}},
+        _ctx("k2"),
+    )
+    service.handlers["knowledge"] = handler
+    outcome = service.run_once()
+
+    assert outcome.state.value == "completed"
+    assert provider.sends == 1  # the completed step was reused, not re-sent
+    calls = _calls(repo, resumed.task_id)
+    assert [call["call_state"] for call in calls] == ["succeeded"]
+    assert calls[0]["response_file_id"]
+    # A reused call never entered the send window, so it consumes no budget.
+    with repo.unit_of_work() as uow:
+        counters = uow.query(
+            "SELECT calls FROM tasks WHERE task_id=?", (resumed.task_id,)
+        )[0]["calls"]
+    assert '"model":0' in counters
+
+
+def test_task_view_exposes_the_persisted_error(repo_factory):
+    repo = repo_factory()
+    provider = SpyProvider(mode="unknown")
+    service = _service(repo, provider)
+
+    def handler(ctx):
+        _invoke_model(ctx)
+
+    service.handlers["knowledge"] = handler
+    accepted = service.register_task(_knowledge_input(model_calls=1), _ctx())
+    assert service.run_once().state.value == "partial"
+
+    view = service.get_task(accepted.task_id)
+    assert view.error is not None
+    assert view.error.code is ErrorCode.CALL_OUTCOME_UNKNOWN
+    assert view.error.request_id == accepted.task_id
+
+
+def test_task_view_lists_the_questions_it_raised(repo_factory):
+    repo = repo_factory()
+    service = _service(repo)
+
+    def handler(ctx):
+        ctx.suspend(information_request_id=_uid(702))
+
+    service.handlers["knowledge"] = handler
+    accepted = service.register_task(_knowledge_input(), _ctx())
+    assert service.run_once().state.value == "waiting_input"
+
+    view = service.get_task(accepted.task_id)
+    assert view.task.information_request_ids == [_uid(702)]
+    assert view.error is None
+
+
+def test_task_view_lists_a_question_returned_with_a_partial_result(repo_factory):
+    from game_app.contracts.primitives import ObjectRef
+
+    repo = repo_factory()
+    service = _service(repo)
+
+    def handler(ctx):
+        return HandlerOutcome(
+            state=TaskState.partial,
+            result_refs=[
+                ObjectRef(entity_type="InformationRequest", entity_id=_uid(703)),
+            ],
+        )
+
+    service.handlers["knowledge"] = handler
+    accepted = service.register_task(_knowledge_input(), _ctx())
+    assert service.run_once().state.value == "partial"
+
+    view = service.get_task(accepted.task_id)
+    assert view.task.information_request_ids == [_uid(703)]

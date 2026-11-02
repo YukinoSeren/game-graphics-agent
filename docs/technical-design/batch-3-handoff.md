@@ -46,12 +46,13 @@ A-1 先做（最小、解除长期缺口）；A-2 与 A-3 可并行；A-4 依赖
 
 | 规则 | 实现要求 |
 |---|---|
-| 形状 | `kind="log_import"`、`file_id: ID`、`source_schema: str`、`session_id: ID`、`segment_ref: BindingRef`、`target: ...`（按 04 §4.3 的 `ExistingLogTarget` / `HistoricalLogTarget` 判别） |
-| 校验 | `file_id` 为 32 位 hex；`source_schema` 非空白；`segment_ref` 的两修订 >= 1 |
+| 形状 | 按 data §9：`kind="log_import"`、`file_id: ID`、`session_id: ID`、`segment_ref: BindingRef`、`source_schema: str` |
+| 校验 | `file_id` 为 32 位 hex；`source_schema` 非空白；`segment_ref.segment_revision` / `binding_revision` >= 1 |
 | 路由 | `DEFAULT_ROUTES["log_import"] = "/api/log-imports"` |
 | 不执行 | **不注册 handler**；`Application.register_task` 对 `log_import` 仍然拒绝（因为无 handler），这是预期行为，写进测试 |
 
-> 若 04 §4.3 对本切片要求的字段与上表不同，以规格为准并先改规格。
+> 历史日志的锚点/目标（`ExistingLogTarget` / `HistoricalLogTarget`）属于 04 §4.3 的
+> `LogAssociationRequest` 同步入口，**不**进入 `LogImportInput`。
 
 ### 2.2 失败测试
 

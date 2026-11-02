@@ -134,16 +134,18 @@ Blocked：<Q1/Q2/G-* 相关跳过项>
 
 ## 2. 批次任务清单
 
-把下面某一节的正文替换进主提示词的 `{{批次任务清单}}`。
-顺序不能打乱：`PERF-T02` 会往 task union 加 `LogImportInput`，`KNW-T02` 依赖批次 2D
-之后才可达的 `published`。
+剩余工作拆成 7 个批次。把某一节的正文替换进主提示词的 `{{批次任务清单}}`，
+或直接用 `scripts/run_batches.sh`（BATCHES 默认 A—G）。
+
+顺序不能打乱：批次 A 会往 task union 加 `LogImportInput`；批次 C 依赖批次 2D
+之后才可达的 `published`；批次 D 依赖批次 C 的包。
 
 <!-- BATCH-A-BEGIN -->
-### 批次 A — 性能
+### 批次 A — 会话、绑定与测试协议（PERF-T02）
 
 ```text
-按此顺序执行，每个切片各自提交、各自评审。
-执行指令：docs/technical-design/batch-3-handoff.md（先读它，按其中的切片顺序与规则做）。
+执行指令：docs/technical-design/batch-3-handoff.md
+先读它，按其中的切片顺序、规则与失败测试清单做。
 
 1. A-1 LogImportInput 进入 task union（补批次 2D 的唯一遗留缺口）
 2. A-2 会话与不可变绑定：create_session / end_segment / split_segment /
@@ -151,17 +153,42 @@ Blocked：<Q1/Q2/G-* 相关跳过项>
 3. A-3 测试协议与指标目录：list_metric_definitions / create_test_protocol
 4. A-4 历史日志关联：inspect_log / associate_log
 
-本批只覆盖 PERF-T02。PERF-T03/T04 与 VAL-T02 框架在下一批另写交接。
-禁用：任何真实采集适配器、真实游戏进程、真实 GPU 查询、PresentMon。
+本批只覆盖 PERF-T02。禁止真实采集适配器、真实游戏进程、真实 GPU 查询、PresentMon。
 ```
 
 <!-- BATCH-A-END -->
 
 <!-- BATCH-B-BEGIN -->
-### 批次 B — 知识
+### 批次 B — 分析与采集生命周期（PERF-T03、PERF-T04、VAL-T02 框架）
 
 ```text
 前置：批次 A 已完成并推送。
+
+按此顺序执行，每个任务各自提交、各自评审：
+
+1. PERF-T03 分析/比较/比较协议/日志关联（04 §10）
+   - analyze_input 只接受已闭合段/绑定的具体修订；开放修订拒绝
+   - ComparisonProtocol 创建即冻结；baseline_derived 阈值由后台复算
+   - 产物：tests/product/test_metrics.py
+2. PERF-T04 自有采集租约/收尾/恢复（04 §10）
+   - 租约状态 prepared/owned/finalized/unresolved，每次变化留事件
+   - 重启遇到可能仍活动的进程：先核验 PID+启动时刻+native_name，
+     无法确认即 PRECONDITION_UNVERIFIED，不启动第二次采集
+   - 产物：tests/product/test_capture_lifecycle.py
+3. VAL-T02 框架（08 §10）
+   - 只建确定性/故障串联框架，不宣称全量结案
+   - 产物：tests/product/test_contracts.py、test_faults.py
+
+禁止启动任何真实采集工具或游戏进程；所有计时用时间桩。
+```
+
+<!-- BATCH-B-END -->
+
+<!-- BATCH-C-BEGIN -->
+### 批次 C — 知识（KNW-T02、KNW-T03、KNW-T04）
+
+```text
+前置：批次 B 已完成并推送。
 
 按此顺序执行：
 
@@ -176,13 +203,13 @@ Blocked：<Q1/Q2/G-* 相关跳过项>
    - 产物：tests/product/test_impacts.py
 ```
 
-<!-- BATCH-B-END -->
+<!-- BATCH-C-END -->
 
-<!-- BATCH-C-BEGIN -->
-### 批次 C — 推荐
+<!-- BATCH-D-BEGIN -->
+### 批次 D — 推荐（REC-T01、REC-T02、REC-T03）
 
 ```text
-前置：批次 B 已完成并推送。
+前置：批次 C 已完成并推送。
 
 按此顺序执行：
 
@@ -193,13 +220,13 @@ Blocked：<Q1/Q2/G-* 相关跳过项>
 R03 仍是建议而非已确认规则：不得据其宣布 readiness 或 actionable。
 ```
 
-<!-- BATCH-C-END -->
+<!-- BATCH-D-END -->
 
-<!-- BATCH-D-BEGIN -->
-### 批次 D — 反馈与效果
+<!-- BATCH-E-BEGIN -->
+### 批次 E — 反馈与研究导入（FBK-T01—T03、IMP-T04）
 
 ```text
-前置：批次 C 已完成并推送。
+前置：批次 D 已完成并推送。
 
 按此顺序执行：
 
@@ -207,15 +234,15 @@ R03 仍是建议而非已确认规则：不得据其宣布 readiness 或 actiona
 2. FBK-T02 下一动作/合法 ChangeSet/LoopGuard（05 §10）→ tests/product/test_next_actions.py
 3. FBK-T03 效果/接受/Outcome 与 manifest（05 §10）→ tests/product/test_outcomes.py
 4. IMP-T04 研究 mapper/独立标注门禁（02a §10）→ tests/product/test_research_import.py
-   - 与研究样本无关时不得用夹具顶替真实未见评价
+   - 没有研究样本时不得用夹具顶替真实未见评价
 
 效果结论最多到 offline_fixture；local_effect 必须有真实会话证据才可声明。
 ```
 
-<!-- BATCH-D-END -->
+<!-- BATCH-E-END -->
 
-<!-- BATCH-E-BEGIN -->
-### 批次 E — 入口与页面（受 Q1 门禁）
+<!-- BATCH-F-BEGIN -->
+### 批次 F — 入口与页面（受 Q1 门禁）
 
 ```text
 先检查 Q1（产品形态：本地网页）是否已在仓库文档中被明确回答。
@@ -231,13 +258,13 @@ R03 仍是建议而非已确认规则：不得据其宣布 readiness 或 actiona
 并在最终报告的 Blocked 段中写明。
 ```
 
-<!-- BATCH-E-END -->
+<!-- BATCH-F-END -->
 
-<!-- BATCH-F-BEGIN -->
-### 批次 F — 验证与交付
+<!-- BATCH-G-BEGIN -->
+### 批次 G — 验证与交付（VAL-T03、VAL-T04、ENG-T05）
 
 ```text
-前置：批次 A—D 已完成；批次 E 若被 Q1 阻塞则先报告。
+前置：批次 A—E 已完成；批次 F 若被 Q1 阻塞则先报告。
 
 按此顺序执行：
 
@@ -249,9 +276,9 @@ R03 仍是建议而非已确认规则：不得据其宣布 readiness 或 actiona
    - 不反向阻断测试服务
 ```
 
----
+<!-- BATCH-G-END -->
 
-<!-- BATCH-F-END -->
+---
 
 ## 3. 使用要点
 
@@ -265,7 +292,7 @@ R03 仍是建议而非已确认规则：不得据其宣布 readiness 或 actiona
 5. 每批次结束后核对 `docs/technical-design/implementation-plan.md` 的复选框，
    当前该文档与真实进度已脱节（VAL-T01 已完成但未勾选）。
 
-### 3.1 一条命令跑完 A—F
+### 3.1 一条命令跑完 A—G
 
 `scripts/run_batches.sh` 把 §1 与 §2 拼成每批提示词，用独立的 `claude -p` 进程
 逐批执行，上下文天然隔离；上一批的报告原文注入下一批。
@@ -275,7 +302,7 @@ DRY_RUN=1 bash scripts/run_batches.sh            # 只拼提示词，不调用�
 git switch -c auto/remaining                     # 建议：在分支上跑
 UNATTENDED=1 I_ACCEPT_UNATTENDED=1 \
   bash scripts/run_batches.sh > .superpowers/batch-runs/driver.log 2>&1 &
-BATCHES="C D E F" bash scripts/run_batches.sh     # 失败后续跑
+BATCHES="C D E F G" bash scripts/run_batches.sh     # 失败后续跑
 ```
 
 - 不加 `UNATTENDED` 时使用受限权限集（`acceptEdits` + 明确的工具白名单），
@@ -290,8 +317,10 @@ BATCHES="C D E F" bash scripts/run_batches.sh     # 失败后续跑
 
 | 类别 | 内容 |
 |---|---|
-| 可立即开工 | PERF-T02、KNW-T02、VAL-T02 框架 |
-| 需要前置批次 | PERF-T03/T04、KNW-T03/T04、REC-*、FBK-*、IMP-T04、VAL-T03 |
+| 批次 A（可立即开工） | PERF-T02 |
+| 批次 B（依赖 A） | PERF-T03、PERF-T04、VAL-T02 框架 |
+| 批次 C—E（顺序依赖） | KNW-T02/T03/T04、REC-T01/02/03、FBK-T01/02/03、IMP-T04 |
+| 批次 G | VAL-T03、VAL-T04、ENG-T05 |
 | 受 Q1 阻塞 | ENG-T04、UX-T01/T02/T03 |
 | 受真实证据门禁 | VAL-T04、ENG-T05 的效果分级部分、所有 G-* 能力 |
 | 代码债务 | 6 条 review Minor（内联 document 强转、device_scan 上下文归属未校验等），建议在 PERF-T02 前清掉前两条 |

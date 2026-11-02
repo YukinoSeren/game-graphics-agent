@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run the remaining implementation batches back to back, one fresh session each.
 #
-#   bash scripts/run_batches.sh                 # all batches A-F, guarded permissions
+#   bash scripts/run_batches.sh                 # all batches A-G, guarded permissions
 #   BATCHES="A" bash scripts/run_batches.sh     # just one batch
 #   DRY_RUN=1 bash scripts/run_batches.sh       # assemble prompts, run nothing
 #
@@ -24,7 +24,7 @@ cd "$REPO_ROOT" || exit 2
 
 DOC="docs/technical-design/one-shot-prompts.md"
 RUN_DIR=".superpowers/batch-runs"
-BATCHES="${BATCHES:-A B C D E F}"
+BATCHES="${BATCHES:-A B C D E F G}"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-2}"
 RETRY_SLEEP="${RETRY_SLEEP:-60}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -38,8 +38,8 @@ fi
 
 # These values reach the shell as loop words, an arithmetic bound and a sleep
 # argument; keep each one to a plain token so nothing else can be interpreted.
-if [[ ! "$BATCHES" =~ ^[A-F[:space:]]+$ ]]; then
-  echo "BATCHES must list batch letters A-F separated by spaces" >&2
+if [[ ! "$BATCHES" =~ ^[A-G[:space:]]+$ ]]; then
+  echo "BATCHES must list batch letters A-G separated by spaces" >&2
   exit 2
 fi
 for value in "$MAX_ATTEMPTS" "$RETRY_SLEEP"; do

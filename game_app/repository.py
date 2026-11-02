@@ -1330,6 +1330,16 @@ class UnitOfWork:
         return revision
 
     # -- metric rule registry ----------------------------------------------
+    def find_metric_rule(
+        self, *, metric_key: str, registry_version: str, rule_hash: str
+    ) -> str | None:
+        row = self.connection.execute(
+            "SELECT definition_id FROM metric_definition_rules"
+            " WHERE metric_key=? AND registry_version=? AND rule_hash=?",
+            (metric_key, registry_version, rule_hash),
+        ).fetchone()
+        return None if row is None else row["definition_id"]
+
     def record_metric_rule(
         self, *, metric_key: str, registry_version: str, rule_hash: str, definition_id: str
     ) -> None:

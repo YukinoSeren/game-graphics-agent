@@ -38,14 +38,19 @@ from game_app.contracts.performance import (
     BindConfigurationRequest,
     ConfigurationBinding,
     CreateSessionRequest,
+    CreateTestProtocolRequest,
     EndSessionRequest,
     EndSegmentRequest,
+    MetricCatalogQuery,
+    MetricChoicePage,
+    MetricDefinition,
     PlaySession,
     RunConditions,
     RunDeclarationInput,
     SessionSegment,
     SplitSegmentRequest,
     StreamSelection,
+    TestProtocol,
 )
 from game_app.contracts.primitives import (
     BindingRange,
@@ -56,6 +61,7 @@ from game_app.contracts.primitives import (
 )
 from game_app.errors import ContractError, ErrorCode, FieldError, empty_details
 from game_app.files import FileService, PublishHooks
+from game_app import metrics
 from game_app.repository import ProductRepository, UnitOfWork, canonical_json
 
 PRODUCT_CONTRACT_VERSION = "product-contract/0.4"
@@ -65,9 +71,12 @@ SESSION_END_ROUTE = "/api/play-sessions/{session_id}/end"
 SEGMENT_END_ROUTE = "/api/session-segments/{segment_id}/end"
 SEGMENT_SPLIT_ROUTE = "/api/session-segments/{segment_id}/split"
 SEGMENT_BIND_ROUTE = "/api/session-segments/{segment_id}/bindings"
+TEST_PROTOCOL_ROUTE = "/api/test-protocols"
+TEST_PROTOCOL_RULE_VERSION = "test-protocol/0.4"
 SESSION_TIME_BASIS = "session"
 
 _ID_NAMESPACE = UUID("9c3d7b0e-6a24-4f18-9e53-1b7c2d5a4e60")
+_METRIC_ID_NAMESPACE = UUID("4b1e2f7a-3c58-4d90-8a61-7e2d9c0b5f13")
 
 _PAIR_WIDTHS = {"output_width": "output_height", "output_height": "output_width",
                 "render_width": "render_height", "render_height": "render_width"}
@@ -75,6 +84,9 @@ _FIXED_CONDITIONS = frozenset({
     "output_width", "output_height", "render_width", "render_height",
     "frame_generation", "upscaling", "scenario",
 })
+# ``scenario`` is a separate test-protocol field and must not be repeated in
+# the condition map (04 §4.4).
+_PROTOCOL_CONDITIONS = _FIXED_CONDITIONS - {"scenario"}
 
 
 def _deterministic_id(*parts: str) -> str:
@@ -760,6 +772,354 @@ class PerformanceService:
             self._record_resource(uow, context, route, request_schema_version, request_hash, result)
             return result
 
+    # -- metric catalog and test protocols (04 §4.4) -----------------------
+    def list_metric_definitions(self, query: MetricCatalogQuery) -> MetricChoicePage:
+        """Read-only: name every packaged rule, with a registered definition id.
+
+        An empty database returns ``definition_id=null`` and writes nothing;
+        the definition is allocated lazily when a protocol is created.
+        """
+        with self.repository.unit_of_work() as uow:
+            ids = {}
+            for rule in metrics.RULES:
+                found = uow.find_metric_rule(
+                    metric_key=rule.metric_key,
+                    registry_version=metrics.REGISTRY_VERSION,
+                    rule_hash=rule.rule_hash,
+                )
+                if found is not None:
+                    ids[rule.key] = found
+        return metrics.catalog(query.frame_stream_kind, ids)
+
+    def get_test_protocol(self, protocol_id: str) -> TestProtocol:
+        with self.repository.unit_of_work() as uow:
+            return self._load_test_protocol(uow, protocol_id)
+
+    def require_comparison_protocol(self, protocol_id: str) -> None:
+        """Type guard for ``CompareInput.protocol_id`` (PERF-T03 consumes it).
+
+        A ``TestProtocol`` id is the wrong entity type and must not be accepted
+        by the comparison entry.
+        """
+        with self.repository.unit_of_work() as uow:
+            stored = uow.find_object("ComparisonProtocol", protocol_id)
+        if stored is None:
+            raise ContractError(
+                ErrorCode.REFERENCE_INVALID,
+                "the referenced comparison protocol does not exist",
+            )
+
+    def create_test_protocol(
+        self,
+        request: CreateTestProtocolRequest,
+        context: MutationContext,
+        *,
+        request_schema_version: str = PRODUCT_CONTRACT_VERSION,
+        hooks: PublishHooks | None = None,
+    ) -> ResourceResult:
+        route = TEST_PROTOCOL_ROUTE
+        request_hash = _request_hash(route, request_schema_version, request)
+        game_id = self._peek_game_id(request.game_context_id)
+        if not self._has_registered(context, route):
+            self._validate_test_protocol(request, context.user_scope_id)
+        protocol_id = _deterministic_id(
+            context.user_scope_id, route, context.idempotency_key, request_hash, "protocol",
+        )
+        now = self.clock()
+        definition_ids = {
+            rule.key: _metric_definition_id(rule)
+            for rule in metrics.RULES
+            if rule.key in request.metric_keys
+        }
+        manifest = {
+            "kind": "test_protocol_declaration",
+            "rule_version": TEST_PROTOCOL_RULE_VERSION,
+            "registry_version": metrics.REGISTRY_VERSION,
+            "registry_manifest_hash": metrics.registry_manifest_hash(),
+            "game_context_id": request.game_context_id,
+            "game_id": game_id,
+            "protocol_id": protocol_id,
+            "input": request.model_dump(mode="json"),
+            "metric_definitions": definition_ids,
+            "registered_at": now,
+        }
+        published = self.files.publish(
+            kind="import",
+            files={f"test-protocols/{protocol_id}/declaration.json": canonical_json(manifest)},
+            user_scope_id=context.user_scope_id,
+            method="POST",
+            canonical_route=route,
+            key=context.idempotency_key,
+            request_schema_version=request_schema_version,
+            request_hash=request_hash,
+            writer=lambda uow, operation, managed: self._write_test_protocol(
+                uow, request=request, user_scope_id=context.user_scope_id,
+                protocol_id=protocol_id, now=now, definition_ids=definition_ids,
+                managed=managed,
+            ),
+            hooks=hooks,
+        )
+        return ResourceResult(refs=[ObjectRef.model_validate(ref) for ref in published.refs])
+
+    def _validate_test_protocol(
+        self, request: CreateTestProtocolRequest, user_scope_id: str
+    ) -> None:
+        with self.repository.unit_of_work() as uow:
+            game_id = self._context_game(uow, request.game_context_id, user_scope_id)
+            if request.parent_protocol_id is not None:
+                parent = self._load_test_protocol(uow, request.parent_protocol_id)
+                if parent.game_id != game_id:
+                    raise ContractError(
+                        ErrorCode.REFERENCE_INVALID,
+                        "the parent protocol belongs to another game",
+                        field_errors=[FieldError(
+                            path="parent_protocol_id", code="reference",
+                            message="cross-game parent protocol",
+                        )],
+                    )
+        self._validate_conditions(request)
+        self._validate_controlled(request)
+        if request.metric_registry_version != metrics.REGISTRY_VERSION:
+            raise ContractError(
+                ErrorCode.PRECONDITION_UNVERIFIED,
+                "the requested metric registry version is not available",
+                field_errors=[FieldError(
+                    path="metric_registry_version", code="enum",
+                    message="no packaged manifest for this version",
+                )],
+            )
+        if not metrics.RULES:
+            raise ContractError(
+                ErrorCode.PRECONDITION_UNVERIFIED,
+                "the packaged metric catalog is empty; no rule can be chosen",
+            )
+        if not request.metric_keys:
+            raise _invalid(
+                "metric_keys", "required", "at least one metric key is required"
+            )
+        if len(set(request.metric_keys)) != len(request.metric_keys):
+            raise _invalid(
+                "metric_keys", "conflict", "a metric key is listed more than once"
+            )
+        unknown = [key for key in request.metric_keys if metrics.rule_for(key) is None]
+        if unknown:
+            raise _invalid(
+                "metric_keys", "enum", f"unknown metric keys: {unknown}"
+            )
+
+    def _write_test_protocol(
+        self,
+        uow: UnitOfWork,
+        *,
+        request: CreateTestProtocolRequest,
+        user_scope_id: str,
+        protocol_id: str,
+        now: str,
+        definition_ids: Mapping[str, str],
+        managed: Sequence[Any],
+    ) -> list[ObjectRef]:
+        game_id = self._context_game(uow, request.game_context_id, user_scope_id)
+        parent: TestProtocol | None = None
+        if request.parent_protocol_id is not None:
+            parent = self._load_test_protocol(uow, request.parent_protocol_id)
+            if parent.game_id != game_id:
+                raise ContractError(
+                    ErrorCode.REFERENCE_INVALID,
+                    "the parent protocol belongs to another game",
+                )
+            series_id = parent.series_id
+            latest = uow.latest_for_series("TestProtocol", series_id)
+            version = (latest.version if latest is not None else parent.version) + 1
+        else:
+            series_id = _deterministic_id(user_scope_id, protocol_id, "series")
+            version = 1
+
+        selected = [metrics.rule_for(key) for key in request.metric_keys]
+        registered = self._register_definitions(
+            uow, [rule for rule in selected if rule is not None], now
+        )
+        if registered != {key: definition_ids[key] for key in registered}:
+            raise ContractError(
+                ErrorCode.INTERNAL_ERROR,
+                "the metric definition identity changed inside one transaction",
+            )
+
+        evidence = _declaration_evidence(managed[0])
+        conditions, _ = _build_run_conditions(request.condition_fields, evidence, now)
+        scenario = (
+            _known(str, request.scenario, evidence, now)
+            if request.scenario is not None else _unknown(str)
+        )
+        protocol = TestProtocol(
+            id=protocol_id,
+            schema_version=PRODUCT_CONTRACT_VERSION,
+            created_at=now,
+            created_by_task_id=None,
+            series_id=series_id,
+            version=version,
+            game_id=game_id,
+            scenario=scenario,
+            conditions=conditions,
+            controlled_variables=list(request.controlled_variables),
+            metric_definition_ids=[
+                definition_ids[key] for key in request.metric_keys
+            ],
+            warmup_seconds=request.warmup_seconds,
+            sample_duration_seconds=request.sample_duration_seconds,
+            repeat_count=request.repeat_count,
+            note=request.note,
+            parent_protocol_id=request.parent_protocol_id,
+            declaration_file_id=managed[0].id,
+        )
+        uow.insert_versioned("TestProtocol", protocol)
+        uow.insert_reference(protocol.id, "game_context", ObjectRef(
+            entity_type="GameContext", entity_id=request.game_context_id,
+        ))
+        if parent is not None:
+            uow.insert_reference(protocol.id, "parent", ObjectRef(
+                entity_type="TestProtocol", entity_id=parent.id,
+            ))
+        for definition_id in protocol.metric_definition_ids:
+            uow.insert_reference(protocol.id, "metric_definition", ObjectRef(
+                entity_type="MetricDefinition", entity_id=definition_id,
+            ))
+        return [
+            ObjectRef(entity_type="TestProtocol", entity_id=protocol.id),
+            ObjectRef(entity_type="ManagedFile", entity_id=managed[0].id),
+        ]
+
+    def _register_definitions(
+        self, uow: UnitOfWork, rules: Sequence[metrics.MetricRule], now: str
+    ) -> dict[str, str]:
+        """Get or create one immutable definition per (rule key, version, hash).
+
+        ``BEGIN IMMEDIATE`` serialises the read-then-insert, so two concurrent
+        different keys share the definition the first one registered.
+        """
+        ids: dict[str, str] = {}
+        for rule in rules:
+            definition_id = _metric_definition_id(rule)
+            found = uow.find_metric_rule(
+                metric_key=rule.metric_key,
+                registry_version=metrics.REGISTRY_VERSION,
+                rule_hash=rule.rule_hash,
+            )
+            if found is not None:
+                if found != definition_id or uow.find_object(
+                    "MetricDefinition", found
+                ) is None:
+                    raise ContractError(
+                        ErrorCode.INTERNAL_ERROR,
+                        "the metric definition index disagrees with the stored definition",
+                    )
+            else:
+                uow.insert_object("MetricDefinition", MetricDefinition(
+                    id=definition_id,
+                    schema_version=PRODUCT_CONTRACT_VERSION,
+                    created_at=now,
+                    created_by_task_id=None,
+                    metric_key=rule.metric_key,
+                    definition_version=rule.definition_version,
+                    unit=rule.unit,
+                    algorithm_ref=rule.algorithm_ref,
+                    frame_stream_kind=rule.frame_stream_kind,
+                    minimum_sample_rule=rule.minimum_sample_rule,
+                ))
+                uow.record_metric_rule(
+                    metric_key=rule.metric_key,
+                    registry_version=metrics.REGISTRY_VERSION,
+                    rule_hash=rule.rule_hash,
+                    definition_id=definition_id,
+                )
+            ids[rule.key] = definition_id
+        return ids
+
+    def _validate_conditions(self, request: CreateTestProtocolRequest) -> None:
+        fields = request.condition_fields
+        for key in fields:
+            if key in _PROTOCOL_CONDITIONS:
+                continue
+            if key.startswith("scene.") and key[len("scene."):].strip():
+                continue
+            raise _invalid(
+                "condition_fields", "enum",
+                f"field {key!r} is not an allowed test-protocol condition",
+            )
+        _check_condition_types(fields, "condition_fields")
+
+    def _validate_controlled(self, request: CreateTestProtocolRequest) -> None:
+        fields = request.condition_fields
+        seen: set[str] = set()
+        for name in request.controlled_variables:
+            if name in seen:
+                raise _invalid(
+                    "controlled_variables", "conflict",
+                    f"{name!r} is listed more than once",
+                )
+            seen.add(name)
+            if name == "scenario":
+                declared = request.scenario is not None
+            elif name in ("output_resolution", "render_resolution"):
+                prefix = name.split("_")[0]
+                declared = f"{prefix}_width" in fields and f"{prefix}_height" in fields
+            elif name in ("frame_generation", "upscaling"):
+                declared = name in fields
+            elif name.startswith("scene.") and name[len("scene."):].strip():
+                declared = name in fields
+            else:
+                declared = False
+            if not declared:
+                raise _invalid(
+                    "controlled_variables", "reference",
+                    f"{name!r} is not a complete, declared condition of this protocol",
+                )
+
+    def _context_game(
+        self, uow: UnitOfWork, context_id: str, user_scope_id: str
+    ) -> str:
+        stored = uow.find_object("GameContext", context_id)
+        if stored is None:
+            raise ContractError(
+                ErrorCode.REFERENCE_INVALID,
+                "the referenced game context does not exist",
+                field_errors=[FieldError(
+                    path="game_context_id", code="reference", message="unknown context",
+                )],
+            )
+        payload = stored.payload
+        installation_id = payload.get("installation_id")
+        if installation_id is not None:
+            installation = uow.latest_for_series("GameInstallation", installation_id)
+            if installation is None or (
+                installation.payload.get("user_scope_id") != user_scope_id
+            ):
+                raise ContractError(
+                    ErrorCode.RESOURCE_NOT_FOUND, "the game context is not available"
+                )
+        game_id = payload.get("game_id")
+        if not isinstance(game_id, str):
+            raise ContractError(
+                ErrorCode.REFERENCE_INVALID, "the game context names no game"
+            )
+        return game_id
+
+    def _peek_game_id(self, context_id: str) -> str | None:
+        with self.repository.unit_of_work() as uow:
+            stored = uow.find_object("GameContext", context_id)
+        if stored is None:
+            return None
+        value = stored.payload.get("game_id")
+        return value if isinstance(value, str) else None
+
+    def _load_test_protocol(self, uow: UnitOfWork, protocol_id: str) -> TestProtocol:
+        stored = uow.find_object("TestProtocol", protocol_id)
+        if stored is None:
+            raise ContractError(
+                ErrorCode.REFERENCE_INVALID,
+                "the referenced test protocol does not exist",
+            )
+        return TestProtocol.model_validate_json(stored.payload_bytes)
+
     # -- segment internals --------------------------------------------------
     def _segment_and_session(
         self, uow: UnitOfWork, segment_id: str, user_scope_id: str
@@ -1341,6 +1701,30 @@ def _unconfirmed_stream(now: str) -> StreamSelection:
     )
 
 
+def _metric_definition_id(rule: metrics.MetricRule) -> str:
+    return uuid5(_METRIC_ID_NAMESPACE, ":".join((
+        metrics.REGISTRY_VERSION, rule.key, rule.rule_hash,
+    ))).hex
+
+
+def _check_condition_types(fields: Mapping[str, Scalar], path: str) -> None:
+    for key, partner in _PAIR_WIDTHS.items():
+        if (key in fields) != (partner in fields):
+            raise _invalid(
+                path, "required",
+                f"{key} and {partner} must be declared together",
+            )
+    for key in ("output_width", "output_height", "render_width", "render_height"):
+        if key in fields and (type(fields[key]) is not int or fields[key] <= 0):
+            raise _invalid(path, "range", f"{key} must be a positive integer")
+    if "frame_generation" in fields and type(fields["frame_generation"]) is not bool:
+        raise _invalid(path, "type", "frame_generation must be a boolean")
+    if "upscaling" in fields and (
+        type(fields["upscaling"]) is not str or not fields["upscaling"].strip()
+    ):
+        raise _invalid(path, "type", "upscaling must be a non-blank string")
+
+
 def _build_run_conditions(
     fields: Mapping[str, Scalar], evidence: EvidenceRef, now: str
 ) -> tuple[RunConditions, FieldValue[str]]:
@@ -1350,29 +1734,7 @@ def _build_run_conditions(
         if key.startswith("scene.") and key[len("scene."):].strip():
             continue
         raise _invalid("run_declaration.fields", "enum", f"field {key!r} is not a run condition")
-
-    for key, partner in _PAIR_WIDTHS.items():
-        if (key in fields) != (partner in fields):
-            raise _invalid(
-                "run_declaration.fields", "required",
-                f"{key} and {partner} must be declared together",
-            )
-    for key in ("output_width", "output_height", "render_width", "render_height"):
-        if key in fields and (type(fields[key]) is not int or fields[key] <= 0):
-            raise _invalid(
-                "run_declaration.fields", "range",
-                f"{key} must be a positive integer",
-            )
-    if "frame_generation" in fields and type(fields["frame_generation"]) is not bool:
-        raise _invalid(
-            "run_declaration.fields", "type", "frame_generation must be a boolean",
-        )
-    if "upscaling" in fields and (
-        type(fields["upscaling"]) is not str or not fields["upscaling"].strip()
-    ):
-        raise _invalid(
-            "run_declaration.fields", "type", "upscaling must be a non-blank string",
-        )
+    _check_condition_types(fields, "run_declaration.fields")
     if "scenario" in fields and (
         type(fields["scenario"]) is not str or not fields["scenario"].strip()
     ):

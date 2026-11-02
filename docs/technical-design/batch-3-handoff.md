@@ -234,6 +234,9 @@ CREATE TABLE IF NOT EXISTS configuration_bindings (
 `project-metrics/1`，`definition_version` 为 `v1`，目录 key 为 `metric_key/definition_version`。
 同一规则 hash 在同一 registry 下复用一个定义 ID；不新增第二套规则表。
 
+测试协议的声明文件必须是逐字节确定的：同一 key 的重试（提交窗口崩溃、双击）要复用同一份冻结
+文件，否则 `_stage` 会以“retried submission changed a frozen file”拒绝。因此后台登记时刻不写入
+暂存字节，而由不可变 `TestProtocol.created_at` 承载；manifest 记录 `protocol_id` 以定位它。
 段的结束点由后台时钟差（`started_at` → 当前后台 `clock()`）计算，浏览器时间、导入时间与日志时钟
 都不参与；差值非有限或不大于 `start_s` 时返回 `PRECONDITION_UNVERIFIED`，段保持开放。
 

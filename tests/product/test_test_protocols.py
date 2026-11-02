@@ -8,6 +8,7 @@ import threading
 import pytest
 from pydantic import ValidationError
 
+from game_app.contracts.device import GameInstallation
 from game_app.contracts.enums import FrameStreamKind
 from game_app.contracts.performance import (
     CreateSessionRequest,
@@ -15,9 +16,10 @@ from game_app.contracts.performance import (
     MetricCatalogQuery,
 )
 from game_app.errors import ContractError, ErrorCode
-from game_app.files import FileService
+from game_app.files import FileService, PublishHooks
 from game_app.metrics import REGISTRY_VERSION, registry_manifest_hash
 from game_app.performance import PerformanceService
+from game_app.contracts.primitives import utc_now
 from game_app.repository import ProductRepository, canonical_json
 from tests.product.support.configuration import (
     GAME_ID,
@@ -25,7 +27,9 @@ from tests.product.support.configuration import (
     setup,
     store_raw,
     uid,
+    unknown_platform,
 )
+from tests.product.test_sessions import FakeClock
 
 ALL_KEYS = [
     "average_present_rate/v1",
@@ -35,8 +39,10 @@ ALL_KEYS = [
 ]
 
 
-def _service(repository, files) -> PerformanceService:
-    return PerformanceService(repository, files)
+def _service(repository, files, clock=None) -> PerformanceService:
+    if clock is None:
+        return PerformanceService(repository, files)
+    return PerformanceService(repository, files, clock=clock)
 
 
 def _protocol(context_id: str, **overrides) -> CreateTestProtocolRequest:
@@ -455,3 +461,117 @@ def test_creation_writes_no_execution_or_controlled_claim(tmp_path):
         check.get("status") == "pass"
         for check in declaration.get("checks", [])
     )
+
+
+# --- idempotent retries must not be defeated by a live clock -----------------
+
+
+def test_a_retry_after_a_failed_commit_returns_the_same_protocol(tmp_path):
+    repository, files, installation_id, context_id, device_id = setup(tmp_path)
+    clock = FakeClock()
+    service = _service(repository, files, clock)
+    request = _protocol(context_id)
+
+    def fail():
+        raise RuntimeError("commit window failure")
+
+    with pytest.raises(RuntimeError):
+        service.create_test_protocol(
+            request, context_key("retry"), hooks=PublishHooks(before_commit=fail)
+        )
+    clock.advance(42)
+
+    result = service.create_test_protocol(request, context_key("retry"))
+
+    assert result.refs[0].entity_type == "TestProtocol"
+    assert _count(repository, "TestProtocol") == 1
+    assert _count(repository, "ManagedFile") == 1
+
+
+def test_two_same_key_submissions_share_one_protocol(tmp_path):
+    repository, files, installation_id, context_id, device_id = setup(tmp_path)
+    second_repository = ProductRepository(repository.path)
+    second_files = FileService(second_repository, files.root)
+    first_clock = FakeClock()
+    second_clock = FakeClock()
+    second_clock.advance(3)
+    services = [
+        _service(repository, files, first_clock),
+        _service(second_repository, second_files, second_clock),
+    ]
+    barrier = threading.Barrier(2)
+    results: list = []
+    errors: list[BaseException] = []
+
+    def create(service):
+        barrier.wait()
+        try:
+            results.append(
+                service.create_test_protocol(_protocol(context_id), context_key("double"))
+            )
+        except BaseException as error:  # surfaced below
+            errors.append(error)
+
+    threads = [threading.Thread(target=create, args=(item,)) for item in services]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    second_repository.close()
+
+    assert errors == []
+    assert {item.refs[0].entity_id for item in results} == {
+        results[0].refs[0].entity_id
+    }
+    assert _count(repository, "TestProtocol") == 1
+
+
+# --- a parent protocol must be visible to this user -------------------------
+
+
+def _second_user_setup(repository):
+    """A same-game installation/context owned by another user."""
+    other = uid(940)
+    installation_id = uid(941)
+    with repository.unit_of_work() as uow:
+        uow.insert_versioned("GameInstallation", GameInstallation(
+            id=installation_id,
+            schema_version="product-contract/0.4",
+            created_at=utc_now(),
+            created_by_task_id=None,
+            series_id=installation_id,
+            version=1,
+            revision=1,
+            user_scope_id=other,
+            game_id=GAME_ID,
+            origin="user_provided",
+            platform=unknown_platform(),
+            private_path_ref=None,
+        ))
+    context_id = store_raw(repository, "GameContext", {
+        "id": uid(942), "installation_id": installation_id, "game_id": GAME_ID,
+    })
+    return other, installation_id, context_id
+
+
+def test_another_users_protocol_cannot_be_a_parent(tmp_path):
+    repository, files, installation_id, context_id, device_id = setup(tmp_path)
+    service = _service(repository, files)
+    mine = service.create_test_protocol(_protocol(context_id), context_key("mine"))
+    other, other_installation, other_context = _second_user_setup(repository)
+    other_key = context_key("other-parent").model_copy(update={"user_scope_id": other})
+
+    with pytest.raises(ContractError) as caught:
+        service.create_test_protocol(
+            _protocol(other_context, parent_protocol_id=mine.refs[0].entity_id),
+            other_key,
+        )
+
+    assert caught.value.code is ErrorCode.RESOURCE_NOT_FOUND
+    assert _count(repository, "TestProtocol") == 1
+    series_id = repository.get_object(
+        "TestProtocol", mine.refs[0].entity_id
+    ).series_id
+    with repository.unit_of_work() as uow:
+        latest = uow.latest_for_series("TestProtocol", series_id)
+    assert latest.version == 1

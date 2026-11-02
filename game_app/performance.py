@@ -846,6 +846,10 @@ class PerformanceService:
             for rule in metrics.RULES
             if rule.key in request.metric_keys
         }
+        # The staged declaration must be byte-identical for every retry of the
+        # same key: a live registration timestamp here turns a crash-window
+        # retry or a double click into IMPORT_SNAPSHOT_INCONSISTENT.  The
+        # backend registration moment is the immutable TestProtocol.created_at.
         manifest = {
             "kind": "test_protocol_declaration",
             "rule_version": TEST_PROTOCOL_RULE_VERSION,
@@ -856,7 +860,6 @@ class PerformanceService:
             "protocol_id": protocol_id,
             "input": request.model_dump(mode="json"),
             "metric_definitions": definition_ids,
-            "registered_at": now,
         }
         published = self.files.publish(
             kind="import",
@@ -882,7 +885,9 @@ class PerformanceService:
         with self.repository.unit_of_work() as uow:
             game_id = self._context_game(uow, request.game_context_id, user_scope_id)
             if request.parent_protocol_id is not None:
-                parent = self._load_test_protocol(uow, request.parent_protocol_id)
+                parent = self._require_visible_protocol(
+                    uow, request.parent_protocol_id, user_scope_id
+                )
                 if parent.game_id != game_id:
                     raise ContractError(
                         ErrorCode.REFERENCE_INVALID,
@@ -936,7 +941,9 @@ class PerformanceService:
         game_id = self._context_game(uow, request.game_context_id, user_scope_id)
         parent: TestProtocol | None = None
         if request.parent_protocol_id is not None:
-            parent = self._load_test_protocol(uow, request.parent_protocol_id)
+            parent = self._require_visible_protocol(
+                uow, request.parent_protocol_id, user_scope_id
+            )
             if parent.game_id != game_id:
                 raise ContractError(
                     ErrorCode.REFERENCE_INVALID,
@@ -1125,6 +1132,30 @@ class PerformanceService:
             return None
         value = stored.payload.get("game_id")
         return value if isinstance(value, str) else None
+
+    def _require_visible_protocol(
+        self, uow: UnitOfWork, protocol_id: str, user_scope_id: str
+    ) -> TestProtocol:
+        """A parent must be same-game *and* visible (04 §4.4).
+
+        Visibility is resolved from the protocol's own game context: an
+        installation-owned context belongs to one user, so another user's
+        protocol is indistinguishable from a missing one.
+        """
+        parent = self._load_test_protocol(uow, protocol_id)
+        refs = uow.query(
+            "SELECT target_id FROM object_references"
+            " WHERE owner_id=? AND relation='game_context'",
+            (parent.id,),
+        )
+        if not refs:
+            raise ContractError(
+                ErrorCode.PRECONDITION_UNVERIFIED,
+                "the parent protocol records no owning context; its visibility"
+                " cannot be verified",
+            )
+        self._context_game(uow, refs[0]["target_id"], user_scope_id)
+        return parent
 
     def _load_test_protocol(self, uow: UnitOfWork, protocol_id: str) -> TestProtocol:
         stored = uow.find_object("TestProtocol", protocol_id)

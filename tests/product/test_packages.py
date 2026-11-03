@@ -1198,9 +1198,11 @@ def test_the_knowledge_task_builds_a_package_from_published_imports(tmp_path):
     outcome = service.run_once()
 
     assert outcome.task_id == accepted.task_id
-    assert outcome.state in (TaskState.completed, TaskState.partial)
+    # The public graphics scope always keeps the image cell open, so the task
+    # can only be partial even when every imported text cell is covered.
+    assert outcome.state is TaskState.partial
     view = service.get_task(accepted.task_id)
-    assert view.task.domain_result.code in ("completed_scope", "partial_scope")
+    assert view.task.domain_result.code == "partial_scope"
     assert _count(repository, "KnowledgePackage") == 1
     # The package builder itself makes no provider call; the two audited
     # searches come from the collection rounds.

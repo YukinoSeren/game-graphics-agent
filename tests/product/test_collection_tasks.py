@@ -298,7 +298,9 @@ def test_collection_starts_without_a_target_fps_preference_or_device(tmp_path):
     outcome = service.run_once()
 
     assert accepted.state is TaskState.queued
-    assert outcome.state in (TaskState.completed, TaskState.partial)
+    # The image cell stays open for the public graphics scope, so a collection
+    # that closes the text gap is still partial, never completed.
+    assert outcome.state is TaskState.partial
     assert provider.sends == 3  # one search, one read, one extraction
     assert _count(repository, "KnowledgePackage") == 1
 

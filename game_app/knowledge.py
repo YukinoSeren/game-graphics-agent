@@ -1002,6 +1002,7 @@ class _CollectionRun:
     stop_reason: CollectionStopReason | None = None
     unknown_call: bool = False
     budget_exhausted: bool = False
+    protocol_error: bool = False
 
     def checks(self) -> list[CheckResult]:
         return [
@@ -1573,6 +1574,14 @@ class KnowledgeService:
                 produced_snapshot_id = imported.snapshot_id
 
         if not snapshot_ids:
+            if run.protocol_error and not run.unknown_call:
+                # An unreadable provider reply with no usable record is a
+                # deliverable-less error (02 §7, state §3), not a low-gain stop.
+                return HandlerOutcome(
+                    state=TaskState.failed,
+                    stop_reason=TaskStopReason(kind="execution", code="provider_error"),
+                    error_code=ErrorCode.PROVIDER_FAILED.value,
+                )
             return self._apply_call_state(HandlerOutcome(
                 state=TaskState.partial,
                 domain_result=DomainResult(
@@ -1799,6 +1808,9 @@ class KnowledgeService:
                 try:
                     urls = parse_search_reply(reply)
                 except CollectionProtocolError as error:
+                    # A reply that cannot be read is a provider failure, not
+                    # evidence of low information gain (02 §7).
+                    run.protocol_error = True
                     run.errors.append(f"search {step.gap_key}: {error}")
                     continue
                 step_gain = 0
@@ -1889,6 +1901,7 @@ class KnowledgeService:
                 extract_reply, scope_id=scope_id
             )
         except CollectionProtocolError as error:
+            run.protocol_error = True
             run.errors.append(f"extract {scope_id}: {error}")
             return 0
         run.errors.extend(errors)

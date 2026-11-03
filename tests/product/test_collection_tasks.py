@@ -212,6 +212,8 @@ class StubCollectionProvider:
         ):
             raise TimeoutError("simulated unknown outcome after in_flight")
         if kind == "search":
+            if self.mode == "malformed":
+                return {"results": []}
             return {"urls": list(self.urls) if self.urls is not None else [self.url]}
         if kind == "read":
             return {"document": {"content": "synthetic article body"}}
@@ -330,6 +332,28 @@ def test_two_rounds_without_gain_stop_with_low_information_gain(tmp_path):
         if check.check_id == "collection.rounds"
     )
     assert "2 follow-up round(s)" in gain_check.note
+
+
+def test_an_unreadable_reply_with_no_deliverable_fails(tmp_path):
+    repository = _repository(tmp_path)
+    files = FileService(repository, tmp_path / "managed")
+    game = _store_game(repository)
+    context = _store_context(repository, files, game)
+    provider = StubCollectionProvider(mode="malformed")
+    service, _knowledge = _app(repository, files, provider)
+    task_input, mutation = _knowledge_input(context, key="task-1")
+
+    accepted, outcome, view = _run(service, task_input, mutation)
+
+    # A reply that cannot be read is a provider failure with nothing to
+    # deliver, not "the search found nothing" (02 §7, state §3).
+    assert outcome.state is TaskState.failed
+    assert view.task.last_error_code == ErrorCode.PROVIDER_FAILED.value
+    assert view.task.stop_reason.kind == "execution"
+    assert view.task.stop_reason.code == "provider_error"
+    assert _count(repository, "KnowledgePackage") == 0
+    assert len(_calls(repository, "search")) == 2
+    assert provider.sends == 2
 
 
 def test_budget_exhaustion_keeps_the_members_and_gaps_already_found(tmp_path):

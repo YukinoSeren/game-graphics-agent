@@ -1064,6 +1064,19 @@ def test_a_pure_conflict_does_not_consume_the_key(tmp_path):
     assert _count(repository, "KnowledgePackage") == 1
 
 
+def test_building_a_package_makes_no_provider_call(tmp_path):
+    repository = _repository(tmp_path)
+    files = FileService(repository, tmp_path / "managed")
+    game = _store_game(repository)
+    context = _store_context(repository, files, game)
+    snapshot = _publish_import(repository, files, game, context)
+
+    _build(_service(repository, files), [snapshot], context)
+
+    with repository.unit_of_work() as uow:
+        assert uow.query("SELECT COUNT(*) AS n FROM external_calls")[0]["n"] == 0
+
+
 def test_a_prior_package_from_another_scope_is_refused(tmp_path):
     repository = _repository(tmp_path)
     files = FileService(repository, tmp_path / "managed")

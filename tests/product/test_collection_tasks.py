@@ -195,6 +195,7 @@ class StubCollectionProvider:
         url: str = URL,
         urls: list[str] | None = None,
         fail_read_url: str | None = None,
+        fail_model_url: str | None = None,
     ) -> None:
         self.records = list(records)
         self.empty = empty
@@ -204,6 +205,7 @@ class StubCollectionProvider:
         self.url = url
         self.urls = urls
         self.fail_read_url = fail_read_url
+        self.fail_model_url = fail_model_url
         self.sends = 0
         self.calls: list[dict] = []
 
@@ -213,6 +215,12 @@ class StubCollectionProvider:
         kind = request["kind"]
         if self.mode == "unknown" and kind == "read":
             raise TimeoutError("simulated unknown outcome after in_flight")
+        if (
+            self.fail_model_url is not None
+            and kind == "model"
+            and (request.get("payload") or {}).get("url") == self.fail_model_url
+        ):
+            raise TimeoutError("simulated unknown extraction outcome")
         if (
             self.fail_read_url is not None
             and kind == "read"
@@ -409,6 +417,54 @@ def test_a_coverage_claim_is_withdrawn_when_the_package_is_partial(tmp_path):
     assert package["stop_reason"] is None
     cells = {cell["key"]: cell for cell in package["coverage_matrix"]}
     assert cells["tradeoffs.directions"]["status"] == "partially_covered"
+
+def test_an_unknown_extraction_does_not_claim_the_source_was_unavailable(tmp_path):
+    """The second page was read; only its extraction outcome is unknown."""
+    repository = _repository(tmp_path)
+    files = FileService(repository, tmp_path / "managed")
+    game = _store_game(repository)
+    context = _store_context(repository, files, game)
+    second_url = "https://example.invalid/second"
+    provider = StubCollectionProvider(
+        urls=[URL, second_url], fail_model_url=second_url
+    )
+    service, _knowledge = _app(repository, files, provider)
+    task_input, mutation = _knowledge_input(context, key="task-1")
+
+    _accepted, outcome, view = _run(service, task_input, mutation)
+
+    assert outcome.state is TaskState.partial
+    assert view.task.last_error_code == ErrorCode.CALL_OUTCOME_UNKNOWN.value
+    assert view.task.stop_reason.kind == "execution"
+    assert view.task.stop_reason.code == "process_exit"
+    # The first page was extracted, so a group exists and must not claim the
+    # source was unavailable when only the extraction outcome is unknown.
+    members = _snapshot_members(repository, files, _only_snapshot_id(repository))
+    assert members["run.json"]["stop_reason"] is None
+    assert members["run.json"]["status"] == "partial_scope"
+    assert len(members["sources.json"]) == 1
+    states = [row["call_state"] for row in _calls(repository)]
+    assert states == ["succeeded", "succeeded", "succeeded", "succeeded",
+                      "outcome_unknown"]
+
+def test_a_source_records_the_read_time_not_the_run_start(tmp_path):
+    repository = _repository(tmp_path)
+    files = FileService(repository, tmp_path / "managed")
+    game = _store_game(repository)
+    context = _store_context(repository, files, game)
+    provider = StubCollectionProvider()
+    service, _knowledge = _app(repository, files, provider)
+    task_input, mutation = _knowledge_input(context, key="task-1")
+
+    _accepted, _outcome, _view = _run(service, task_input, mutation)
+
+    read_row = _calls(repository, "read")[0]
+    members = _snapshot_members(repository, files, _only_snapshot_id(repository))
+    assert [source["retrieved_at"] for source in members["sources.json"]] == [
+        read_row["finished_at"]
+    ]
+    # The run start is a different, earlier fact and stays in run.json only.
+    assert members["run.json"]["started_at"] != read_row["finished_at"]
 
 def test_an_unreadable_reply_with_no_deliverable_fails(tmp_path):
     repository = _repository(tmp_path)

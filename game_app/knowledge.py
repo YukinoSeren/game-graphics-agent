@@ -1871,7 +1871,7 @@ class KnowledgeService:
                 if rounds_without_gain >= 2:
                     run.stop_reason = CollectionStopReason.low_information_gain
                     break
-        if run.stop_reason is None:
+        if run.stop_reason is None and not run.unknown_call:
             run.stop_reason = (
                 CollectionStopReason.coverage_reached
                 if not run.open_gaps
@@ -1931,7 +1931,9 @@ class KnowledgeService:
             return "stop"
         except UnknownCall:
             run.unknown_call = True
-            run.stop_reason = CollectionStopReason.source_unavailable
+            # The page was retrieved; only the extraction outcome is unknown,
+            # so the run must not claim the source was unavailable.  The task
+            # carries CALL_OUTCOME_UNKNOWN and the collection stop stays unset.
             return "stop"
         try:
             records, errors = parse_extraction_reply(
@@ -1942,12 +1944,9 @@ class KnowledgeService:
             run.errors.append(f"extract {scope_id}: {error}")
             return 0
         run.errors.extend(errors)
-        retrieved_at = (
-            extract_reply.get("retrieved_at")
-            if isinstance(extract_reply, dict)
-            and isinstance(extract_reply.get("retrieved_at"), str)
-            else run.started_at
-        )
+        # The retrieval time is the audited read call's own end, not the run's
+        # start: a URL read in round 3 was not retrieved when the task began.
+        retrieved_at = self._read_time(context) or run.started_at
         source = run.sources.get(scope_id)
         if source is None:
             source = CollectedSource(
@@ -1972,6 +1971,20 @@ class KnowledgeService:
                 gained += 1
                 gained_types.add(record.record_type)
         return gained
+
+    @staticmethod
+    def _read_time(context: TaskContext) -> str | None:
+        """When the audit says the read just made finished (state §6)."""
+        with context.service.repository.unit_of_work() as uow:
+            rows = uow.query(
+                "SELECT finished_at, sent_at FROM external_calls"
+                " WHERE task_id=? AND kind='read' AND call_state='succeeded'"
+                " ORDER BY rowid DESC LIMIT 1",
+                (context.task_id,),
+            )
+        if not rows:
+            return None
+        return rows[0]["finished_at"] or rows[0]["sent_at"]
 
     @staticmethod
     def _collection_result(run: "_CollectionRun") -> CollectionResult:

@@ -189,7 +189,7 @@ def _group(files: FileService, members: dict, *, name: str) -> FrozenGroup:
 
 def _publish(
     repository: ProductRepository, files: FileService, game: Game,
-    context: GameContext, *, run_id: str, sources, records,
+    context: GameContext, *, run_id: str, sources, records, scope: str = SCOPE,
 ) -> str:
     members = {
         "run.json": _json({
@@ -219,16 +219,16 @@ def _publish(
     return ImportPublisher(repository, files).publish(
         frozen=group, game_context_id=context.id,
         mapping_version="collector-import/1",
-        identity_mapping_ids=[mapping.id], user_scope_id=SCOPE,
+        identity_mapping_ids=[mapping.id], user_scope_id=scope,
         idempotency_key=f"import:{run_id}",
     ).snapshot_id
 
 
 def _package(repository, files, context, snapshots, *, key: str, prior: str | None = None,
-             **kwargs):
+             scope: str = SCOPE, **kwargs):
     return KnowledgeService(repository, files).build_package(
         list(snapshots), prior, "collection.public_graphics",
-        game_context_id=context.id, user_scope_id=SCOPE,
+        game_context_id=context.id, user_scope_id=scope,
         idempotency_key=key, **kwargs,
     ).package
 
@@ -412,6 +412,112 @@ def test_a_cross_game_pair_is_refused(tmp_path):
 
     assert caught.value.code is ErrorCode.REFERENCE_INVALID
     assert _notice_rows(repository) == []
+
+
+def test_a_notice_never_reads_another_players_package(tmp_path):
+    repository, files, context, service, old, _new, _snapshots = _pair(tmp_path)
+    other_scope = "b" * 32
+    game = Game.model_validate_json(
+        repository.get_object("Game", context.game_revision_id).payload_bytes
+    )
+    other_snapshot = _publish(
+        repository, files, game, context, run_id="run-other",
+        sources=[_source("src-0009", content_hash="e" * 64)],
+        records=[_record("src-0009", "set-0009", {"id": "set-0009"})],
+        scope=other_scope,
+    )
+    foreign = _package(
+        repository, files, context, [other_snapshot], key="pkg-foreign",
+        scope=other_scope,
+    )
+
+    with pytest.raises(ContractError) as caught:
+        service.notify_impacts(
+            old.id, foreign.id, user_scope_id=SCOPE,
+            idempotency_key="notice-1", request_id=_uid(9000),
+        )
+
+    # Existence is not disclosed for a package the caller does not own (A-2/A-4).
+    assert caught.value.code is ErrorCode.RESOURCE_NOT_FOUND
+    assert _notice_rows(repository) == []
+    assert _count(repository, "ImpactNotice") == 0
+
+
+def test_a_notice_needs_a_version_lineage(tmp_path):
+    repository = _repository(tmp_path)
+    files = FileService(repository, tmp_path / "managed")
+    game = _store_game(repository)
+    context = _store_context(repository, files, game)
+    first = _publish(
+        repository, files, game, context, run_id="run-1",
+        sources=[_source("src-0001", content_hash="a" * 64)],
+        records=[_record("src-0001", "set-0001", {"id": "set-0001", "name": "A"})],
+    )
+    second = _publish(
+        repository, files, game, context, run_id="run-2",
+        sources=[_source("src-0001", content_hash="b" * 64)],
+        records=[_record("src-0001", "set-0001", {"id": "set-0001", "name": "B"})],
+    )
+    old = _package(repository, files, context, [first], key="pkg-old")
+    # Same game and series, but this package does not descend from ``old``.
+    unrelated = _package(repository, files, context, [second], key="pkg-unrelated")
+    service = KnowledgeService(repository, files)
+
+    with pytest.raises(ContractError) as caught:
+        _notify(service, old.id, unrelated.id, key="notice-1")
+
+    assert caught.value.code is ErrorCode.REFERENCE_INVALID
+    assert _notice_rows(repository) == []
+
+
+def test_every_record_under_a_changed_key_is_reported(tmp_path):
+    repository = _repository(tmp_path)
+    files = FileService(repository, tmp_path / "managed")
+    game = _store_game(repository)
+    context = _store_context(repository, files, game)
+
+    def payload(name: str) -> dict:
+        return {
+            "id": "set-0001", "raw_name": name, "canonical_name": name,
+            "aliases": [], "proof": {"url": "https://example.invalid/src-0001"},
+        }
+
+    def snapshot(run_id: str, name: str, content_hash: str) -> str:
+        return _publish(
+            repository, files, game, context, run_id=run_id,
+            sources=[_source("src-0001", content_hash=content_hash)],
+            records=[_record("src-0001", "set-0001", payload(name))],
+        )
+
+    # Two runs each contribute the same four-part key with different payloads.
+    # The new package changes both, so both new records are affected; a
+    # key-keyed dict would silently keep only one of them.
+    old_a = snapshot("run-1", "Quality", "a" * 64)
+    old_b = snapshot("run-2", "Balanced", "b" * 64)
+    new_a = snapshot("run-3", "High", "c" * 64)
+    new_b = snapshot("run-4", "Low", "d" * 64)
+    old = _package(repository, files, context, [old_a, old_b], key="pkg-old")
+    new = _package(
+        repository, files, context, [new_a, new_b], key="pkg-new", prior=old.id
+    )
+    service = KnowledgeService(repository, files)
+
+    notice = _notify(service, old.id, new.id, key="notice-1")
+
+    assert notice is not None
+    assert set(notice.affected_record_ids) == set(new.record_snapshot_ids)
+
+
+def test_the_same_key_with_another_pair_is_a_conflict(tmp_path):
+    repository, _files, _context, service, old, new, _snapshots = _pair(tmp_path)
+    first = _notify(service, old.id, new.id, key="notice-1")
+
+    with pytest.raises(ContractError) as caught:
+        _notify(service, new.id, old.id, key="notice-1")
+
+    assert caught.value.code is ErrorCode.IDEMPOTENCY_CONFLICT
+    assert len(_notice_rows(repository)) == 1
+    assert _notice_rows(repository)[0]["notice_id"] == first.notice_id
 
 
 # --- consumers are never rewritten ------------------------------------------

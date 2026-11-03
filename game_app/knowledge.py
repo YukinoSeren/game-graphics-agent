@@ -1119,6 +1119,22 @@ def _knowledge_evidence(package_id: str, records: Sequence[ImportedRecord]) -> l
     ]
 
 
+def _records_by_key(
+    records: Sequence[ImportedRecord],
+) -> dict[tuple[str, str, str], list[ImportedRecord]]:
+    """Group members by the four-part key's identifying triple.
+
+    Two runs may carry the same ``(capture_scope, type, local id)``; each entry
+    keeps every record so a comparison cannot silently drop a duplicate.
+    """
+    index: dict[tuple[str, str, str], list[ImportedRecord]] = {}
+    for record in records:
+        index.setdefault(
+            (record.capture_scope_id, record.record_type, record.local_record_id), []
+        ).append(record)
+    return index
+
+
 def _rule_check(check_id: str, status: CheckStatus, note: str) -> CheckResult:
     return CheckResult(
         check_id=check_id,
@@ -2242,11 +2258,7 @@ class KnowledgeService:
         self, package: KnowledgePackage, user_scope_id: str
     ) -> bool:
         with self.repository.unit_of_work() as uow:
-            for snapshot_id in package.import_snapshot_ids:
-                owner = self._snapshot_owner(uow, snapshot_id)
-                if owner != user_scope_id:
-                    return False
-        return True
+            return self._package_owned_by(uow, package, user_scope_id)
 
     def _verify_package_artifacts(self, package: KnowledgePackage) -> None:
         """A consumed package must still locate readable originals (state §8.2)."""
@@ -2309,12 +2321,19 @@ class KnowledgeService:
                     uow, existing, request_schema_version, request_hash
                 )
 
-            old = self._require_published_package(uow, old_package_id)
-            new = self._require_published_package(uow, new_package_id)
-            if old.game_id != new.game_id:
+            old = self._package_for_scope(uow, old_package_id, user_scope_id)
+            new = self._package_for_scope(uow, new_package_id, user_scope_id)
+            if old.game_id != new.game_id or old.series_id != new.series_id:
                 raise ContractError(
                     ErrorCode.REFERENCE_INVALID,
-                    "the two packages belong to different games",
+                    "the two packages belong to different games or scopes",
+                )
+            if not self._descends_from(uow, old.id, new):
+                # An impact notice describes a new version's directed effect;
+                # an arbitrary pair of same-series packages has no lineage.
+                raise ContractError(
+                    ErrorCode.REFERENCE_INVALID,
+                    "the new package does not descend from the old one",
                 )
             affected, evidence_refs, reason = self._affected_records(uow, old, new)
             if not affected:
@@ -2408,14 +2427,22 @@ class KnowledgeService:
             )
         return ImpactNotice.model_validate_json(stored.payload_bytes)
 
-    @staticmethod
-    def _require_published_package(uow: UnitOfWork, package_id: str) -> KnowledgePackage:
+    def _package_for_scope(
+        self, uow: UnitOfWork, package_id: str, user_scope_id: str
+    ) -> KnowledgePackage:
+        """Load a published package the caller owns; never disclose another's."""
         stored = uow.find_object("KnowledgePackage", package_id)
         if stored is None:
             raise ContractError(
                 ErrorCode.RESOURCE_NOT_FOUND, "the requested package is not available"
             )
         package = KnowledgePackage.model_validate_json(stored.payload_bytes)
+        if not self._package_owned_by(uow, package, user_scope_id):
+            # Ownership is checked before publication so an unpublished package
+            # of another player does not leak its existence (A-2/A-4).
+            raise ContractError(
+                ErrorCode.RESOURCE_NOT_FOUND, "the requested package is not available"
+            )
         if package.publication_status is not PublicationStatus.published:
             raise ContractError(
                 ErrorCode.REFERENCE_INVALID,
@@ -2423,62 +2450,91 @@ class KnowledgeService:
             )
         return package
 
+    def _package_owned_by(
+        self,
+        uow: UnitOfWork,
+        package: KnowledgePackage,
+        user_scope_id: str,
+    ) -> bool:
+        for snapshot_id in package.import_snapshot_ids:
+            if self._snapshot_owner(uow, snapshot_id) != user_scope_id:
+                return False
+        return True
+
+    @staticmethod
+    def _descends_from(
+        uow: UnitOfWork, old_id: str, new: KnowledgePackage
+    ) -> bool:
+        """True when ``old`` is an ancestor in the new package's revision chain."""
+        current = new.parent_package_id
+        seen: set[str] = set()
+        while current is not None and current not in seen:
+            if current == old_id:
+                return True
+            seen.add(current)
+            stored = uow.find_object("KnowledgePackage", current)
+            if stored is None:
+                return False
+            parent = KnowledgePackage.model_validate_json(stored.payload_bytes)
+            current = parent.parent_package_id
+        return False
+
     def _affected_records(
         self, uow: UnitOfWork, old: KnowledgePackage, new: KnowledgePackage
     ) -> tuple[list[str], list[EvidenceRef], str]:
         old_records = self._package_records(uow, old)
         new_records = self._package_records(uow, new)
-        old_index = {
-            (record.capture_scope_id, record.record_type, record.local_record_id): record
-            for record in old_records
-        }
-        new_index = {
-            (record.capture_scope_id, record.record_type, record.local_record_id): record
-            for record in new_records
-        }
+        # Two runs may contribute the same four-part key, so a key maps to
+        # every record that carries it; a dict of single records would silently
+        # hide one of the duplicates.
+        old_index = _records_by_key(old_records)
+        new_index = _records_by_key(new_records)
         old_sources = self._source_index(uow, old)
         new_sources = self._source_index(uow, new)
         changed_urls = {
-            url for url, (_revision, content_hash) in old_sources.items()
-            if url in new_sources and new_sources[url][1] != content_hash
+            url for url, hashes in old_sources.items()
+            if url in new_sources and new_sources[url] != hashes
         }
-        affected: dict[tuple[str, str, str], str] = {}
+        affected: dict[tuple[str, str, str], list[str]] = {}
         removed = 0
         changed = 0
-        for key, old_record in old_index.items():
-            new_record = new_index.get(key)
-            if new_record is None:
-                affected[key] = old_record.id
-                removed += 1
-            elif new_record.payload_hash != old_record.payload_hash:
-                affected[key] = new_record.id
-                changed += 1
-            elif (
-                self._record_source_url(uow, old_record) in changed_urls
-                and self._record_source_url(uow, new_record) in changed_urls
+        for key, old_group in old_index.items():
+            new_group = new_index.get(key)
+            if not new_group:
+                affected[key] = [record.id for record in old_group]
+                removed += len(old_group)
+                continue
+            old_hashes = sorted({record.payload_hash for record in old_group})
+            new_hashes = sorted({record.payload_hash for record in new_group})
+            if old_hashes != new_hashes or (
+                self._cites_changed_source(uow, old_group, changed_urls)
+                and self._cites_changed_source(uow, new_group, changed_urls)
             ):
-                # The payload is byte-identical but the source revision it
-                # cites changed: only members citing that source are affected.
-                affected[key] = new_record.id
-                changed += 1
+                # The payload changed, or the source revision it rests on
+                # changed: every record carrying this key is affected.
+                affected[key] = [record.id for record in new_group]
+                changed += len(new_group)
 
         dependent = 0
         propagated = True
         while propagated:
             propagated = False
-            for key, record in new_index.items():
+            for key, group in new_index.items():
                 if key in affected:
                     continue
-                for target_type, local_id, _path in record_payload_references(
-                    record.record_type, record.payload
-                ):
-                    if (record.capture_scope_id, target_type, local_id) in affected:
-                        affected[key] = record.id
-                        dependent += 1
-                        propagated = True
+                for record in group:
+                    for target_type, local_id, _path in record_payload_references(
+                        record.record_type, record.payload
+                    ):
+                        if (record.capture_scope_id, target_type, local_id) in affected:
+                            affected[key] = [item.id for item in group]
+                            dependent += len(group)
+                            propagated = True
+                            break
+                    if key in affected:
                         break
 
-        affected_ids = sorted(set(affected.values()))
+        affected_ids = sorted({record_id for ids in affected.values() for record_id in ids})
         by_id = {record.id: record for record in new_records}
         old_by_id = {record.id: record for record in old_records}
         evidence_refs: list[EvidenceRef] = []
@@ -2498,6 +2554,17 @@ class KnowledgeService:
         )
         return affected_ids, evidence_refs, reason
 
+    def _cites_changed_source(
+        self,
+        uow: UnitOfWork,
+        records: Sequence[ImportedRecord],
+        changed_urls: set[str],
+    ) -> bool:
+        return any(
+            self._record_source_url(uow, record) in changed_urls
+            for record in records
+        )
+
     @staticmethod
     def _package_records(
         uow: UnitOfWork, package: KnowledgePackage
@@ -2512,8 +2579,8 @@ class KnowledgeService:
     @staticmethod
     def _source_index(
         uow: UnitOfWork, package: KnowledgePackage
-    ) -> dict[str, tuple[str, str | None]]:
-        index: dict[str, tuple[str, str | None]] = {}
+    ) -> dict[str, frozenset[str]]:
+        index: dict[str, set[str]] = {}
         for revision_id in package.source_revision_ids:
             stored = uow.find_object("SourceRevision", revision_id)
             if stored is None:
@@ -2523,8 +2590,10 @@ class KnowledgeService:
             if source_stored is None:
                 continue
             source = Source.model_validate_json(source_stored.payload_bytes)
-            index[source.canonical_url] = (revision.id, revision.content_hash)
-        return index
+            index.setdefault(source.canonical_url, set()).add(
+                revision.content_hash or ""
+            )
+        return {url: frozenset(hashes) for url, hashes in index.items()}
 
     @staticmethod
     def _record_source_url(uow: UnitOfWork, record: ImportedRecord) -> str | None:

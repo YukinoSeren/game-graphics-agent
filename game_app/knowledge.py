@@ -1503,7 +1503,7 @@ class KnowledgeService:
         prior = self._task_prior_package(
             task_input.prior_package_id, game_context, context.user_scope_id
         )
-        if prior is not None and self._coverage_complete(prior):
+        if prior is not None and self._reusable_for_task(prior):
             # Nothing is missing for this scope: reuse the published package
             # instead of manufacturing an identical new version.
             return HandlerOutcome(
@@ -2891,6 +2891,20 @@ class KnowledgeService:
             )
             and not any(gap.status is GapStatus.open for gap in package.critical_gaps)
         )
+
+    def _reusable_for_task(self, package: KnowledgePackage) -> bool:
+        """A prior package is reusable only if it contains the task's cells.
+
+        A package built without the image dimension satisfies its own cells but
+        not the public graphics task, which always requires the image cell.
+        """
+        required = set(
+            self.evaluator.dimensions_for(
+                KNOWLEDGE_TASK_SCOPE, image_required=True
+            )
+        )
+        present = {cell.key for cell in package.coverage_matrix}
+        return required <= present and self._coverage_complete(package)
 
     def _published_snapshots(self, game_id: str, user_scope_id: str) -> list[str]:
         """Only this player's published snapshots with a usable record.

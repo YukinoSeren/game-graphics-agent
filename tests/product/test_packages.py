@@ -714,6 +714,46 @@ def test_a_fully_covered_text_scope_still_records_the_image_gap(tmp_path):
     assert package["critical_gaps"], "the unread image condition stays a gap"
 
 
+def test_a_text_only_prior_package_is_not_reused_for_the_image_scope(tmp_path):
+    repository = _repository(tmp_path)
+    files = FileService(repository, tmp_path / "managed")
+    game = _store_game(repository)
+    context = _store_context(repository, files, game)
+    records = _dataset(configs=2)
+    records.append(_record("evi-0002", "evidence", {
+        "id": "evi-0002", "kind": "observation", "origin": "source_statement",
+        "statement": "synthetic observation", "metric": None, "numeric": None,
+        "unit": None, "setting_ids": [], "input_ids": [],
+        "detected_state": "detected",
+    }))
+    records.append(_record("ver-0001", "version_impacts", {
+        "id": "ver-0001", "evidence_id": "evi-0001", "setting_id": "set-0001",
+        "affected_value": "High", "platform": "steam", "version_raw": "1.0",
+        "effective_date": None,
+    }))
+    snapshot = _publish_import(repository, files, game, context, records=records)
+    prior = _build(_service(repository, files), [snapshot], context, key="pkg-text")
+    # The prior was built without the image dimension, so its own cells are
+    # complete even though the task's declared scope is not.
+    assert all(
+        cell.status in (CoverageStatus.covered, CoverageStatus.not_applicable)
+        for cell in prior.package.coverage_matrix
+    )
+
+    task = TaskService(repository, provider=_NoDiscoveryProvider(), files=files)
+    task.handlers["knowledge"] = _service(repository, files).handle
+    task_input, mutation = _knowledge_input(context, prior=prior.package.id)
+    accepted = task.register_task(task_input, mutation)
+    outcome = task.run_once()
+
+    assert outcome.state is TaskState.partial
+    with repository.unit_of_work() as uow:
+        package = json.loads(uow.latest_objects("KnowledgePackage")[0].payload_bytes)
+    assert package["id"] != prior.package.id
+    cells = {cell["key"]: cell for cell in package["coverage_matrix"]}
+    assert cells["graphics.image_figures"]["status"] == "unknown"
+
+
 # --- ownership ---------------------------------------------------------------
 
 

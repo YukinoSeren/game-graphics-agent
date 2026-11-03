@@ -185,6 +185,8 @@ class StubCollectionProvider:
         return_model: bool = True,
         bad_records: int = 0,
         url: str = URL,
+        urls: list[str] | None = None,
+        fail_read_url: str | None = None,
     ) -> None:
         self.records = list(records)
         self.empty = empty
@@ -192,6 +194,8 @@ class StubCollectionProvider:
         self.return_model = return_model
         self.bad_records = bad_records
         self.url = url
+        self.urls = urls
+        self.fail_read_url = fail_read_url
         self.sends = 0
         self.calls: list[dict] = []
 
@@ -201,8 +205,14 @@ class StubCollectionProvider:
         kind = request["kind"]
         if self.mode == "unknown" and kind == "read":
             raise TimeoutError("simulated unknown outcome after in_flight")
+        if (
+            self.fail_read_url is not None
+            and kind == "read"
+            and (request.get("payload") or {}).get("url") == self.fail_read_url
+        ):
+            raise TimeoutError("simulated unknown outcome after in_flight")
         if kind == "search":
-            return {"urls": [self.url]}
+            return {"urls": list(self.urls) if self.urls is not None else [self.url]}
         if kind == "read":
             return {"document": {"content": "synthetic article body"}}
         rows = [] if self.empty else list(self.records)
@@ -431,6 +441,35 @@ def test_an_unknown_call_stops_without_a_second_send_on_retry_or_resume(tmp_path
     assert provider.sends == 2
     resumed_view = service.get_task(resumed.task_id)
     assert resumed_view.task.last_error_code == ErrorCode.CALL_OUTCOME_UNKNOWN.value
+
+
+def test_an_unknown_call_after_a_gain_keeps_the_gain_and_names_source_unavailable(tmp_path):
+    repository = _repository(tmp_path)
+    files = FileService(repository, tmp_path / "managed")
+    game = _store_game(repository)
+    context = _store_context(repository, files, game)
+    second_url = "https://example.invalid/second"
+    provider = StubCollectionProvider(urls=[URL, second_url], fail_read_url=second_url)
+    service, _knowledge = _app(repository, files, provider)
+    task_input, mutation = _knowledge_input(context, key="task-1")
+
+    _accepted, outcome, view = _run(service, task_input, mutation)
+
+    assert outcome.state is TaskState.partial
+    assert view.task.last_error_code == ErrorCode.CALL_OUTCOME_UNKNOWN.value
+    assert provider.sends == 4  # search, read+model for the first URL, failed read
+    assert len([
+        row for row in _calls(repository) if row["call_state"] == "outcome_unknown"
+    ]) == 1
+    with repository.unit_of_work() as uow:
+        package_row = uow.latest_objects("KnowledgePackage")[0]
+    package = json.loads(package_row.payload_bytes)
+    # The records gained before the unknown read are kept, and the collection
+    # stop reason is a collection fact; the product execution state lives on
+    # the task (02 §6), never as "budget exhausted".
+    assert package["record_snapshot_ids"]
+    assert package["collection_result"] == "partial_scope"
+    assert package["stop_reason"] == "source_unavailable"
 
 
 def test_a_missing_returned_model_stays_null(tmp_path):

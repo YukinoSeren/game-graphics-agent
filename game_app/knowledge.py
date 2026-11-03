@@ -1791,6 +1791,9 @@ class KnowledgeService:
                     break
                 except UnknownCall:
                     run.unknown_call = True
+                    # An unknown read is a collection fact (the source was not
+                    # obtained); the product execution state stays on the task.
+                    run.stop_reason = CollectionStopReason.source_unavailable
                     stopped = True
                     break
                 try:
@@ -1854,6 +1857,7 @@ class KnowledgeService:
             return "stop"
         except UnknownCall:
             run.unknown_call = True
+            run.stop_reason = CollectionStopReason.source_unavailable
             return "stop"
         run.read_urls.add(url)
         scope_id = source_scope_id(url)
@@ -1878,6 +1882,7 @@ class KnowledgeService:
             return "stop"
         except UnknownCall:
             run.unknown_call = True
+            run.stop_reason = CollectionStopReason.source_unavailable
             return "stop"
         try:
             records, errors = parse_extraction_reply(

@@ -170,6 +170,14 @@ DEFAULT_RECORDS = [
             "environment_ids": [],
         },
     },
+    {
+        "local_id": "env-1",
+        "record_type": "environments",
+        "payload": {
+            "id": "env-1",
+            "fields": {"gpu": {"value": "Synthetic GPU", "proof": {"url": URL}}},
+        },
+    },
 ]
 
 
@@ -300,6 +308,11 @@ def test_collection_starts_without_a_target_fps_preference_or_device(tmp_path):
     outcome = service.run_once()
 
     assert accepted.state is TaskState.queued
+    # Neither a target frame rate nor a device is part of the input: the task
+    # starts from the game context alone (KNW-V01).
+    assert task_input.device_snapshot_id is None
+    fields = task_input.model_dump()
+    assert not any("fps" in key or "preference" in key for key in fields)
     # The image cell stays open for the public graphics scope, so a collection
     # that closes the text gap is still partial, never completed.
     assert outcome.state is TaskState.partial
@@ -333,6 +346,69 @@ def test_two_rounds_without_gain_stop_with_low_information_gain(tmp_path):
     )
     assert "2 follow-up round(s)" in gain_check.note
 
+
+def test_a_gap_stays_open_until_every_expected_type_arrives(tmp_path):
+    """One settings record does not close a gap that also wants the rest."""
+    repository = _repository(tmp_path)
+    files = FileService(repository, tmp_path / "managed")
+    game = _store_game(repository)
+    context = _store_context(repository, files, game)
+    provider = StubCollectionProvider(records=[DEFAULT_RECORDS[0]])
+    service, _knowledge = _app(repository, files, provider)
+    task_input, mutation = _knowledge_input(context, key="task-1")
+
+    _accepted, outcome, _view = _run(service, task_input, mutation)
+
+    assert outcome.state is TaskState.partial
+    members = _snapshot_members(repository, files, _only_snapshot_id(repository))
+    assert members["run.json"]["status"] == "partial_scope"
+    assert members["run.json"]["stop_reason"] == "budget_exhausted"
+    # The seed gap asked for four record types and only one arrived.
+    assert [gap["status"] for gap in members["gaps.json"]] == ["open"]
+
+def test_an_exhausted_query_quota_is_budget_exhausted_not_coverage(tmp_path):
+    """No plan left to run while a gap is open is a budget stop, not coverage."""
+    repository = _repository(tmp_path)
+    files = FileService(repository, tmp_path / "managed")
+    game = _store_game(repository)
+    context = _store_context(repository, files, game)
+    provider = StubCollectionProvider(empty=True)
+    service, _knowledge = _app(repository, files, provider)
+    task_input, mutation = _knowledge_input(
+        context, key="task-1", max_queries_per_gap=1, max_followup_rounds=3
+    )
+
+    _accepted, outcome, view = _run(service, task_input, mutation)
+
+    assert outcome.state is TaskState.partial
+    assert view.task.stop_reason.code == "budget_exhausted"
+    members = _snapshot_members(repository, files, _only_snapshot_id(repository))
+    assert members["run.json"]["stop_reason"] == "budget_exhausted"
+    assert [gap["status"] for gap in members["gaps.json"]] == ["open"]
+    # One search only: the gap's quota was spent by that single query.
+    assert len(_calls(repository, "search")) == 1
+
+def test_a_coverage_claim_is_withdrawn_when_the_package_is_partial(tmp_path):
+    """A gap set can close while a declared cell is still only partial."""
+    repository = _repository(tmp_path)
+    files = FileService(repository, tmp_path / "managed")
+    game = _store_game(repository)
+    context = _store_context(repository, files, game)
+    provider = StubCollectionProvider()
+    service, _knowledge = _app(repository, files, provider)
+    task_input, mutation = _knowledge_input(context, key="task-1")
+
+    _accepted, outcome, _view = _run(service, task_input, mutation)
+
+    assert outcome.state is TaskState.partial
+    with repository.unit_of_work() as uow:
+        package = json.loads(uow.latest_objects("KnowledgePackage")[0].payload_bytes)
+    assert package["collection_result"] == "partial_scope"
+    # The run closed its gap set, but the builder downgraded the result:
+    # the package must not keep claiming coverage was reached.
+    assert package["stop_reason"] is None
+    cells = {cell["key"]: cell for cell in package["coverage_matrix"]}
+    assert cells["tradeoffs.directions"]["status"] == "partially_covered"
 
 def test_an_unreadable_reply_with_no_deliverable_fails(tmp_path):
     repository = _repository(tmp_path)
@@ -416,8 +492,9 @@ def test_one_url_with_several_bad_records_is_read_once(tmp_path):
         if check.check_id == "collection.read_errors"
     )
     assert error_check.status is CheckStatus.fail
-    assert "record[3]" in error_check.note
+    # The four default records come first, so the rejected rows start at 4.
     assert "record[4]" in error_check.note
+    assert "record[5]" in error_check.note
 
 
 def test_an_unknown_call_stops_without_a_second_send_on_retry_or_resume(tmp_path):

@@ -999,6 +999,9 @@ class _CollectionRun:
     errors: list[str] = field(default_factory=list)
     rounds: int = 0
     gained: int = 0
+    # Which record types each gap has actually received; a gap closes only
+    # when every type it expects has arrived (per gap, across rounds).
+    gained_types: dict[str, set[str]] = field(default_factory=dict)
     stop_reason: CollectionStopReason | None = None
     unknown_call: bool = False
     budget_exhausted: bool = False
@@ -1662,6 +1665,10 @@ class KnowledgeService:
 
         package = built.package
         covered = self._coverage_complete(package) and not run.unknown_call
+        # The builder withdraws a coverage claim the run made when the
+        # declared scope is not covered; the task reports the product result,
+        # not the withdrawn plan outcome (02 §4).
+        task_stop = package.stop_reason if single_execution else run.stop_reason
         outcome = HandlerOutcome(
             state=TaskState.completed if covered else TaskState.partial,
             domain_result=DomainResult(
@@ -1675,8 +1682,8 @@ class KnowledgeService:
                 checks=[*package.checks, *run.checks()],
             ),
             stop_reason=(
-                None if run.stop_reason is None
-                else TaskStopReason(kind="collection", code=run.stop_reason.value)
+                None if task_stop is None
+                else TaskStopReason(kind="collection", code=task_stop.value)
             ),
             result_refs=[
                 ObjectRef(entity_type="KnowledgePackage", entity_id=package.id),
@@ -1758,12 +1765,18 @@ class KnowledgeService:
                 ),
                 None,
             )
+            expects = _CELL_EXPECTS.get(cell_key or "", ())
+            if not expects:
+                # A gap whose check is not a coverage cell has no record type
+                # that could close it, so it is not a query: it is carried as
+                # a diagnostic of the prior package instead.
+                continue
             gaps.append(GapSpec(
                 key=gap.id,
                 priority=gap.priority.value,
                 operation_scope=gap.operation_scope,
                 question=gap.question,
-                expects=_CELL_EXPECTS.get(cell_key or "", ()),
+                expects=expects,
             ))
         return gaps
 
@@ -1786,13 +1799,20 @@ class KnowledgeService:
         for _round in range(budget.max_followup_rounds):
             planned = planner.plan_round(run.open_gaps.values(), used=run.used)
             if not planned:
-                run.stop_reason = CollectionStopReason.coverage_reached
+                if run.open_gaps:
+                    # Every remaining gap has spent its query quota; the round
+                    # budget stopped the run, coverage did not (02 §4/§6).
+                    run.stop_reason = CollectionStopReason.budget_exhausted
+                    run.budget_exhausted = True
+                else:
+                    run.stop_reason = CollectionStopReason.coverage_reached
                 break
             run.rounds += 1
             gained = 0
             stopped = False
             for step in planned:
                 run.used[step.gap_key] = run.used.get(step.gap_key, 0) + 1
+                gained_types = run.gained_types.setdefault(step.gap_key, set())
                 try:
                     reply = context.invoke_provider(
                         kind="search",
@@ -1824,14 +1844,21 @@ class KnowledgeService:
                     continue
                 step_gain = 0
                 for url in urls:
-                    result = self._read_and_extract(context, run, url, step, seen)
+                    result = self._read_and_extract(
+                        context, run, url, step, seen, gained_types
+                    )
                     if result == "stop":
                         stopped = True
                         break
                     step_gain += result
                 gained += step_gain
                 if step_gain:
-                    run.open_gaps.pop(step.gap_key, None)
+                    gap = run.open_gaps.get(step.gap_key)
+                    if gap is not None and set(gap.expects) <= gained_types:
+                        # A gap is closed only when every expected type has
+                        # arrived; one settings record does not cover a gap
+                        # that also asks for configurations and environments.
+                        run.open_gaps.pop(step.gap_key, None)
                 if stopped:
                     break
             if stopped:
@@ -1859,6 +1886,7 @@ class KnowledgeService:
         url: str,
         step: Any,
         seen: set[tuple[str, str, str]],
+        gained_types: set[str],
     ) -> int | str:
         """One read and one extraction per URL; several bad rows share both."""
         url = canonical_url(url)
@@ -1942,6 +1970,7 @@ class KnowledgeService:
             source.records.append(record)
             if record.record_type in step.expects:
                 gained += 1
+                gained_types.add(record.record_type)
         return gained
 
     @staticmethod
@@ -2108,6 +2137,11 @@ class KnowledgeService:
             # 02 §4: completed_scope needs every declared cell covered or
             # provably not applicable; a run that stopped early cannot claim it.
             collection_result = CollectionResult.partial_scope
+            if stop_reason is CollectionStopReason.coverage_reached:
+                # The run closed its own gap set but the declared scope is not
+                # covered, so the coverage claim is withdrawn rather than left
+                # beside a partial result.
+                stop_reason = None
         critical = [gap for gap in gaps if gap.priority is GapPriority.P0]
         noncritical = [gap for gap in gaps if gap.priority is not GapPriority.P0]
         package = KnowledgePackage(

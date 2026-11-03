@@ -62,7 +62,6 @@ from game_app.knowledge import (
 )
 from game_app.repository import ProductRepository, canonical_json
 from game_app.tasks import TaskService
-from tests.product.support.spies import SpyProvider
 
 SCOPE = "a" * 32
 NOW = "2026-11-03T00:00:00+00:00"
@@ -640,7 +639,7 @@ def test_an_unverified_identity_publishes_no_matched_package(tmp_path):
     assert caught.value.code is ErrorCode.PRECONDITION_UNVERIFIED
     assert _count(repository, "KnowledgePackage") == 0
     # The source facts and their diagnostics are still readable.
-    assert _count(repository, "ImportedRecord") > 0
+    assert _count(repository, "ImportedRecord") == 4
 
 
 def test_an_unregistered_declared_scope_is_refused(tmp_path):

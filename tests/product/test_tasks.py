@@ -716,6 +716,8 @@ def test_resume_reuses_an_already_succeeded_call_instead_of_resending(repo_facto
     calls = _calls(repo, resumed.task_id)
     assert [call["call_state"] for call in calls] == ["succeeded"]
     assert calls[0]["response_file_id"]
+    # A reused call never entered the send window, so it has no sent time.
+    assert calls[0]["sent_at"] is None
     # A reused call never entered the send window, so it consumes no budget.
     with repo.unit_of_work() as uow:
         counters = uow.query(

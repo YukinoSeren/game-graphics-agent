@@ -162,6 +162,18 @@ class Application:
     def get_summary(self, summary_id: str, user_scope_id: str):
         return self.performance.get_summary(summary_id, user_scope_id)
 
+    def create_comparison_protocol(self, request: Any, context: MutationContext, **kwargs: Any):
+        return self.performance.create_comparison_protocol(request, context, **kwargs)
+
+    def compare(self, request: Any, context: MutationContext, **kwargs: Any):
+        return self.performance.compare(request, context, **kwargs)
+
+    def get_comparison(self, comparison_id: str, user_scope_id: str):
+        return self.performance.get_comparison(comparison_id, user_scope_id)
+
+    def get_comparison_protocol(self, protocol_id: str, user_scope_id: str):
+        return self.performance.get_comparison_protocol(protocol_id, user_scope_id)
+
     def get_session(self, session_id: str, user_scope_id: str):
         return self.performance.get_session(session_id, user_scope_id)
 

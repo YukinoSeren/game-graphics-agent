@@ -21,10 +21,13 @@ from game_app.contracts.common import (
 )
 from game_app.contracts.device import ProcessIdentity, Resolution
 from game_app.contracts.enums import (
+    CheckStatus,
+    ComparabilityLevel,
     ConfigurationState,
     FrameStreamKind,
     LogQuality,
     SessionLifecycle,
+    ThresholdMode,
 )
 from game_app.contracts.primitives import (
     BindingRange,
@@ -653,6 +656,108 @@ class PerformanceSummary(StrictModel):
         return value
 
 
+
+
+# --- comparison protocols and comparisons (04 §4.2/§6, data §6.2) -----------
+
+
+class CreateComparisonProtocolRequest(StrictModel):
+    """A common long-frame threshold, frozen before the adjusted result is read."""
+
+    threshold_mode: ThresholdMode
+    threshold_ms: float | None
+    baseline_summary_ids: list[ID]
+    baseline_binding_refs: list[BindingRef]
+    cleaning_definition: str
+    clustering_definition: str
+    denominator_definition: str
+    exploratory: bool
+
+    @field_validator("threshold_ms")
+    @classmethod
+    def threshold_is_finite_and_positive(cls, value: float | None) -> float | None:
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            raise ValueError("threshold_ms is null or finite and > 0")
+        return value
+
+    @field_validator("cleaning_definition", "clustering_definition", "denominator_definition")
+    @classmethod
+    def definition_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("a comparison definition names a registered rule version")
+        return value
+
+
+class ComparisonProtocol(StrictModel):
+    """An immutable frozen protocol; a changed rule means a new protocol id."""
+
+    id: ID
+    schema_version: str
+    created_at: Timestamp
+    created_by_task_id: ID | None
+    series_id: ID
+    version: Revision
+    threshold_mode: ThresholdMode
+    threshold_ms: float
+    baseline_summary_ids: list[ID]
+    baseline_binding_refs: list[BindingRef]
+    frozen_at: Timestamp
+    exploratory: bool
+    cleaning_definition: str
+    clustering_definition: str
+    denominator_definition: str
+
+    @field_validator("threshold_ms")
+    @classmethod
+    def threshold_is_positive(cls, value: float) -> float:
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("a frozen threshold is finite and > 0")
+        return value
+
+
+class CompareInput(StrictModel):
+    summary_ids: list[ID]
+    protocol_id: ID
+
+    @field_validator("summary_ids")
+    @classmethod
+    def exactly_two_distinct_summaries(cls, value: list[ID]) -> list[ID]:
+        if len(value) != 2:
+            raise ValueError("a comparison names exactly two summaries")
+        if value[0] == value[1]:
+            raise ValueError("a comparison needs two different summaries")
+        return value
+
+
+class MetricComparison(StrictModel):
+    metric_definition_id: ID
+    status: CheckStatus
+    left: MetricValue | None
+    right: MetricValue | None
+    delta: MetricValue | None
+    reason: str | None
+
+
+class PerformanceComparison(StrictModel):
+    id: ID
+    schema_version: str
+    created_at: Timestamp
+    created_by_task_id: ID | None
+    summary_ids: list[ID]
+    protocol_id: ID
+    level: ComparabilityLevel
+    per_metric: list[MetricComparison]
+    checks: list[CheckResult]
+    limitations: list[str]
+
+    @field_validator("summary_ids")
+    @classmethod
+    def two_distinct_summaries(cls, value: list[ID]) -> list[ID]:
+        if len(value) != 2 or value[0] == value[1]:
+            raise ValueError("a comparison references two different summaries")
+        return value
+
+
 __all__ = [
     "ColumnMapping",
     "TimeMapping",
@@ -687,4 +792,9 @@ __all__ = [
     "MetricValue",
     "AdaptiveLongFrame",
     "PerformanceSummary",
+    "CreateComparisonProtocolRequest",
+    "ComparisonProtocol",
+    "CompareInput",
+    "MetricComparison",
+    "PerformanceComparison",
 ]

@@ -6,210 +6,33 @@ model is started and every test asserts that ``external_calls`` stays empty.
 
 from __future__ import annotations
 
-import hashlib
-import json
-
 import pytest
 
-from game_app.analyzer import (
-    ANALYZER_VERSION,
-    CLEANING_PROTOCOL_VERSION,
-    adaptive_threshold_ms,
-    long_frame_statistics,
-    slowest_tail_inverse_mean,
-)
-from game_app.contracts.common import MutationContext
-from game_app.contracts.performance import (
-    CaptureArtifact,
-    ColumnMapping,
-    EndSegmentRequest,
-    LogAssociationRequest,
-    PerformanceSummary,
-    TimeMapping,
-)
-from game_app.contracts.primitives import BindingRef, TimeRange, utc_now
-from game_app.contracts.tasks import AnalysisInput
+from game_app.analyzer import long_frame_statistics, slowest_tail_inverse_mean
+from game_app.contracts.performance import EndSegmentRequest
+from game_app.contracts.primitives import BindingRef
 from game_app.errors import ContractError, ErrorCode
-from game_app.performance import PerformanceService
 from game_app.repository import canonical_json
-from game_app.tasks import TaskService
-from tests.product.support.configuration import USER, context_key, setup, store_raw, uid
-from tests.product.test_sessions import FakeClock
-
-SCHEMA = "offline-frame-csv/v1"
-HEADER = (
-    "EventNumber,ProcessId,Time (ms),MsBetweenPresents (ms),FrameType,"
-    "MsGPUActive (ms),FrameStream,FrameGeneration"
+from tests.product.support.configuration import USER, context_key
+from tests.product.support.performance import (
+    HEADER,
+    analysis_input as _input,
+    artifact_from_csv as _artifact_from_csv,
+    count_objects,
+    craft_artifact as _craft_artifact,
+    csv_bytes as _csv,
+    external_calls as _external_calls,
+    metric_of as _metric,
+    open_session_artifact as _open_session_artifact,
+    publish_log as _publish,
+    run_analysis as _run,
+    summary_of as _summary,
+    wired as _wired,
 )
-
-
-def _wired(tmp_path):
-    repository, files, installation_id, context_id, device_id = setup(tmp_path)
-    clock = FakeClock()
-    tasks = TaskService(repository, files=files, clock=clock)
-    service = PerformanceService(repository, files, clock=clock, tasks=tasks)
-    tasks.handlers["analysis"] = service.handle_analysis
-    return repository, files, service, tasks, installation_id, context_id, device_id, clock
-
-
-def _csv(intervals: list[float | str | None], *, stream: str = "application_present",
-         frame_generation: str = "off") -> bytes:
-    lines = [HEADER]
-    timestamps: list[float] = []
-    moment = 0.0
-    lines.append(f"1,4242,0.0,,Application,0.0,{stream},{frame_generation}")
-    timestamps.append(0.0)
-    for index, interval in enumerate(intervals, start=2):
-        if interval is None:
-            moment = moment
-        elif isinstance(interval, str):
-            moment += 10.0
-        else:
-            moment += interval
-        cell = "" if interval is None else str(interval)
-        lines.append(f"{index},4242,{moment},{cell},Application,7.5,{stream},{frame_generation}")
-        timestamps.append(moment)
-    return ("\n".join(lines) + "\n").encode("utf-8")
-
-
-def _publish(files, data: bytes, key: str, *, user: str = USER) -> tuple[str, str]:
-    published = files.publish(
-        kind="import",
-        files={f"logs/{key}.csv": data},
-        user_scope_id=user,
-        method="POST",
-        canonical_route="/api/log-files",
-        key=key,
-        request_schema_version="product-contract/0.4",
-        request_hash=hashlib.sha256(data).hexdigest(),
-    )
-    return published.file_ids[0], hashlib.sha256(data).hexdigest()
-
-
-def _association_payload(installation_id, context_id, device_id, file_id, sha, stream_key):
-    inspection_range = None
-    return {
-        "file_id": file_id,
-        "content_hash": sha,
-        "source_schema": SCHEMA,
-        "source_range": inspection_range,
-        "stream_key": stream_key,
-        "source_anchor": None,
-        "target_anchor_s": 0.0,
-        "target": {
-            "mode": "historical_session",
-            "installation_id": installation_id,
-            "device_snapshot_id": device_id,
-            "game_context_id": context_id,
-            "started_at": "2026-10-01T12:00:00+00:00",
-            "run_declaration": {
-                "installation_id": installation_id,
-                "fields": {"upscaling": "off"},
-                "raw_text": "synthetic fixture run",
-            },
-            "test_protocol_id": None,
-        },
-        "evidence_refs": [{
-            "kind": "artifact",
-            "file_id": file_id,
-            "content_hash": sha,
-            "locator": "log.csv",
-        }],
-        "raw_text": "",
-    }
-
-
-def _artifact_from_csv(service, files, installation_id, context_id, device_id, data, key):
-    file_id, sha = _publish(files, data, key)
-    inspection = service.inspect_log(file_id, SCHEMA, USER)
-    assert inspection.source_ranges
-    source = inspection.source_ranges[0]
-    payload = _association_payload(
-        installation_id, context_id, device_id, file_id, sha,
-        inspection.streams[0].stream_key,
-    )
-    payload["source_range"] = source.model_dump(mode="json")
-    payload["source_anchor"] = source.start
-    request = LogAssociationRequest.model_validate_json(canonical_json(payload))
-    result = service.associate_log(request, context_key(f"{key}-assoc"))
-    artifact_id = next(
-        ref.entity_id for ref in result.refs if ref.entity_type == "CaptureArtifact"
-    )
-    artifact = _load(service, "CaptureArtifact", artifact_id)
-    with service.repository.unit_of_work() as uow:
-        row = uow.query(
-            "SELECT * FROM session_segments WHERE segment_id=?",
-            (artifact.segment_ids[0],),
-        )[0]
-    return artifact, BindingRef(
-        segment_id=row["segment_id"],
-        segment_revision=row["revision"],
-        binding_revision=row["binding_revision"],
-    )
-
-
-def _load(service, entity_type, object_id):
-    from game_app.contracts.performance import (
-        CaptureArtifact as Artifact,
-        PerformanceSummary as Summary,
-    )
-
-    model = Artifact if entity_type == "CaptureArtifact" else Summary
-    with service.repository.unit_of_work() as uow:
-        return model.model_validate_json(
-            uow.find_object(entity_type, object_id).payload_bytes
-        )
-
-
-def _input(artifact_id, binding_ref, **overrides):
-    payload = {
-        "kind": "analysis",
-        "artifact_id": artifact_id,
-        "bindings": [binding_ref.model_dump(mode="json")],
-        "analyzer_version": ANALYZER_VERSION,
-        "cleaning_protocol_version": CLEANING_PROTOCOL_VERSION,
-    }
-    payload.update(overrides)
-    return AnalysisInput.model_validate_json(canonical_json(payload))
-
-
-def _run(service, tasks, request, key="analysis-1"):
-    accepted = service.analyze(request, context_key(key))
-    outcome = tasks.run_once()
-    assert outcome is not None and outcome.task_id == accepted.task_id
-    return accepted, tasks.get_task(accepted.task_id)
-
-
-def _summary(service, task_view) -> PerformanceSummary:
-    ref = next(
-        item for item in task_view.task.result_refs
-        if item.entity_type == "PerformanceSummary"
-    )
-    return _load(service, "PerformanceSummary", ref.entity_id)
-
-
-def _metric(summary, key: str):
-    from game_app import metrics
-
-    rule = next(item for item in metrics.RULES if item.metric_key == key)
-    definition_id = _definition_id(rule)
-    return next(item for item in summary.metrics if item.definition_id == definition_id)
-
-
-def _definition_id(rule) -> str:
-    from game_app.performance import _metric_definition_id
-
-    return _metric_definition_id(rule)
-
-
-def _external_calls(repository) -> int:
-    with repository.unit_of_work() as uow:
-        return uow.query("SELECT COUNT(*) AS n FROM external_calls")[0]["n"]
 
 
 def _summary_count(repository) -> int:
-    with repository.unit_of_work() as uow:
-        return len(uow.iter_objects("PerformanceSummary"))
+    return count_objects(repository, "PerformanceSummary")
 
 
 def test_original_formula_sequence_and_tail_gate(tmp_path):
@@ -333,78 +156,6 @@ def test_no_valid_interval_is_unknown_not_zero(tmp_path):
     assert all(item.numeric.value is None for item in summary.metrics)
 
 
-def _open_session_artifact(repository, files, service, installation, context, device, data, key):
-    from game_app.contracts.performance import CreateSessionRequest
-
-    request = CreateSessionRequest.model_validate_json(canonical_json({
-        "installation_id": installation,
-        "device_snapshot_id": device,
-        "game_context_id": context,
-        "applied_id": None,
-        "configuration_state": "unverified",
-        "run_declaration": {
-            "installation_id": installation,
-            "fields": {},
-            "raw_text": "",
-        },
-        "test_protocol_id": None,
-        "recommendation_id": None,
-    }))
-    result = service.create_session(request, context_key(f"{key}-session"))
-    session_id = next(
-        ref.entity_id for ref in result.refs if ref.entity_type == "PlaySession"
-    )
-    segment_id = next(
-        ref.entity_id for ref in result.refs if ref.entity_type == "SessionSegment"
-    )
-    file_id, sha = _publish(files, data, key)
-    artifact = _craft_artifact(
-        repository, session_id=session_id, segment_id=segment_id,
-        file_id=file_id, offset=0.0, scale=0.001,
-    )
-    return artifact, BindingRef(
-        segment_id=segment_id, segment_revision=1, binding_revision=1,
-    )
-
-
-def _craft_artifact(repository, *, session_id, segment_id, file_id, offset, scale,
-                    segment_ids=None):
-    payload = {
-        "id": uid(abs(hash((session_id, segment_id, file_id))) % 10**30 or 1),
-        "schema_version": "product-contract/0.4",
-        "created_at": utc_now(),
-        "created_by_task_id": None,
-        "session_id": session_id,
-        "segment_ids": segment_ids or [segment_id],
-        "file_id": file_id,
-        "tool_name": "offline-fixture",
-        "tool_version": "1",
-        "options": {},
-        "source_schema": SCHEMA,
-        "source_column_map": [{
-            "source_column": "Time",
-            "target_field": "timestamp",
-            "source_unit": "ms",
-            "target_unit": "ms",
-            "conversion": "identity",
-        }],
-        "time_mapping": {
-            "source_basis": "log_relative",
-            "target_basis": "session",
-            "source_unit": "ms",
-            "target_unit": "s",
-            "offset": offset,
-            "scale": scale,
-            "checks": [],
-        },
-        "quality": "limited",
-        "checks": [],
-    }
-    artifact = CaptureArtifact.model_validate_json(canonical_json(payload))
-    store_raw(repository, "CaptureArtifact", artifact.model_dump(mode="json"))
-    return artifact
-
-
 def test_open_segment_is_refused_without_a_summary(tmp_path):
     repository, files, service, tasks, installation, context, device, clock = _wired(tmp_path)
     artifact, binding = _open_session_artifact(
@@ -431,7 +182,7 @@ def test_foreign_artifact_is_not_visible(tmp_path):
     )
     # Replace the artifact's file with one published by another user.
     artifact = _craft_artifact(
-        repository, session_id=_session_of(repository, artifact), segment_id=binding.segment_id,
+        repository, session_id=artifact.session_id, segment_id=binding.segment_id,
         file_id=file_id, offset=0.0, scale=0.001,
     )
 
@@ -440,10 +191,6 @@ def test_foreign_artifact_is_not_visible(tmp_path):
 
     assert caught.value.code is ErrorCode.RESOURCE_NOT_FOUND
     assert _summary_count(repository) == 0
-
-
-def _session_of(repository, artifact) -> str:
-    return artifact.session_id
 
 
 def test_same_key_replays_the_same_summary_and_different_content_conflicts(tmp_path):

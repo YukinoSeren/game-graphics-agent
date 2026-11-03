@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import statistics
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable, Mapping, Sequence
@@ -32,9 +33,11 @@ from game_app.contracts.enums import (
     AcquisitionMethod,
     AcquisitionStatus,
     CheckStatus,
+    ComparabilityLevel,
     ConfigurationState,
     FrameStreamKind,
     SessionLifecycle,
+    ThresholdMode,
     ValueState,
 )
 from game_app.contracts.performance import (
@@ -89,9 +92,14 @@ from game_app.analyzer import (
 )
 from game_app.contracts.performance import (
     AdaptiveLongFrame,
+    CompareInput,
+    ComparisonProtocol,
+    CreateComparisonProtocolRequest,
+    MetricComparison,
     MetricDenominator,
     MetricValue,
     NumericValueV01,
+    PerformanceComparison,
     PerformanceSummary,
 )
 from game_app.contracts.tasks import AnalysisInput, DomainResult
@@ -114,6 +122,13 @@ LOG_ASSOCIATION_RULE_VERSION = "log-association/0.4"
 ANALYSIS_ROUTE = "/api/analyses"
 ANALYSIS_RULE_VERSION = "analysis/0.4"
 COMPARISON_ROUTE = "/api/comparisons"
+COMPARISON_PROTOCOL_ROUTE = "/api/comparison-protocols"
+COMPARISON_PROTOCOL_RULE_VERSION = "comparison-protocol/0.4"
+COMPARISON_RULE_VERSION = "comparison/0.4"
+LONG_FRAME_CLUSTERING_VERSION = "perf-long-frame-clustering/1"
+LONG_FRAME_DENOMINATOR_VERSION = "perf-long-frame-denominator/1"
+DEFAULT_COMPARISON_THRESHOLD_MS = 50.0
+RECOMPUTE_DEADLINE_SECONDS = 120.0
 LOG_TARGET_TIME_BASIS = "session"
 SESSION_TIME_BASIS = "session"
 
@@ -1865,7 +1880,7 @@ class PerformanceService:
         if isinstance(request, AnalysisInput):
             return request
         try:
-            return AnalysisInput.model_validate(request)
+            return AnalysisInput.model_validate_json(canonical_json(request))
         except Exception as error:  # pydantic ValidationError, no writes yet
             raise ContractError(
                 ErrorCode.INPUT_VALIDATION_FAILED,
@@ -2260,6 +2275,735 @@ class PerformanceService:
             session = self._load_session(uow, artifact.session_id)
             self._require_session_owner(uow, session, user_scope_id)
             return summary
+
+    # -- comparison protocols and comparisons (04 §4.2/§6) ------------------
+    def create_comparison_protocol(
+        self,
+        request: Any,
+        context: MutationContext,
+        *,
+        request_schema_version: str = PRODUCT_CONTRACT_VERSION,
+        hooks: PublishHooks | None = None,
+    ) -> ResourceResult:
+        route = COMPARISON_PROTOCOL_ROUTE
+        typed = self._comparison_protocol_request(request)
+        request_hash = _request_hash(route, request_schema_version, typed)
+        protocol_id = _deterministic_id(
+            context.user_scope_id, route, context.idempotency_key, request_hash,
+            "comparison-protocol",
+        )
+        if self._has_registered(context, route):
+            # Replay the original response; never recompute the threshold or the
+            # frozen_at of a protocol that already committed.
+            published = self.files.publish(
+                kind="import",
+                files={f"comparison-protocols/{protocol_id}/declaration.json": b"{}"},
+                user_scope_id=context.user_scope_id,
+                method="POST",
+                canonical_route=route,
+                key=context.idempotency_key,
+                request_schema_version=request_schema_version,
+                request_hash=request_hash,
+                hooks=hooks,
+            )
+            return ResourceResult(
+                refs=[ObjectRef.model_validate(ref) for ref in published.refs]
+            )
+
+        prepared = self._prepare_comparison_protocol(typed, context.user_scope_id)
+        manifest = {
+            "kind": "comparison_protocol_declaration",
+            "rule_version": COMPARISON_PROTOCOL_RULE_VERSION,
+            "input": typed.model_dump(mode="json"),
+            "protocol_id": protocol_id,
+            "threshold_ms": prepared["threshold_ms"],
+            "baseline_statistics": prepared["statistics"],
+            "metric_registry_version": metrics.REGISTRY_VERSION,
+            "registry_manifest_hash": metrics.registry_manifest_hash(),
+            "baseline_summary_ids": list(typed.baseline_summary_ids),
+            "baseline_binding_refs": [
+                item.model_dump(mode="json") for item in typed.baseline_binding_refs
+            ],
+        }
+        now = self.clock()
+        published = self.files.publish(
+            kind="import",
+            files={
+                f"comparison-protocols/{protocol_id}/declaration.json":
+                    canonical_json(manifest)
+            },
+            user_scope_id=context.user_scope_id,
+            method="POST",
+            canonical_route=route,
+            key=context.idempotency_key,
+            request_schema_version=request_schema_version,
+            request_hash=request_hash,
+            writer=lambda uow, operation, managed: self._write_comparison_protocol(
+                uow, request=typed, protocol_id=protocol_id, now=now,
+                threshold_ms=prepared["threshold_ms"], managed=managed,
+            ),
+            hooks=hooks,
+            owner_ref=protocol_id,
+        )
+        return ResourceResult(refs=[ObjectRef.model_validate(ref) for ref in published.refs])
+
+    def _comparison_protocol_request(self, request: Any) -> CreateComparisonProtocolRequest:
+        if isinstance(request, CreateComparisonProtocolRequest):
+            return request
+        try:
+            return CreateComparisonProtocolRequest.model_validate_json(
+                canonical_json(request)
+            )
+        except Exception as error:
+            raise ContractError(
+                ErrorCode.INPUT_VALIDATION_FAILED,
+                "the comparison protocol input is invalid",
+                field_errors=[FieldError(
+                    path="input", code="type", message=str(error).splitlines()[0],
+                )],
+            ) from error
+
+    def _prepare_comparison_protocol(
+        self, request: CreateComparisonProtocolRequest, user_scope_id: str
+    ) -> dict[str, Any]:
+        if request.cleaning_definition != CLEANING_PROTOCOL_VERSION:
+            raise _invalid(
+                "cleaning_definition", "enum",
+                "the requested cleaning definition is not the packaged version",
+            )
+        if request.clustering_definition != LONG_FRAME_CLUSTERING_VERSION:
+            raise _invalid(
+                "clustering_definition", "enum",
+                "the requested clustering definition is not the packaged version",
+            )
+        if request.denominator_definition != LONG_FRAME_DENOMINATOR_VERSION:
+            raise _invalid(
+                "denominator_definition", "enum",
+                "the requested denominator definition is not the packaged version",
+            )
+        if request.threshold_mode is ThresholdMode.baseline_derived:
+            if request.threshold_ms is not None:
+                raise _invalid(
+                    "threshold_ms", "enum",
+                    "a baseline-derived protocol must not self-report a threshold",
+                )
+            if not request.baseline_summary_ids:
+                raise _invalid(
+                    "baseline_summary_ids", "required",
+                    "a baseline-derived protocol needs its baseline summaries",
+                )
+            if not request.baseline_binding_refs:
+                raise _invalid(
+                    "baseline_binding_refs", "required",
+                    "a baseline-derived protocol needs its baseline bindings",
+                )
+        elif request.threshold_ms is not None and (
+            not math.isfinite(request.threshold_ms) or request.threshold_ms <= 0
+        ):
+            raise _invalid("threshold_ms", "range", "a fixed threshold is finite and > 0")
+
+        summaries = self._validate_baselines(request, user_scope_id)
+        if request.threshold_mode is ThresholdMode.fixed:
+            return {
+                "threshold_ms": (
+                    request.threshold_ms
+                    if request.threshold_ms is not None
+                    else DEFAULT_COMPARISON_THRESHOLD_MS
+                ),
+                "statistics": {"derived": False},
+            }
+
+        # Derived: recompute every baseline original under the recorded cleaning
+        # rules; the client's numbers are never trusted.
+        all_intervals: list[float] = []
+        sample_sizes: list[int] = []
+        for target in summaries:
+            recomputed = self._recompute_summary(target)
+            if not recomputed.available:
+                raise ContractError(
+                    ErrorCode.PRECONDITION_UNVERIFIED,
+                    recomputed.reason or "a baseline original cannot be recomputed",
+                )
+            if not recomputed.intervals:
+                raise ContractError(
+                    ErrorCode.PRECONDITION_UNVERIFIED,
+                    "a baseline has no valid interval; its threshold cannot be frozen",
+                )
+            all_intervals.extend(recomputed.intervals)
+            sample_sizes.append(len(recomputed.intervals))
+        median = statistics.median(all_intervals)
+        if not math.isfinite(median) or median <= 0:
+            raise ContractError(
+                ErrorCode.PRECONDITION_UNVERIFIED,
+                "the baseline median interval is not usable",
+            )
+        threshold = max(DEFAULT_COMPARISON_THRESHOLD_MS, 2.0 * median)
+        return {
+            "threshold_ms": threshold,
+            "statistics": {
+                "derived": True,
+                "baseline_median_ms": median,
+                "interval_counts": sample_sizes,
+                "total_intervals": len(all_intervals),
+            },
+        }
+
+    def _validate_baselines(
+        self, request: CreateComparisonProtocolRequest, user_scope_id: str
+    ) -> list["_SummaryTarget"]:
+        if len(set(request.baseline_summary_ids)) != len(request.baseline_summary_ids):
+            raise _invalid(
+                "baseline_summary_ids", "conflict", "a baseline summary is listed twice"
+            )
+        refs = [
+            (item.segment_id, item.segment_revision, item.binding_revision)
+            for item in request.baseline_binding_refs
+        ]
+        if len(set(refs)) != len(refs):
+            raise _invalid(
+                "baseline_binding_refs", "conflict", "a baseline binding is listed twice"
+            )
+        targets = [
+            self._load_summary_target(summary_id, user_scope_id)
+            for summary_id in request.baseline_summary_ids
+        ]
+        if request.threshold_mode is ThresholdMode.baseline_derived:
+            union = {
+                (segment.id, segment.revision, binding.binding_revision)
+                for target in targets
+                for segment, binding in target.bindings
+            }
+            if union != set(refs):
+                raise ContractError(
+                    ErrorCode.REFERENCE_INVALID,
+                    "the baseline bindings are not exactly the summaries' own bindings",
+                )
+        else:
+            # A fixed protocol may name baselines; they must still be visible and
+            # closed, but they do not have to mirror a summary.
+            for ref in request.baseline_binding_refs:
+                self.require_analyzeable(ref, user_scope_id)
+        artifacts = [target.artifact.id for target in targets]
+        if len(set(artifacts)) != len(artifacts):
+            raise _invalid(
+                "baseline_summary_ids", "conflict",
+                "two baselines name the same original interval",
+            )
+        for index, first in enumerate(targets):
+            for second in targets[index + 1:]:
+                if (
+                    first.session.id == second.session.id
+                    and _ranges_overlap(first.summary.analyzed_ranges, second.summary.analyzed_ranges)
+                ):
+                    raise _invalid(
+                        "baseline_summary_ids", "conflict",
+                        "two baselines cover overlapping original intervals",
+                    )
+        if targets:
+            games = {target.session.game_id for target in targets}
+            if len(games) != 1:
+                raise ContractError(
+                    ErrorCode.REFERENCE_INVALID,
+                    "the baselines belong to different games",
+                )
+            schema = {target.artifact.source_schema for target in targets}
+            if len(schema) != 1:
+                raise ContractError(
+                    ErrorCode.PRECONDITION_UNVERIFIED,
+                    "the baselines use different verified schemas",
+                )
+        return targets
+
+    def _load_summary_target(self, summary_id: str, user_scope_id: str) -> "_SummaryTarget":
+        with self.repository.unit_of_work() as uow:
+            stored = uow.find_object("PerformanceSummary", summary_id)
+            if stored is None:
+                raise ContractError(
+                    ErrorCode.RESOURCE_NOT_FOUND, "the requested summary is not available"
+                )
+            summary = PerformanceSummary.model_validate_json(stored.payload_bytes)
+            artifact = self._load_artifact(uow, summary.artifact_id)
+            session = self._load_session(uow, artifact.session_id)
+            self._require_session_owner(uow, session, user_scope_id)
+            file_row = uow.find_object("ManagedFile", artifact.file_id)
+            file_payload = None if file_row is None else file_row.payload
+            if file_payload is not None and file_payload.get("user_scope_id") != user_scope_id:
+                raise ContractError(
+                    ErrorCode.RESOURCE_NOT_FOUND, "the requested summary is not available"
+                )
+            bindings: list[tuple[SessionSegment, ConfigurationBinding]] = []
+            for ref in summary.bindings:
+                segment = self._load_segment_revision(
+                    uow, ref.segment_id, ref.segment_revision
+                )
+                binding = self._load_binding(uow, ref.segment_id, ref.binding_revision)
+                if segment.lifecycle is not SessionLifecycle.ended or segment.end_s is None:
+                    raise ContractError(
+                        ErrorCode.PRECONDITION_UNVERIFIED,
+                        "the summary names an open segment revision",
+                    )
+                if binding.effective_range.end is None:
+                    raise ContractError(
+                        ErrorCode.PRECONDITION_UNVERIFIED,
+                        "the summary names an open binding revision",
+                    )
+                if segment.session_id != session.id or segment.id not in artifact.segment_ids:
+                    raise ContractError(
+                        ErrorCode.REFERENCE_INVALID,
+                        "the summary's artifact does not cover its binding",
+                    )
+                bindings.append((segment, binding))
+        return _SummaryTarget(
+            summary=summary,
+            artifact=artifact,
+            session=session,
+            bindings=bindings,
+            file_payload=file_payload,
+        )
+
+    def _recompute_summary(self, target: "_SummaryTarget") -> "_Recompute":
+        """Re-read the original and rebuild the summary's retained intervals."""
+        if target.file_payload is None:
+            return _Recompute(False, [], 0.0, None, "the summary's original is not registered")
+        if target.file_payload.get("file_status") != "published":
+            return _Recompute(False, [], 0.0, None, "the summary's original is not consumable")
+        try:
+            data = self.files.read_managed_file(target.artifact.file_id)
+        except ContractError as error:
+            return _Recompute(False, [], 0.0, None, error.message)
+        try:
+            parsed = parse_log(
+                data,
+                registry=self.log_registry,
+                evidence=_artifact_evidence(target.file_payload),
+                deadline_seconds=RECOMPUTE_DEADLINE_SECONDS,
+            )
+        except ContractError as error:
+            return _Recompute(False, [], 0.0, None, error.message)
+        if parsed.format_id != target.artifact.source_schema:
+            return _Recompute(
+                False, [], 0.0, None,
+                "the original no longer matches the artifact's verified schema",
+            )
+        mapping = target.artifact.time_mapping
+        if mapping.scale is None or mapping.offset is None:
+            return _Recompute(False, [], 0.0, None, "the artifact has no time mapping")
+        if len(parsed.observed_streams) > 1:
+            return _Recompute(
+                False, [], 0.0, None,
+                "the original mixes frame streams; it cannot be recomputed as one",
+            )
+        if parsed.frame_stream_kind is not FrameStreamKind.application_present:
+            return _Recompute(
+                False, [], 0.0, None,
+                "the original's frame stream is not confirmed as application_present",
+            )
+        intervals: list[float] = []
+        for segment, binding in target.bindings:
+            window = _analysis_window(segment, binding)
+            cleaning = clean_frames(
+                parsed.frames,
+                time_mapping=mapping,
+                window=window,
+                excluded_ranges=segment.excluded_ranges,
+            )
+            intervals.extend(cleaning.intervals)
+        return _Recompute(
+            True, intervals, sum(intervals) / 1000.0,
+            parsed.frame_stream_kind, None,
+        )
+
+    def _write_comparison_protocol(
+        self,
+        uow: UnitOfWork,
+        *,
+        request: CreateComparisonProtocolRequest,
+        protocol_id: str,
+        now: str,
+        threshold_ms: float,
+        managed: Sequence[Any],
+    ) -> list[ObjectRef]:
+        series_id = _deterministic_id(protocol_id, "series")
+        protocol = ComparisonProtocol(
+            id=protocol_id,
+            schema_version=PRODUCT_CONTRACT_VERSION,
+            created_at=now,
+            created_by_task_id=None,
+            series_id=series_id,
+            version=1,
+            threshold_mode=request.threshold_mode,
+            threshold_ms=threshold_ms,
+            baseline_summary_ids=list(request.baseline_summary_ids),
+            baseline_binding_refs=list(request.baseline_binding_refs),
+            frozen_at=now,
+            exploratory=request.exploratory,
+            cleaning_definition=request.cleaning_definition,
+            clustering_definition=request.clustering_definition,
+            denominator_definition=request.denominator_definition,
+        )
+        uow.insert_versioned("ComparisonProtocol", protocol)
+        for summary_id in protocol.baseline_summary_ids:
+            uow.insert_reference(protocol.id, "baseline_summary", ObjectRef(
+                entity_type="PerformanceSummary", entity_id=summary_id,
+            ))
+        # ``managed[0]`` is not yet an objects row (files.publish inserts it after
+        # the writer), so the declaration is referenced by id only.
+        return [
+            ObjectRef(entity_type="ComparisonProtocol", entity_id=protocol.id),
+            ObjectRef(entity_type="ManagedFile", entity_id=managed[0].id),
+        ]
+
+    def _load_comparison_protocol_typed(self, protocol_id: str) -> ComparisonProtocol:
+        self.require_comparison_protocol(protocol_id)
+        with self.repository.unit_of_work() as uow:
+            stored = uow.find_object("ComparisonProtocol", protocol_id)
+        assert stored is not None
+        return ComparisonProtocol.model_validate_json(stored.payload_bytes)
+
+    def compare(
+        self,
+        request: Any,
+        context: MutationContext,
+        *,
+        request_schema_version: str = PRODUCT_CONTRACT_VERSION,
+    ) -> ResourceResult:
+        route = COMPARISON_ROUTE
+        typed = self._compare_input(request)
+        request_hash = _request_hash(route, request_schema_version, typed)
+        with self.repository.unit_of_work() as uow:
+            replay = self._replay_resource(
+                uow, context, route, request_schema_version, request_hash
+            )
+            if replay is not None:
+                return replay
+
+        protocol = self._load_comparison_protocol_typed(typed.protocol_id)
+        self._require_protocol_owner(protocol.id, context.user_scope_id)
+        left = self._load_summary_target(typed.summary_ids[0], context.user_scope_id)
+        right = self._load_summary_target(typed.summary_ids[1], context.user_scope_id)
+        recomputed_left = self._recompute_summary(left)
+        recomputed_right = self._recompute_summary(right)
+        self._require_temporal_order(left, right, protocol)
+
+        comparison_id = _deterministic_id(
+            context.user_scope_id, route, context.idempotency_key, request_hash, "comparison",
+        )
+        plan = self._build_comparison(
+            protocol, left, right, recomputed_left, recomputed_right, comparison_id,
+        )
+        now = self.clock()
+        with self.repository.unit_of_work() as uow:
+            # A concurrent submission of the same key may have committed while
+            # this one computed; replay its response instead of writing twice.
+            winner = self._replay_resource(
+                uow, context, route, request_schema_version, request_hash
+            )
+            if winner is not None:
+                return winner
+            # Re-check the frozen protocol and both summaries inside the short
+            # publishing transaction; a concurrently removed reference loses.
+            if uow.find_object("ComparisonProtocol", protocol.id) is None:
+                raise ContractError(
+                    ErrorCode.REFERENCE_INVALID, "the comparison protocol disappeared"
+                )
+            for summary_id in typed.summary_ids:
+                if uow.find_object("PerformanceSummary", summary_id) is None:
+                    raise ContractError(
+                        ErrorCode.REFERENCE_INVALID, "a compared summary disappeared"
+                    )
+            self._register_definitions(uow, plan["metric_rules"], now)
+            uow.insert_object("PerformanceComparison", plan["comparison"])
+            for summary_id in typed.summary_ids:
+                uow.insert_reference(comparison_id, "summary", ObjectRef(
+                    entity_type="PerformanceSummary", entity_id=summary_id,
+                ))
+            uow.insert_reference(comparison_id, "protocol", ObjectRef(
+                entity_type="ComparisonProtocol", entity_id=protocol.id,
+            ))
+            result = ResourceResult(refs=[
+                ObjectRef(entity_type="PerformanceComparison", entity_id=comparison_id)
+            ])
+            self._record_resource(
+                uow, context, route, request_schema_version, request_hash, result,
+            )
+            return result
+
+    def _compare_input(self, request: Any) -> CompareInput:
+        if isinstance(request, CompareInput):
+            return request
+        try:
+            return CompareInput.model_validate_json(canonical_json(request))
+        except Exception as error:
+            raise ContractError(
+                ErrorCode.INPUT_VALIDATION_FAILED,
+                "the compare input is invalid",
+                field_errors=[FieldError(
+                    path="input", code="type", message=str(error).splitlines()[0],
+                )],
+            ) from error
+
+    def _require_temporal_order(
+        self,
+        left: "_SummaryTarget",
+        right: "_SummaryTarget",
+        protocol: ComparisonProtocol,
+    ) -> None:
+        """A non-exploratory protocol must be provably frozen before the later test."""
+        if protocol.exploratory:
+            return
+        try:
+            left_start = datetime.fromisoformat(left.session.started_at)
+            right_start = datetime.fromisoformat(right.session.started_at)
+            frozen = datetime.fromisoformat(protocol.frozen_at)
+        except ValueError as error:
+            raise ContractError(
+                ErrorCode.PRECONDITION_UNVERIFIED,
+                "the test order has no usable backend time",
+            ) from error
+        if left_start == right_start:
+            raise ContractError(
+                ErrorCode.PRECONDITION_UNVERIFIED,
+                "the two tests have the same start time; their order is unproven",
+            )
+        later = (left, right)[0] if left_start > right_start else (left, right)[1]
+        later_start = max(left_start, right_start)
+        if later_start <= frozen:
+            raise ContractError(
+                ErrorCode.PRECONDITION_UNVERIFIED,
+                "the later test started before the protocol was frozen",
+            )
+        later_summary_at = datetime.fromisoformat(later.summary.created_at)
+        if later_summary_at <= frozen:
+            raise ContractError(
+                ErrorCode.PRECONDITION_UNVERIFIED,
+                "the later test's result was registered before the protocol was frozen",
+            )
+
+    def _build_comparison(
+        self,
+        protocol: ComparisonProtocol,
+        left: "_SummaryTarget",
+        right: "_SummaryTarget",
+        recomputed_left: "_Recompute",
+        recomputed_right: "_Recompute",
+        comparison_id: str,
+    ) -> dict[str, Any]:
+        rules = _protocol_metric_rules(protocol)
+        left_ref = ObjectRef(entity_type="PerformanceSummary", entity_id=left.summary.id)
+        right_ref = ObjectRef(entity_type="PerformanceSummary", entity_id=right.summary.id)
+        per_metric: list[MetricComparison] = []
+        for left_value in left.summary.metrics:
+            right_value = next(
+                (item for item in right.summary.metrics
+                 if item.definition_id == left_value.definition_id),
+                None,
+            )
+            per_metric.append(_compare_stored_metric(
+                left_value, right_value, left_ref, right_ref,
+            ))
+        per_metric.extend([
+            _compare_long_frame_rate(
+                rules[0], protocol, left, right, recomputed_left, recomputed_right,
+                left_ref, right_ref,
+            ),
+            _compare_long_frame_share(
+                rules[1], protocol, left, right, recomputed_left, recomputed_right,
+                left_ref, right_ref,
+            ),
+        ])
+
+        checks, level, limitations = self._comparability(protocol, left, right)
+        comparison = PerformanceComparison(
+            id=comparison_id,
+            schema_version=PRODUCT_CONTRACT_VERSION,
+            created_at=self.clock(),
+            created_by_task_id=None,
+            summary_ids=[left.summary.id, right.summary.id],
+            protocol_id=protocol.id,
+            level=level,
+            per_metric=per_metric,
+            checks=checks,
+            limitations=limitations,
+        )
+        return {
+            "comparison": comparison,
+            "metric_rules": list(rules),
+        }
+
+    def _comparability(
+        self,
+        protocol: ComparisonProtocol,
+        left: "_SummaryTarget",
+        right: "_SummaryTarget",
+    ) -> tuple[list[CheckResult], ComparabilityLevel, list[str]]:
+        limitations: list[str] = []
+        if protocol.exploratory:
+            limitations.append(
+                "exploratory comparison: it was created after observing the tests and"
+                " is not a pre-planned experiment"
+            )
+        left_segment = left.bindings[0][0] if left.bindings else None
+        right_segment = right.bindings[0][0] if right.bindings else None
+
+        def check(check_id: str, status: CheckStatus, note: str) -> CheckResult:
+            return _comparison_check(check_id, status, note, self.clock())
+
+        checks: list[CheckResult] = []
+        game = CheckStatus.pass_ if left.session.game_id == right.session.game_id else CheckStatus.fail
+        checks.append(check(
+            "comparison.game", game,
+            "both tests name the same game" if game is CheckStatus.pass_
+            else "the tests name different games; they are not comparable",
+        ))
+        device = (
+            CheckStatus.pass_
+            if left.session.device_snapshot_id == right.session.device_snapshot_id
+            else CheckStatus.unknown
+        )
+        checks.append(check(
+            "comparison.device", device,
+            "both tests share one device snapshot" if device is CheckStatus.pass_
+            else "the device snapshots differ; the same hardware cannot be proven",
+        ))
+        if left_segment is None or right_segment is None:
+            scenario = CheckStatus.unknown
+            note = "a summary names no segment revision"
+        else:
+            scenario = _compare_field(left_segment.scenario, right_segment.scenario)
+            note = "the declared scenario is known and equal" if scenario is CheckStatus.pass_ else (
+                "the declared scenario differs or is unknown"
+            )
+        checks.append(check("comparison.scenario", scenario, note))
+
+        if left_segment is None or right_segment is None:
+            conditions = CheckStatus.unknown
+            conditions_note = "a summary names no segment revision"
+        else:
+            statuses = _compare_run_conditions(
+                left_segment.run_conditions, right_segment.run_conditions
+            )
+            statuses.append(_compare_stream(
+                left_segment.stream_selection, right_segment.stream_selection
+            ))
+            conditions = _combine_statuses(statuses)
+            conditions_note = (
+                "resolution, frame generation, upscaling, scene and stream are equal"
+                if conditions is CheckStatus.pass_
+                else "a run condition differs or is unknown"
+            )
+        checks.append(check("comparison.frame_conditions", conditions, conditions_note))
+
+        configuration = self._compare_configuration(left_segment, right_segment, limitations)
+        checks.append(check(
+            "comparison.configuration", configuration,
+            "both runs have a bound, confirmed configuration"
+            if configuration is CheckStatus.pass_
+            else "the effective configuration is unknown, mixed or unconfirmed",
+        ))
+
+        protocol_ok = (
+            left.summary.analyzer_version == right.summary.analyzer_version
+            and left.summary.cleaning_protocol_version == right.summary.cleaning_protocol_version
+            and left.summary.cleaning_protocol_version == protocol.cleaning_definition
+            and left.summary.analyzer_version == ANALYZER_VERSION
+        )
+        checks.append(check(
+            "comparison.protocol", CheckStatus.pass_ if protocol_ok else CheckStatus.fail,
+            "both summaries and the frozen protocol use the same analyzer/cleaning rules"
+            if protocol_ok else
+            "the analyzer or cleaning definitions differ; the metrics are not one rule set",
+        ))
+
+        critical = {"comparison.game", "comparison.scenario",
+                    "comparison.frame_conditions", "comparison.configuration",
+                    "comparison.protocol"}
+        by_id = {item.check_id: item for item in checks}
+        if any(by_id[item].status is CheckStatus.fail for item in critical):
+            level = ComparabilityLevel.descriptive
+        elif any(by_id[item].status is CheckStatus.unknown for item in critical):
+            level = ComparabilityLevel.descriptive
+        elif by_id["comparison.device"].status is not CheckStatus.pass_:
+            level = ComparabilityLevel.approximate
+            limitations.append(
+                "the device snapshot is not identical; the difference is a minor"
+                " unexplained condition"
+            )
+        else:
+            level = ComparabilityLevel.controlled
+        return checks, level, limitations
+
+    def _compare_configuration(
+        self,
+        left: SessionSegment | None,
+        right: SessionSegment | None,
+        limitations: list[str],
+    ) -> CheckStatus:
+        if left is None or right is None:
+            return CheckStatus.unknown
+        if (
+            left.configuration_state is not ConfigurationState.bound
+            or right.configuration_state is not ConfigurationState.bound
+            or left.applied_id is None
+            or right.applied_id is None
+        ):
+            return CheckStatus.unknown
+        if left.applied_id == right.applied_id:
+            return CheckStatus.pass_
+        activations: list[Any] = []
+        with self.repository.unit_of_work() as uow:
+            for applied_id in (left.applied_id, right.applied_id):
+                stored = uow.find_object("AppliedConfiguration", applied_id)
+                activations.append(None if stored is None else stored.payload)
+        if any(
+            item is None or item.get("activation_state") != "active_confirmed"
+            for item in activations
+        ):
+            return CheckStatus.unknown
+        limitations.append(
+            "the two runs used different adopted configurations; only declared"
+            " settings are claimed to differ"
+        )
+        return CheckStatus.pass_
+
+    def get_comparison(self, comparison_id: str, user_scope_id: str) -> PerformanceComparison:
+        with self.repository.unit_of_work() as uow:
+            stored = uow.find_object("PerformanceComparison", comparison_id)
+            if stored is None:
+                raise ContractError(
+                    ErrorCode.RESOURCE_NOT_FOUND, "the requested comparison is not available"
+                )
+            comparison = PerformanceComparison.model_validate_json(stored.payload_bytes)
+        # Resolve ownership outside the read transaction: every summary load
+        # opens its own short transaction.
+        for summary_id in comparison.summary_ids:
+            self._load_summary_target(summary_id, user_scope_id)
+        return comparison
+
+    def get_comparison_protocol(
+        self, protocol_id: str, user_scope_id: str
+    ) -> ComparisonProtocol:
+        protocol = self._load_comparison_protocol_typed(protocol_id)
+        self._require_protocol_owner(protocol.id, user_scope_id)
+        for summary_id in protocol.baseline_summary_ids:
+            self._load_summary_target(summary_id, user_scope_id)
+        return protocol
+
+    def _require_protocol_owner(self, protocol_id: str, user_scope_id: str) -> None:
+        """The frozen protocol belongs to the user whose submission wrote it."""
+        with self.repository.unit_of_work() as uow:
+            rows = uow.query(
+                "SELECT user_scope_id FROM file_operations WHERE owner_ref=?",
+                (protocol_id,),
+            )
+        if not rows:
+            raise ContractError(
+                ErrorCode.PRECONDITION_UNVERIFIED,
+                "the protocol records no owning submission",
+            )
+        if rows[0]["user_scope_id"] != user_scope_id:
+            raise ContractError(
+                ErrorCode.RESOURCE_NOT_FOUND, "the requested protocol is not available"
+            )
 
     # -- segment internals --------------------------------------------------
     def _segment_and_session(
@@ -2943,6 +3687,24 @@ class _AnalysisPlan:
     effective_duration_s: float
 
 
+@dataclass(frozen=True)
+class _SummaryTarget:
+    summary: PerformanceSummary
+    artifact: CaptureArtifact
+    session: PlaySession
+    bindings: list[tuple[SessionSegment, ConfigurationBinding]]
+    file_payload: Mapping[str, Any] | None
+
+
+@dataclass(frozen=True)
+class _Recompute:
+    available: bool
+    intervals: list[float]
+    duration_s: float
+    stream_kind: FrameStreamKind | None
+    reason: str | None
+
+
 _QUALITY_ORDER = {
     LogQuality.invalid: 0,
     LogQuality.limited: 1,
@@ -3126,8 +3888,280 @@ def _adaptive_long_frame(run: ContinuousRun, segment: SessionSegment) -> Adaptiv
     )
 
 
-def _unconfirmed_stream(now: str) -> StreamSelection:
-    return StreamSelection(
+def _ranges_overlap(
+    left: Sequence[TimeRange], right: Sequence[TimeRange]
+) -> bool:
+    for first in left:
+        for second in right:
+            if first.time_basis != second.time_basis or first.unit != second.unit:
+                return True  # disjointness cannot be proven across bases
+            if first.start < second.end and first.end > second.start:
+                return True
+    return False
+
+
+def _comparison_check(
+    check_id: str, status: CheckStatus, note: str, now: str
+) -> CheckResult:
+    return CheckResult(
+        check_id=check_id,
+        definition_version=COMPARISON_RULE_VERSION,
+        status=status,
+        input_refs=[],
+        evidence_refs=[],
+        checked_at=None if status is CheckStatus.not_run else now,
+        method="deterministic comparison rule",
+        note=note,
+    )
+
+
+def _compare_field(left: Any, right: Any) -> CheckStatus:
+    if (
+        left.value_state is ValueState.known
+        and right.value_state is ValueState.known
+    ):
+        return CheckStatus.pass_ if left.value == right.value else CheckStatus.fail
+    return CheckStatus.unknown
+
+
+def _combine_statuses(statuses: Sequence[CheckStatus]) -> CheckStatus:
+    if any(item is CheckStatus.fail for item in statuses):
+        return CheckStatus.fail
+    if any(item is CheckStatus.unknown for item in statuses):
+        return CheckStatus.unknown
+    return CheckStatus.pass_
+
+
+def _compare_run_conditions(
+    left: RunConditions, right: RunConditions
+) -> list[CheckStatus]:
+    statuses = [
+        _compare_field(left.output_resolution, right.output_resolution),
+        _compare_field(left.render_resolution, right.render_resolution),
+        _compare_field(left.frame_generation, right.frame_generation),
+        _compare_field(left.upscaling, right.upscaling),
+    ]
+    for key in sorted(set(left.scene_conditions) | set(right.scene_conditions)):
+        if key not in left.scene_conditions or key not in right.scene_conditions:
+            statuses.append(CheckStatus.unknown)
+        else:
+            statuses.append(_compare_field(
+                left.scene_conditions[key], right.scene_conditions[key],
+            ))
+    return statuses
+
+
+def _compare_stream(left: StreamSelection, right: StreamSelection) -> CheckStatus:
+    if (
+        left.frame_stream_kind is FrameStreamKind.unknown
+        or right.frame_stream_kind is FrameStreamKind.unknown
+    ):
+        return CheckStatus.unknown
+    return (
+        CheckStatus.pass_
+        if left.frame_stream_kind is right.frame_stream_kind
+        else CheckStatus.fail
+    )
+
+
+def _protocol_metric_rules(protocol: ComparisonProtocol) -> tuple[Any, Any]:
+    """Two definitions fingerprinted by the frozen protocol (04 §6 step 9)."""
+    fingerprint = hashlib.sha256(canonical_json({
+        "protocol_id": protocol.id,
+        "threshold_ms": protocol.threshold_ms,
+        "clustering_definition": protocol.clustering_definition,
+        "denominator_definition": protocol.denominator_definition,
+    })).hexdigest()[:16]
+    version = f"v1-{fingerprint}"
+    rate = metrics.MetricRule(
+        metric_key="long_frame_cluster_rate",
+        definition_version=version,
+        label="Long-frame clusters per minute",
+        unit="clusters/min",
+        frame_stream_kind=FrameStreamKind.application_present,
+        algorithm_ref=(
+            f"04 §6 step 7: 60*K/T with the frozen threshold"
+            f" {protocol.threshold_ms}ms and denominator T in seconds"
+        ),
+        minimum_sample_rule="T > 0; otherwise the value stays unknown",
+    )
+    share = metrics.MetricRule(
+        metric_key="long_frame_time_share",
+        definition_version=version,
+        label="Long-frame time share",
+        unit="ratio",
+        frame_stream_kind=FrameStreamKind.application_present,
+        algorithm_ref=(
+            f"04 §6 step 7: sum(L)/(1000*T) with the frozen threshold"
+            f" {protocol.threshold_ms}ms over the full interval duration"
+        ),
+        minimum_sample_rule="T > 0; otherwise the value stays unknown",
+    )
+    return rate, share
+
+
+def _delta_value(
+    left: MetricValue, value: float, left_ref: ObjectRef, right_ref: ObjectRef
+) -> MetricValue:
+    return MetricValue(
+        definition_id=left.definition_id,
+        numeric=_known_numeric(value),
+        unit=left.unit,
+        frame_stream_kind=left.frame_stream_kind,
+        input_refs=[left_ref, right_ref],
+        denominator=None,
+        method="right-left in the definition's unit",
+    )
+
+
+def _compare_stored_metric(
+    left: MetricValue,
+    right: MetricValue | None,
+    left_ref: ObjectRef,
+    right_ref: ObjectRef,
+) -> MetricComparison:
+    if right is None:
+        return MetricComparison(
+            metric_definition_id=left.definition_id,
+            status=CheckStatus.not_applicable,
+            left=left,
+            right=None,
+            delta=None,
+            reason="the right summary carries no metric with this definition",
+        )
+    left_known = left.numeric.number_kind != "unknown"
+    right_known = right.numeric.number_kind != "unknown"
+    if left_known and right_known:
+        return MetricComparison(
+            metric_definition_id=left.definition_id,
+            status=CheckStatus.pass_,
+            left=left,
+            right=right,
+            delta=_delta_value(
+                left, right.numeric.value - left.numeric.value, left_ref, right_ref,
+            ),
+            reason=None,
+        )
+    reasons = [item for item in (
+        None if left_known else f"left={left.numeric.unknown_reason}",
+        None if right_known else f"right={right.numeric.unknown_reason}",
+    ) if item]
+    return MetricComparison(
+        metric_definition_id=left.definition_id,
+        status=CheckStatus.unknown,
+        left=left,
+        right=right,
+        delta=None,
+        reason="a side has no numeric value: " + ", ".join(reasons),
+    )
+
+
+def _protocol_long_frame_value(
+    rule: Any,
+    target: _SummaryTarget,
+    recomputed: _Recompute,
+    protocol: ComparisonProtocol,
+    *,
+    kind: str,
+) -> MetricValue:
+    summary_ref = ObjectRef(
+        entity_type="PerformanceSummary", entity_id=target.summary.id
+    )
+    definition_id = _metric_definition_id(rule)
+    duration = target.summary.effective_duration_s
+    if not recomputed.available or duration <= 0:
+        return MetricValue(
+            definition_id=definition_id,
+            numeric=_unknown_numeric("not_provided"),
+            unit=rule.unit,
+            frame_stream_kind=FrameStreamKind.application_present,
+            input_refs=[summary_ref],
+            denominator=None,
+            method=rule.algorithm_ref,
+        )
+    clusters, _, long_ms = long_frame_statistics(
+        recomputed.intervals, protocol.threshold_ms
+    )
+    value = (
+        60.0 * clusters / duration
+        if kind == "rate"
+        else long_ms / (1000.0 * duration)
+    )
+    return MetricValue(
+        definition_id=definition_id,
+        numeric=_known_numeric(value),
+        unit=rule.unit,
+        frame_stream_kind=FrameStreamKind.application_present,
+        input_refs=[summary_ref],
+        denominator=MetricDenominator(
+            value=duration, unit="s", input_refs=[summary_ref],
+        ),
+        method=rule.algorithm_ref,
+    )
+
+
+def _compare_long_frame(
+    rule: Any,
+    protocol: ComparisonProtocol,
+    left: _SummaryTarget,
+    right: _SummaryTarget,
+    recomputed_left: _Recompute,
+    recomputed_right: _Recompute,
+    left_ref: ObjectRef,
+    right_ref: ObjectRef,
+    *,
+    kind: str,
+) -> MetricComparison:
+    left_value = _protocol_long_frame_value(
+        rule, left, recomputed_left, protocol, kind=kind,
+    )
+    right_value = _protocol_long_frame_value(
+        rule, right, recomputed_right, protocol, kind=kind,
+    )
+    definition_id = _metric_definition_id(rule)
+    if (
+        left_value.numeric.number_kind != "unknown"
+        and right_value.numeric.number_kind != "unknown"
+    ):
+        return MetricComparison(
+            metric_definition_id=definition_id,
+            status=CheckStatus.pass_,
+            left=left_value,
+            right=right_value,
+            delta=_delta_value(
+                left_value,
+                right_value.numeric.value - left_value.numeric.value,
+                left_ref, right_ref,
+            ),
+            reason=None,
+        )
+    reasons = [
+        item for item in (
+            None if left_value.numeric.number_kind != "unknown"
+            else f"left: {recomputed_left.reason or 'no effective duration'}",
+            None if right_value.numeric.number_kind != "unknown"
+            else f"right: {recomputed_right.reason or 'no effective duration'}",
+        ) if item
+    ]
+    return MetricComparison(
+        metric_definition_id=definition_id,
+        status=CheckStatus.unknown,
+        left=left_value,
+        right=right_value,
+        delta=None,
+        reason="the threshold metric cannot be recomputed: " + "; ".join(reasons),
+    )
+
+
+def _compare_long_frame_rate(*args: Any, **kwargs: Any) -> MetricComparison:
+    return _compare_long_frame(*args, kind="rate", **kwargs)
+
+
+def _compare_long_frame_share(*args: Any, **kwargs: Any) -> MetricComparison:
+    return _compare_long_frame(*args, kind="share", **kwargs)
+
+
+def _unconfirmed_stream(now: str) -> StreamSelection:    return StreamSelection(
         process=None,
         swapchain_id=None,
         frame_stream_kind=FrameStreamKind.unknown,

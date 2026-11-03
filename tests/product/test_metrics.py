@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 
 from game_app.analyzer import long_frame_statistics, slowest_tail_inverse_mean
-from game_app.contracts.performance import EndSegmentRequest
+from game_app.contracts.performance import BindConfigurationRequest, EndSegmentRequest
 from game_app.contracts.primitives import BindingRef
 from game_app.errors import ContractError, ErrorCode
 from game_app.repository import canonical_json
@@ -283,3 +283,117 @@ def test_second_analysis_creates_a_new_summary_without_touching_the_old(tmp_path
         assert uow.find_object("PerformanceSummary", first.id).payload_bytes == first_bytes
         assert uow.query("SELECT COUNT(*) AS n FROM current_applied")[0]["n"] == 0
     assert _summary_count(repository) == 2
+
+
+def test_overlapping_bindings_in_one_analysis_are_rejected(tmp_path):
+    repository, files, service, tasks, installation, context, device, clock = _wired(tmp_path)
+    artifact, binding = _open_session_artifact(
+        repository, files, service, installation, context, device,
+        _csv([10, 20, 30, 40]), "overlap",
+    )
+    clock.advance(60)
+    service.end_segment(
+        EndSegmentRequest.model_validate_json(canonical_json({
+            "segment_id": binding.segment_id,
+            "expected_segment_revision": 1,
+            "expected_binding_revision": 1,
+        })),
+        context_key("overlap-end"),
+    )
+    sha = _published_hash(service, artifact.file_id)
+    rebound = service.bind_configuration(
+        BindConfigurationRequest.model_validate_json(canonical_json({
+            "segment_id": binding.segment_id,
+            "expected_segment_revision": 2,
+            "expected_binding_revision": 2,
+            "applied_id": _applied_id(repository, installation),
+            "effective_range": {
+                "start": 0.0, "end": 20.0, "time_basis": "session", "unit": "s",
+            },
+            "evidence_refs": [{
+                "kind": "artifact",
+                "file_id": artifact.file_id,
+                "content_hash": sha,
+                "locator": "log.csv",
+            }],
+        })),
+        context_key("overlap-bind"),
+    )
+    assert rebound.refs
+
+    with pytest.raises(ContractError) as caught:
+        service.analyze(
+            _input(artifact.id, binding, bindings=[
+                {
+                    "segment_id": binding.segment_id,
+                    "segment_revision": 2,
+                    "binding_revision": 2,
+                },
+                {
+                    "segment_id": binding.segment_id,
+                    "segment_revision": 3,
+                    "binding_revision": 3,
+                },
+            ]),
+            context_key("overlap-analysis"),
+        )
+
+    assert caught.value.code is ErrorCode.REFERENCE_INVALID
+    assert _summary_count(repository) == 0
+
+
+def _published_hash(service, file_id: str) -> str:
+    with service.repository.unit_of_work() as uow:
+        return uow.find_object("ManagedFile", file_id).payload["manifest"]["sha256"]
+
+
+def _applied_id(repository, installation_id: str) -> str:
+    from tests.product.support.configuration import store_raw, uid
+
+    applied_id = uid(777)
+    store_raw(repository, "AppliedConfiguration", {
+        "id": applied_id,
+        "user_scope_id": USER,
+        "installation_id": installation_id,
+        "activation_state": "active_confirmed",
+    })
+    return applied_id
+
+
+def test_a_replay_returns_the_original_task_after_the_world_changed(tmp_path):
+    repository, files, service, tasks, installation, context, device, clock = _wired(tmp_path)
+    artifact, binding = _artifact_from_csv(
+        service, files, installation, context, device, _csv([10, 20, 30, 40]), "replay"
+    )
+    request = _input(artifact.id, binding)
+
+    first, view = _run(service, tasks, request, key="replay")
+    summary_id = _summary(service, view).id
+    with repository.unit_of_work() as uow:
+        stored = uow.find_object("CaptureArtifact", artifact.id)
+    (files.root / "objects" / stored.payload["file_id"]).unlink()
+
+    replay = service.analyze(request, context_key("replay"))
+
+    assert replay.task_id == first.task_id
+    assert _summary(service, tasks.get_task(replay.task_id)).id == summary_id
+
+
+def test_the_declared_sample_rules_match_behavior(tmp_path):
+    from game_app import metrics
+
+    repository, files, service, tasks, installation, context, device, clock = _wired(tmp_path)
+    artifact, binding = _artifact_from_csv(
+        service, files, installation, context, device, _csv([10, 20, 30, 40]), "rules"
+    )
+    _, view = _run(service, tasks, _input(artifact.id, binding))
+    summary = _summary(service, view)
+
+    p99 = metrics.rule_for("interval_p99_nearest_rank/v1")
+    slowest = metrics.rule_for("slowest_1pct_inverse_mean/v1")
+    assert "20" not in p99.minimum_sample_rule
+    assert "20" in slowest.minimum_sample_rule
+    # The behaviour matches the declared rules: P99 exists for four samples,
+    # the 1% tail needs its 20-sample gate.
+    assert _metric(summary, "interval_p99_nearest_rank").numeric.value == 40.0
+    assert _metric(summary, "slowest_1pct_inverse_mean").numeric.number_kind == "unknown"

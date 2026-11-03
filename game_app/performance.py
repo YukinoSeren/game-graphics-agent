@@ -1886,7 +1886,11 @@ class PerformanceService:
         (error-conventions §4.2).
         """
         task_input = self._analysis_input(request)
-        self._load_analysis_targets(task_input, context.user_scope_id)
+        # A registered key replays its original TaskAccepted even if the world
+        # changed since (error-conventions §4.2); only a new submission is
+        # guarded.
+        if not self._has_registered(context, ANALYSIS_ROUTE):
+            self._load_analysis_targets(task_input, context.user_scope_id)
         if self.tasks is None:
             raise ContractError(
                 ErrorCode.INTERNAL_ERROR, "the analysis handler is not wired"
@@ -1990,6 +1994,19 @@ class PerformanceService:
                         ErrorCode.PRECONDITION_UNVERIFIED,
                         "an open binding cannot be analyzed",
                     )
+                window = _analysis_window(segment, binding)
+                for other_segment, other_binding in bindings:
+                    other_window = _analysis_window(other_segment, other_binding)
+                    if (
+                        window.start < other_window.end
+                        and window.end > other_window.start
+                    ):
+                        # Two overlapping windows would count the same frames
+                        # twice in every statistic.
+                        raise ContractError(
+                            ErrorCode.REFERENCE_INVALID,
+                            "two analyzed bindings cover overlapping intervals",
+                        )
                 bindings.append((segment, binding))
 
         # The managed read re-verifies the bytes against the manifest hash; a
@@ -2859,8 +2876,8 @@ class PerformanceService:
                 "exploratory comparison: it was created after observing the tests and"
                 " is not a pre-planned experiment"
             )
-        left_segment = left.bindings[0][0] if left.bindings else None
-        right_segment = right.bindings[0][0] if right.bindings else None
+        left_segments = [segment for segment, _ in left.bindings]
+        right_segments = [segment for segment, _ in right.bindings]
 
         def check(check_id: str, status: CheckStatus, note: str) -> CheckResult:
             return _comparison_check(check_id, status, note, self.clock())
@@ -2882,26 +2899,33 @@ class PerformanceService:
             "both tests share one device snapshot" if device is CheckStatus.pass_
             else "the device snapshots differ; the same hardware cannot be proven",
         ))
-        if left_segment is None or right_segment is None:
+        if not left_segments or not right_segments:
             scenario = CheckStatus.unknown
             note = "a summary names no segment revision"
         else:
-            scenario = _compare_field(left_segment.scenario, right_segment.scenario)
-            note = "the declared scenario is known and equal" if scenario is CheckStatus.pass_ else (
-                "the declared scenario differs or is unknown"
+            # Every binding of a summary is inspected: a summary that mixes two
+            # scenarios cannot inherit the first binding's answer.
+            left_scenario, left_uniform = _side_field(
+                [segment.scenario for segment in left_segments]
             )
+            right_scenario, right_uniform = _side_field(
+                [segment.scenario for segment in right_segments]
+            )
+            if not (left_uniform and right_uniform):
+                scenario = CheckStatus.fail
+                note = "a summary mixes several declared scenarios"
+            else:
+                scenario = _compare_field(left_scenario, right_scenario)
+                note = "the declared scenario is known and equal" if scenario is CheckStatus.pass_ else (
+                    "the declared scenario differs or is unknown"
+                )
         checks.append(check("comparison.scenario", scenario, note))
 
-        if left_segment is None or right_segment is None:
+        if not left_segments or not right_segments:
             conditions = CheckStatus.unknown
             conditions_note = "a summary names no segment revision"
         else:
-            statuses = _compare_run_conditions(
-                left_segment.run_conditions, right_segment.run_conditions
-            )
-            statuses.append(_compare_stream(
-                left_segment.stream_selection, right_segment.stream_selection
-            ))
+            statuses = _compare_conditions_across(left_segments, right_segments)
             conditions = _combine_statuses(statuses)
             conditions_note = (
                 "resolution, frame generation, upscaling, scene and stream are equal"
@@ -2910,7 +2934,9 @@ class PerformanceService:
             )
         checks.append(check("comparison.frame_conditions", conditions, conditions_note))
 
-        configuration = self._compare_configuration(left_segment, right_segment, limitations)
+        configuration = self._compare_configuration(
+            left_segments, right_segments, limitations,
+        )
         checks.append(check(
             "comparison.configuration", configuration,
             "both runs have a bound, confirmed configuration"
@@ -2951,31 +2977,36 @@ class PerformanceService:
 
     def _compare_configuration(
         self,
-        left: SessionSegment | None,
-        right: SessionSegment | None,
+        left: Sequence[SessionSegment],
+        right: Sequence[SessionSegment],
         limitations: list[str],
     ) -> CheckStatus:
-        if left is None or right is None:
+        if not left or not right:
             return CheckStatus.unknown
-        if (
-            left.configuration_state is not ConfigurationState.bound
-            or right.configuration_state is not ConfigurationState.bound
-            or left.applied_id is None
-            or right.applied_id is None
+        segments = list(left) + list(right)
+        if any(
+            segment.configuration_state is not ConfigurationState.bound
+            or segment.applied_id is None
+            for segment in segments
         ):
             return CheckStatus.unknown
-        if left.applied_id == right.applied_id:
-            return CheckStatus.pass_
         activations: list[Any] = []
         with self.repository.unit_of_work() as uow:
-            for applied_id in (left.applied_id, right.applied_id):
+            for applied_id in {segment.applied_id for segment in segments}:
                 stored = uow.find_object("AppliedConfiguration", applied_id)
                 activations.append(None if stored is None else stored.payload)
+        # Being equal is not enough: a restart-pending adoption is not an
+        # effective configuration, so it can never support a controlled claim
+        # (original 04 §7: an unknown or restart-pending config is not controlled).
         if any(
             item is None or item.get("activation_state") != "active_confirmed"
             for item in activations
         ):
             return CheckStatus.unknown
+        left_ids = {segment.applied_id for segment in left}
+        right_ids = {segment.applied_id for segment in right}
+        if left_ids == right_ids:
+            return CheckStatus.pass_
         limitations.append(
             "the two runs used different adopted configurations; only declared"
             " settings are claimed to differ"
@@ -4740,6 +4771,33 @@ def _combine_statuses(statuses: Sequence[CheckStatus]) -> CheckStatus:
     if any(item is CheckStatus.unknown for item in statuses):
         return CheckStatus.unknown
     return CheckStatus.pass_
+
+
+
+def _side_field(values: Sequence[Any]) -> tuple[Any, bool]:
+    """One side's declared value, and whether every binding agrees on it."""
+    if not values:
+        return None, False
+    if any(item.value_state is not ValueState.known for item in values):
+        return None, False
+    first = values[0]
+    return first, all(item.value == first.value for item in values[1:])
+
+
+def _compare_conditions_across(
+    left: Sequence[SessionSegment], right: Sequence[SessionSegment]
+) -> list[CheckStatus]:
+    """Compare run conditions for every binding pair, not only the first one."""
+    statuses: list[CheckStatus] = []
+    for left_segment in left:
+        for right_segment in right:
+            statuses.extend(_compare_run_conditions(
+                left_segment.run_conditions, right_segment.run_conditions,
+            ))
+            statuses.append(_compare_stream(
+                left_segment.stream_selection, right_segment.stream_selection,
+            ))
+    return statuses
 
 
 def _compare_run_conditions(

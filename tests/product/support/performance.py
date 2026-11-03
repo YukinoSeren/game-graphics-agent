@@ -80,6 +80,7 @@ def publish_log(files, data: bytes, key: str, *, user: str = USER) -> tuple[str,
 
 def artifact_from_csv(
     service, files, installation_id, context_id, device_id, data, key,
+    *, started_at: str = "2026-10-01T12:00:00+00:00",
 ) -> tuple[CaptureArtifact, BindingRef]:
     file_id, sha = publish_log(files, data, key)
     inspection = service.inspect_log(file_id, SCHEMA, USER)
@@ -98,7 +99,7 @@ def artifact_from_csv(
             "installation_id": installation_id,
             "device_snapshot_id": device_id,
             "game_context_id": context_id,
-            "started_at": "2026-10-01T12:00:00+00:00",
+            "started_at": started_at,
             "run_declaration": {
                 "installation_id": installation_id,
                 "fields": {"upscaling": "off"},
@@ -269,14 +270,15 @@ def open_session_artifact(
 def crafted_summary(
     repository, *, artifact: CaptureArtifact, binding_refs: list[BindingRef],
     effective_duration_s: float = 0.1, quality: str = "limited",
+    created_at: str | None = None,
 ) -> PerformanceSummary:
     """A summary with an open/foreign revision, for refusal tests only."""
     payload = {
         "id": uid(int(hashlib.sha256(
-            f"summary:{artifact.id}:{binding_refs!r}".encode("utf-8")
+            f"summary:{artifact.id}:{binding_refs!r}:{created_at}".encode("utf-8")
         ).hexdigest()[:12], 16)),
         "schema_version": "product-contract/0.4",
-        "created_at": utc_now(),
+        "created_at": created_at or utc_now(),
         "created_by_task_id": None,
         "artifact_id": artifact.id,
         "bindings": [item.model_dump(mode="json") for item in binding_refs],

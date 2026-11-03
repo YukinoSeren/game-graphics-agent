@@ -8,32 +8,38 @@ from __future__ import annotations
 
 import pytest
 
+from game_app.application import Application
 from game_app.contracts.common import MutationContext
 from game_app.contracts.performance import (
     CaptureArtifact,
     CompareInput,
     CreateComparisonProtocolRequest,
+    CreateSessionRequest,
     CreateTestProtocolRequest,
     EndSegmentRequest,
     PerformanceSummary,
+    SplitSegmentRequest,
 )
 from game_app.contracts.primitives import BindingRef
 from game_app.errors import ContractError, ErrorCode
 from game_app.repository import canonical_json
-from tests.product.support.configuration import USER, context_key
+from tests.product.support.configuration import USER, context_key, setup, store_raw, uid
 from tests.product.support.performance import (
     analysis_input,
     artifact_from_csv,
     count_objects,
+    craft_artifact,
     crafted_summary,
     csv_bytes,
     external_calls,
     load_object,
     open_session_artifact,
+    publish_log,
     run_analysis,
     summary_of,
     wired,
 )
+from tests.product.test_sessions import FakeClock
 
 CLEANING = "perf-cleaning/1"
 CLUSTERING = "perf-long-frame-clustering/1"
@@ -505,3 +511,262 @@ def test_comparison_leaves_summaries_and_pointer_untouched(tmp_path):
         assert uow.find_object("PerformanceSummary", right.id).payload_bytes == before_right
         assert uow.query("SELECT COUNT(*) AS n FROM current_applied")[0]["n"] == 0
     assert external_calls(repository) == 0
+
+
+def _application_stack(tmp_path):
+    repository, files, installation, context, device = setup(tmp_path)
+    clock = FakeClock()
+    application = Application(
+        repository, file_root=str(tmp_path / "managed"), clock=clock,
+    )
+    return repository, application, installation, context, device, clock
+
+
+def _applied(repository, installation, *, activation, suffix):
+    applied_id = uid(int(suffix, 16))
+    store_raw(repository, "AppliedConfiguration", {
+        "id": applied_id,
+        "user_scope_id": USER,
+        "installation_id": installation,
+        "activation_state": activation,
+    })
+    return applied_id
+
+
+def _summary_of(application, task_id):
+    view = application.get_task(task_id)
+    ref = next(
+        item for item in view.task.result_refs
+        if item.entity_type == "PerformanceSummary"
+    )
+    return load_object(application.performance, "PerformanceSummary", ref.entity_id,
+                       PerformanceSummary)
+
+
+def _bound_run(application, repository, installation, context, device, applied_id,
+               *, key, data, fields):
+    request = CreateSessionRequest.model_validate_json(canonical_json({
+        "installation_id": installation,
+        "device_snapshot_id": device,
+        "game_context_id": context,
+        "applied_id": applied_id,
+        "configuration_state": "bound",
+        "run_declaration": {
+            "installation_id": installation,
+            "fields": fields,
+            "raw_text": "",
+        },
+        "test_protocol_id": None,
+        "recommendation_id": None,
+    }))
+    result = application.create_session(request, _ctx(f"{key}-session"))
+    session_id = next(
+        ref.entity_id for ref in result.refs if ref.entity_type == "PlaySession"
+    )
+    segment_id = next(
+        ref.entity_id for ref in result.refs if ref.entity_type == "SessionSegment"
+    )
+    file_id, _ = publish_log(application.files, data, key)
+    artifact = craft_artifact(
+        repository, session_id=session_id, segment_id=segment_id,
+        file_id=file_id, offset=0.0, scale=0.001,
+    )
+    return session_id, segment_id, artifact
+
+
+def test_a_restart_pending_configuration_is_never_controlled(tmp_path):
+    repository, application, installation, context, device, clock = _application_stack(tmp_path)
+    applied_id = _applied(repository, installation, activation="restart_pending", suffix="c1")
+    data = csv_bytes([10, 20, 30, 40])
+    fields = {
+        "scenario": "route",
+        "output_width": 1920, "output_height": 1080,
+        "render_width": 1920, "render_height": 1080,
+        "frame_generation": False,
+        "upscaling": "off",
+    }
+    summaries = []
+    for index in range(2):
+        _, segment_id, artifact = _bound_run(
+            application, repository, installation, context, device, applied_id,
+            key=f"pending-{index}", data=data, fields=fields,
+        )
+        clock.advance(60)
+        application.end_segment(
+            EndSegmentRequest.model_validate_json(canonical_json({
+                "segment_id": segment_id,
+                "expected_segment_revision": 1,
+                "expected_binding_revision": 1,
+            })),
+            _ctx(f"pending-end-{index}"),
+        )
+        accepted = application.analyze(
+            analysis_input(artifact.id, BindingRef(
+                segment_id=segment_id, segment_revision=2, binding_revision=2,
+            )),
+            _ctx(f"pending-analysis-{index}"),
+        )
+        application.run_once()
+        summaries.append(_summary_of(application, accepted.task_id))
+
+    protocol = _create_protocol(
+        application.performance, _protocol_request(exploratory=True), "pending-protocol",
+    )
+    comparison = _compare(
+        application.performance, summaries[0], summaries[1], protocol, "pending-compare",
+    )
+
+    assert _count_status(comparison, "comparison.configuration") == "unknown"
+    assert comparison.level.value != "controlled"
+
+
+def test_every_binding_of_a_summary_is_inspected(tmp_path):
+    repository, files, service, tasks, installation, context, device, clock = wired(tmp_path)
+    request = CreateSessionRequest.model_validate_json(canonical_json({
+        "installation_id": installation,
+        "device_snapshot_id": device,
+        "game_context_id": context,
+        "applied_id": None,
+        "configuration_state": "unverified",
+        "run_declaration": {
+            "installation_id": installation,
+            "fields": {"scenario": "route-x"},
+            "raw_text": "",
+        },
+        "test_protocol_id": None,
+        "recommendation_id": None,
+    }))
+    created = service.create_session(request, _ctx("multi-session"))
+    session_id = next(
+        ref.entity_id for ref in created.refs if ref.entity_type == "PlaySession"
+    )
+    first_segment = next(
+        ref.entity_id for ref in created.refs if ref.entity_type == "SessionSegment"
+    )
+    file_id, _ = publish_log(files, csv_bytes([10, 20, 30, 40]), "multi-log")
+    clock.advance(60)
+    split = service.split_segment(
+        SplitSegmentRequest.model_validate_json(canonical_json({
+            "ending": {
+                "segment_id": first_segment,
+                "expected_segment_revision": 1,
+                "expected_binding_revision": 1,
+            },
+            "new_applied_id": None,
+            "configuration_state": "unverified",
+            "run_declaration": {
+                "installation_id": installation,
+                "fields": {"scenario": "route-y"},
+                "raw_text": "",
+            },
+        })),
+        _ctx("multi-split"),
+    )
+    second_segment = next(
+        ref.entity_id for ref in split.refs
+        if ref.entity_type == "SessionSegment" and ref.entity_id != first_segment
+    )
+    clock.advance(60)
+    service.end_segment(
+        EndSegmentRequest.model_validate_json(canonical_json({
+            "segment_id": second_segment,
+            "expected_segment_revision": 1,
+            "expected_binding_revision": 1,
+        })),
+        _ctx("multi-end"),
+    )
+    artifact = craft_artifact(
+        repository, session_id=session_id, segment_id=first_segment,
+        file_id=file_id, offset=0.0, scale=0.001,
+        segment_ids=[first_segment, second_segment],
+    )
+    # One summary that names both closed segments of the session.
+    summary = crafted_summary(
+        repository, artifact=artifact,
+        binding_refs=[
+            BindingRef(
+                segment_id=first_segment, segment_revision=2, binding_revision=2,
+            ),
+            BindingRef(
+                segment_id=second_segment, segment_revision=2, binding_revision=2,
+            ),
+        ],
+    )
+    # The other side names only the first segment, whose scenario is route-x.
+    other = crafted_summary(
+        repository, artifact=artifact,
+        binding_refs=[BindingRef(
+            segment_id=first_segment, segment_revision=2, binding_revision=2,
+        )],
+    )
+
+    protocol = _create_protocol(service, _protocol_request(exploratory=True), "multi")
+    comparison = service.compare(
+        CompareInput(summary_ids=[summary.id, other.id], protocol_id=protocol.id),
+        _ctx("multi-compare"),
+    )
+    stored = service.get_comparison(comparison.refs[0].entity_id, USER)
+
+    # The summary's two segments declare different scenarios; a comparison must
+    # not treat the whole summary as sharing the first segment's scenario.
+    assert _count_status(stored, "comparison.scenario") == "fail"
+    assert stored.level.value == "descriptive"
+
+
+def test_a_later_test_that_started_before_the_freeze_is_rejected(tmp_path):
+    repository, files, service, tasks, installation, context, device, clock = wired(tmp_path)
+    left_artifact, left_binding = artifact_from_csv(
+        service, files, installation, context, device, csv_bytes([10, 20, 30, 40]),
+        "frozen-a", started_at="2026-10-01T12:00:00+00:00",
+    )
+    right_artifact, right_binding = artifact_from_csv(
+        service, files, installation, context, device, csv_bytes([10, 20, 30, 40]),
+        "frozen-b", started_at="2026-10-02T12:00:00+00:00",
+    )
+    left = crafted_summary(repository, artifact=left_artifact, binding_refs=[left_binding])
+    right = crafted_summary(repository, artifact=right_artifact, binding_refs=[right_binding])
+    clock.advance(15 * 24 * 3600)
+
+    protocol = _create_protocol(
+        service, _protocol_request(threshold_ms=50.0, exploratory=False), "frozen-late",
+    )
+    with pytest.raises(ContractError) as caught:
+        service.compare(
+            CompareInput(summary_ids=[left.id, right.id], protocol_id=protocol.id),
+            _ctx("frozen-late-compare"),
+        )
+    assert caught.value.code is ErrorCode.PRECONDITION_UNVERIFIED
+    assert "before the protocol was frozen" in caught.value.message
+
+
+def test_a_later_result_registered_before_the_freeze_is_rejected(tmp_path):
+    repository, files, service, tasks, installation, context, device, clock = wired(tmp_path)
+    left_artifact, left_binding = artifact_from_csv(
+        service, files, installation, context, device, csv_bytes([10, 20, 30, 40]),
+        "registered-a", started_at="2026-10-01T12:00:00+00:00",
+    )
+    right_artifact, right_binding = artifact_from_csv(
+        service, files, installation, context, device, csv_bytes([10, 20, 30, 40]),
+        "registered-b", started_at="2026-10-02T12:00:00+00:00",
+    )
+    # Freeze the protocol before both tests began.
+    clock.moment = clock.moment.replace(month=9, day=30)
+    protocol = _create_protocol(
+        service, _protocol_request(threshold_ms=50.0, exploratory=False), "registered",
+    )
+    # Both tests began after the freeze, but their results were registered first.
+    left = crafted_summary(
+        repository, artifact=left_artifact, binding_refs=[left_binding],
+        created_at="2026-09-25T00:00:00+00:00",
+    )
+    right = crafted_summary(
+        repository, artifact=right_artifact, binding_refs=[right_binding],
+        created_at="2026-09-26T00:00:00+00:00",
+    )
+    with pytest.raises(ContractError) as caught:
+        service.compare(
+            CompareInput(summary_ids=[left.id, right.id], protocol_id=protocol.id),
+            _ctx("registered-compare"),
+        )
+    assert caught.value.code is ErrorCode.PRECONDITION_UNVERIFIED
+    assert "registered before the protocol was frozen" in caught.value.message

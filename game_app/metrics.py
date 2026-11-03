@@ -80,7 +80,7 @@ RULES: tuple[MetricRule, ...] = (
         frame_stream_kind=FrameStreamKind.application_present,
         algorithm_ref="04 §6 step 4: ascending item ceil(0.99*m)",
         minimum_sample_rule=(
-            "m >= 1; a 1% tail smaller than 20 samples is not displayed"
+            "m >= 1; a nearest-rank percentile needs no tail-sample gate"
         ),
     ),
     MetricRule(

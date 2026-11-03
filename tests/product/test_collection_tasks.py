@@ -568,6 +568,89 @@ def test_a_new_collection_becomes_a_standard_group_and_one_task(tmp_path):
     )
 
 
+def _snapshot_members(repository: ProductRepository, files: FileService, snapshot_id: str):
+    with repository.unit_of_work() as uow:
+        refs = uow.query(
+            "SELECT target_id FROM object_references WHERE owner_id=?"
+            " AND target_type='ManagedFile' ORDER BY target_id",
+            (snapshot_id,),
+        )
+    members = {}
+    for ref in refs:
+        stored = repository.get_object("ManagedFile", ref["target_id"])
+        # The stored name is prefixed with the collection's directory; the
+        # group member name is the last path segment.
+        name = stored.payload["manifest"]["relative_name"].rsplit("/", 1)[-1]
+        members[name] = json.loads(files.read_managed_file(ref["target_id"]))
+    return members
+
+def _only_snapshot_id(repository: ProductRepository) -> str:
+    with repository.unit_of_work() as uow:
+        snapshots = uow.iter_objects("ImportSnapshot")
+    assert len(snapshots) == 1
+    return json.loads(snapshots[0].payload_bytes)["id"]
+
+def test_a_collected_configuration_without_a_stated_status_stays_null(tmp_path):
+    """The extraction never said "candidate"; the frozen record must not say it."""
+    repository = _repository(tmp_path)
+    files = FileService(repository, tmp_path / "managed")
+    game = _store_game(repository)
+    context = _store_context(repository, files, game)
+    service, _knowledge = _app(repository, files, StubCollectionProvider())
+    task_input, mutation = _knowledge_input(context, key="task-1")
+
+    _run(service, task_input, mutation)
+
+    members = _snapshot_members(repository, files, _only_snapshot_id(repository))
+    configs = [
+        row for row in members["records.json"] if row["record_type"] == "configurations"
+    ]
+    assert configs
+    for row in configs:
+        # The key must exist (the format requires it) but must claim nothing.
+        assert "recommendation_status" in row
+        assert row["recommendation_status"] is None
+
+def test_a_collected_configuration_keeps_the_status_it_stated(tmp_path):
+    repository = _repository(tmp_path)
+    files = FileService(repository, tmp_path / "managed")
+    game = _store_game(repository)
+    context = _store_context(repository, files, game)
+    records = [dict(row) for row in DEFAULT_RECORDS]
+    records[2] = {**records[2], "recommendation_status": "excluded_branch"}
+    service, _knowledge = _app(
+        repository, files, StubCollectionProvider(records=records)
+    )
+    task_input, mutation = _knowledge_input(context, key="task-1")
+
+    _run(service, task_input, mutation)
+
+    members = _snapshot_members(repository, files, _only_snapshot_id(repository))
+    statuses = {
+        row["local_id"]: row["recommendation_status"]
+        for row in members["records.json"]
+        if row["record_type"] == "configurations"
+    }
+    assert statuses == {"cfg-1": "excluded_branch"}
+
+def test_an_extraction_does_not_borrow_the_run_start_as_its_own(tmp_path):
+    """Only run.json states when the run started; per-source times are unknown."""
+    repository = _repository(tmp_path)
+    files = FileService(repository, tmp_path / "managed")
+    game = _store_game(repository)
+    context = _store_context(repository, files, game)
+    service, _knowledge = _app(repository, files, StubCollectionProvider())
+    task_input, mutation = _knowledge_input(context, key="task-1")
+
+    _run(service, task_input, mutation)
+
+    members = _snapshot_members(repository, files, _only_snapshot_id(repository))
+    assert members["run.json"]["started_at"]
+    extractions = members["extractions.json"]
+    assert extractions
+    for row in extractions:
+        assert row["started_at"] is None
+
 def test_the_group_bytes_are_reproducible_for_the_same_task(tmp_path):
     from game_app.collection import CollectionSnapshotWriter
 

@@ -202,10 +202,12 @@ def parse_extraction_reply(
             local_id=local_id,
             record_type=str(record_type),
             payload=payload,
+            # Only a status the extraction actually stated is carried; the
+            # writer never classifies a configuration on the provider's behalf.
             recommendation_status=(
-                row.get("recommendation_status")
+                row["recommendation_status"]
                 if isinstance(row.get("recommendation_status"), str)
-                else ("candidate" if record_type == "configurations" else None)
+                else None
             ),
         ))
     return records, errors
@@ -312,7 +314,9 @@ class CollectionSnapshotWriter:
                     "source_id": source.scope_id,
                     "status": "ok" if source.records else "empty",
                     "model": source.model_requested,
-                    "started_at": started_at,
+                    # The per-source extraction time was not recorded by the
+                    # task, so it is unknown rather than the run's start.
+                    "started_at": None,
                     "raw": source.raw_extraction,
                     "parsed": {"records": len(source.records)},
                 }

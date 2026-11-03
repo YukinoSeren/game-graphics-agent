@@ -1553,7 +1553,7 @@ class KnowledgeService:
                 ),
                 stop_reason=run.stop_reason,
                 sources=list(run.sources.values()),
-                gaps=self._remaining_gaps(run, task_input.prior_package_id),
+                gaps=self._remaining_gaps(run),
             )
             imported = ImportPublisher(self.repository, self.files).publish(
                 frozen=group,
@@ -1941,9 +1941,7 @@ class KnowledgeService:
             return CollectionResult.completed_scope
         return CollectionResult.partial_scope
 
-    def _remaining_gaps(
-        self, run: "_CollectionRun", prior_package_id: str | None
-    ) -> list[CollectedGap]:
+    def _remaining_gaps(self, run: "_CollectionRun") -> list[CollectedGap]:
         gaps = [
             CollectedGap(
                 gap_id=gap.key if len(gap.key) <= 64 else gap.key[:64],

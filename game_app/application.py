@@ -18,7 +18,7 @@ from game_app.device import DeviceService
 from game_app.errors import ContractError, ErrorCode, FieldError
 from game_app.files import FileService
 from game_app.importer import ImportService
-from game_app.knowledge import IdentityService
+from game_app.knowledge import IdentityService, KnowledgeService
 from game_app.performance import PerformanceService
 from game_app.repository import ProductRepository
 from game_app.tasks import TaskService
@@ -56,6 +56,10 @@ class Application:
         )
         self.amendments = AmendmentService(repository, self.files, clock=clock)
         self.identity = IdentityService(repository, self.files)
+        self.knowledge = KnowledgeService(repository, self.files, clock=clock)
+        # Registered only now that a real handler exists: a missing
+        # implementation must never masquerade as an empty success.
+        self.tasks.handlers["knowledge"] = self.knowledge.handle
         self.performance = PerformanceService(
             repository, self.files, clock=clock, tasks=self.tasks,
             capture_registry=capture_registry,
@@ -138,6 +142,22 @@ class Application:
 
     def declare_import_identity(self, request: Any, context: MutationContext, **kwargs: Any):
         return self.identity.declare_import_identity(request, context, **kwargs)
+
+    # -- 02 knowledge entries ----------------------------------------------
+    def collect_knowledge(self, task_input: Any, context: MutationContext, **kwargs: Any):
+        """Register a knowledge task; pure conflicts do not consume the key."""
+        self.knowledge.precheck_collection(
+            task_input, user_scope_id=context.user_scope_id
+        )
+        return self.register_task(task_input, context, **kwargs)
+
+    def build_package(self, *args: Any, **kwargs: Any):
+        return self.knowledge.build_package(*args, **kwargs)
+
+    def get_package(self, package_id: str, user_scope_id: str, **kwargs: Any):
+        return self.knowledge.get_package(
+            package_id, user_scope_id=user_scope_id, **kwargs
+        )
 
     # -- 04 performance entries (synchronous, thin wrappers) ----------------
     def create_session(self, request: Any, context: MutationContext, **kwargs: Any):

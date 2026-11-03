@@ -1051,6 +1051,18 @@ def _allocate_nodes(
     return nodes, envelopes, limitations
 
 
+def record_payload_references(
+    record_type: str, payload: Any
+) -> list[tuple[str, str, str]]:
+    """Public view of the typed references one payload states (02a §4.1).
+
+    ``(target record type, local id, payload path)`` — the same relation the
+    importer resolves, exposed so a package builder can re-check closure
+    without a second, drifting copy of the reference table.
+    """
+    return _payload_references(record_type, payload)
+
+
 def _payload_references(record_type: str, payload: Any) -> list[tuple[str, str, str]]:
     """(target type, local id, payload path) for one record's typed references."""
     if not isinstance(payload, dict):
@@ -1980,6 +1992,7 @@ __all__ = [
     "mapping_context_hash",
     "read_frozen_bytes",
     "read_group",
+    "record_payload_references",
     "snapshot_manifest",
     "verify_group_unchanged",
 ]

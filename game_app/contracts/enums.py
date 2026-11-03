@@ -357,6 +357,7 @@ ENTITY_TYPES = frozenset({
     "PlaySession",
     "SessionSegment",
     "CaptureArtifact",
+    "CaptureLease",
     "TestProtocol",
     "ComparisonProtocol",
     "PerformanceSummary",

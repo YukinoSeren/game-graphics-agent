@@ -262,9 +262,28 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_capture_lease_active
 
 CREATE INDEX IF NOT EXISTS ix_capture_leases_session
     ON capture_leases(session_id, state);
+
+-- Every state change is appended with the ownership facts it observed, so the
+-- lease head above is a rebuildable projection.  Additions to §5's original
+-- shape: this table plus the pid/started_at/file_id columns inside it.
+CREATE TABLE IF NOT EXISTS capture_lease_events (
+    task_id            TEXT NOT NULL,
+    sequence           INTEGER NOT NULL CHECK (sequence >= 1),
+    previous_state     TEXT,
+    next_state         TEXT NOT NULL CHECK (next_state IN ('prepared','owned','finalized','unresolved')),
+    cause              TEXT NOT NULL,
+    process_pid        INTEGER CHECK (process_pid IS NULL OR process_pid > 0),
+    process_started_at TEXT,
+    file_id            TEXT,
+    created_at         TEXT NOT NULL,
+    PRIMARY KEY (task_id, sequence)
+);
 ```
 
 > 若实现需要额外列，追加在本迁移内并同步更新本节与 `04-performance.md`。
+> B-3 的实际迁移额外增加了 `capture_lease_events`（状态变化日志，含归属事实），
+> 因为共享 `StateDimension` 没有 lease 维度，且 `capture_leases` 必须可从事件重建；
+> `capture_leases.file_id` 固定为 `capture:<task_id>` 的确定性文件 ID。
 
 ---
 

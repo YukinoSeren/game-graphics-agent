@@ -263,6 +263,10 @@ class FileService:
             )
 
     # -- artifacts produced by other modules --------------------------------
+    def artifact_file_id(self, stable_key: str) -> str:
+        """The deterministic id ``store_artifact`` will use for a stable key."""
+        return uuid5(_NAMESPACE, stable_key).hex
+
     def store_artifact(
         self,
         data: bytes,
@@ -277,7 +281,7 @@ class FileService:
         reuses the same published file and never duplicates the object.
         """
         _materialise({relative_name: data})
-        file_id = uuid5(_NAMESPACE, stable_key).hex
+        file_id = self.artifact_file_id(stable_key)
         entry = FileEntry(
             relative_name=relative_name,
             byte_length=len(data),

@@ -32,6 +32,7 @@ class Application:
         file_root: str,
         provider: Any | None = None,
         probe: Any | None = None,
+        capture_registry: Any | None = None,
         clock: Any = utc_now,
     ) -> None:
         # A managed-file root is required: provider calls must persist their
@@ -56,11 +57,16 @@ class Application:
         self.amendments = AmendmentService(repository, self.files, clock=clock)
         self.identity = IdentityService(repository, self.files)
         self.performance = PerformanceService(
-            repository, self.files, clock=clock, tasks=self.tasks
+            repository, self.files, clock=clock, tasks=self.tasks,
+            capture_registry=capture_registry,
         )
         # Analysis is a durable domain task; the entry pre-validates before the
         # key is consumed, and the handler runs once the task is claimed.
         self.tasks.handlers["analysis"] = self.performance.handle_analysis
+        if capture_registry is not None:
+            # Without a registry the type stays unregistered and is refused at
+            # registration instead of running an empty success.
+            self.tasks.handlers["capture"] = self.performance.handle_capture
 
     # -- task control -------------------------------------------------------
     def register_task(
@@ -106,7 +112,12 @@ class Application:
         return self.tasks.run_once()
 
     def recover_on_startup(self) -> list[str]:
-        return self.tasks.recover_on_startup()
+        interrupted = self.tasks.recover_on_startup()
+        if self.performance.capture_registry is not None:
+            # Only a pid + start time + native name this task can prove is
+            # stopped; anything else becomes unresolved and blocks a new launch.
+            self.performance.reconcile_capture_leases()
+        return interrupted
 
     # -- synchronous domain entries (thin wrappers, no extra rules) ---------
     def adopt_configuration(self, request: Any, context: MutationContext, **kwargs: Any):
@@ -173,6 +184,15 @@ class Application:
 
     def get_comparison_protocol(self, protocol_id: str, user_scope_id: str):
         return self.performance.get_comparison_protocol(protocol_id, user_scope_id)
+
+    def capture(self, request: Any, context: MutationContext):
+        return self.performance.capture(request, context)
+
+    def stop_capture(self, request: Any, context: MutationContext, **kwargs: Any):
+        return self.performance.stop_capture(request, context, **kwargs)
+
+    def get_capture_lease(self, task_id: str, user_scope_id: str):
+        return self.performance.get_capture_lease(task_id, user_scope_id)
 
     def get_session(self, session_id: str, user_scope_id: str):
         return self.performance.get_session(session_id, user_scope_id)

@@ -758,6 +758,50 @@ class PerformanceComparison(StrictModel):
         return value
 
 
+
+
+# --- owned capture and its recovery lease (04 §4.3/§5) ----------------------
+
+
+class CaptureLease(StrictModel):
+    """One local recovery log row per capture task; state changes append events.
+
+    ``prepared`` is registered with the task, ``owned`` is committed before the
+    tool is launched, ``finalized`` requires a published original and a
+    registered file status, and an unprovable ownership stays ``unresolved``.
+    """
+
+    id: ID
+    schema_version: str
+    created_at: Timestamp
+    created_by_task_id: ID | None
+    task_id: ID
+    session_id: ID
+    native_name: str
+    process_pid: int | None
+    process_started_at: Timestamp | None
+    file_id: ID
+    state: Literal["prepared", "owned", "finalized", "unresolved"]
+
+    @field_validator("native_name")
+    @classmethod
+    def native_name_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("a capture lease names the tool's native session")
+        return value
+
+    @field_validator("process_pid")
+    @classmethod
+    def pid_is_positive(cls, value: int | None) -> int | None:
+        if value is not None and (type(value) is not int or value <= 0):
+            raise ValueError("a recorded pid is a positive integer")
+        return value
+
+
+class StopCaptureInput(StrictModel):
+    task_id: ID
+
+
 __all__ = [
     "ColumnMapping",
     "TimeMapping",
@@ -797,4 +841,6 @@ __all__ = [
     "CompareInput",
     "MetricComparison",
     "PerformanceComparison",
+    "CaptureLease",
+    "StopCaptureInput",
 ]

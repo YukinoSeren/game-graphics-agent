@@ -11,12 +11,14 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import sqlite3
 import statistics
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable, Mapping, Sequence
 from uuid import UUID, uuid5
 
+from game_app.adapters.capture import CaptureAdapterRegistry, CaptureHandle
 from game_app.adapters.presentmon import LogParseResult, default_registry, parse_log
 
 from game_app.contracts.common import (
@@ -37,6 +39,7 @@ from game_app.contracts.enums import (
     ConfigurationState,
     FrameStreamKind,
     SessionLifecycle,
+    TERMINAL_TASK_STATES,
     ThresholdMode,
     ValueState,
 )
@@ -92,6 +95,7 @@ from game_app.analyzer import (
 )
 from game_app.contracts.performance import (
     AdaptiveLongFrame,
+    CaptureLease,
     CompareInput,
     ComparisonProtocol,
     CreateComparisonProtocolRequest,
@@ -101,8 +105,14 @@ from game_app.contracts.performance import (
     NumericValueV01,
     PerformanceComparison,
     PerformanceSummary,
+    StopCaptureInput,
 )
-from game_app.contracts.tasks import AnalysisInput, DomainResult
+from game_app.contracts.tasks import (
+    AnalysisInput,
+    CaptureInput,
+    DomainResult,
+    TaskStopReason,
+)
 from game_app.contracts.common import TaskAccepted
 from game_app.contracts.enums import LogQuality, TaskState, TaskType
 from game_app.tasks import HandlerOutcome, TaskContext
@@ -122,6 +132,9 @@ LOG_ASSOCIATION_RULE_VERSION = "log-association/0.4"
 ANALYSIS_ROUTE = "/api/analyses"
 ANALYSIS_RULE_VERSION = "analysis/0.4"
 COMPARISON_ROUTE = "/api/comparisons"
+CAPTURE_ROUTE = "/api/captures"
+CAPTURE_STOP_ROUTE = "/api/captures/{task_id}/stop"
+CAPTURE_RULE_VERSION = "capture/0.4"
 COMPARISON_PROTOCOL_ROUTE = "/api/comparison-protocols"
 COMPARISON_PROTOCOL_RULE_VERSION = "comparison-protocol/0.4"
 COMPARISON_RULE_VERSION = "comparison/0.4"
@@ -225,6 +238,7 @@ class PerformanceService:
         clock: Callable[[], str] = utc_now,
         log_registry: Any = None,
         tasks: Any = None,
+        capture_registry: CaptureAdapterRegistry | None = None,
     ) -> None:
         self.repository = repository
         self.files = files
@@ -235,6 +249,9 @@ class PerformanceService:
         # Set by Application: analysis is registered as a durable task, so the
         # submission guards can run *before* a key is consumed.
         self.tasks = tasks
+        # None means capture is not wired at all (its handler stays
+        # unregistered); an empty registry still refuses every adapter.
+        self.capture_registry = capture_registry
 
     # -- reads (every read resolves the caller's ownership) ------------------
     def get_session(self, session_id: str, user_scope_id: str) -> PlaySession:
@@ -3005,6 +3022,799 @@ class PerformanceService:
                 ErrorCode.RESOURCE_NOT_FOUND, "the requested protocol is not available"
             )
 
+    # -- owned capture, leases and safe stop (04 §4.3/§5) -------------------
+    def capture(self, request: Any, context: MutationContext) -> TaskAccepted:
+        typed = self._capture_input(request)
+        # A registered key replays its original TaskAccepted; the launch guards
+        # (adapter availability, an active capture) must not run a second time
+        # for it.  Different content still conflicts inside register_task.
+        registered = self._has_registered(context, CAPTURE_ROUTE)
+        if not registered:
+            self._capture_adapter(typed.adapter_id, typed.adapter_version)
+            with self.repository.unit_of_work() as uow:
+                self._capture_guard(uow, typed, context.user_scope_id)
+        if self.tasks is None:
+            raise ContractError(
+                ErrorCode.INTERNAL_ERROR, "the capture handler is not wired"
+            )
+        return self.tasks.register_task(
+            typed, context,
+            companion=self._lease_companion(typed, context.user_scope_id),
+        )
+
+    def _capture_input(self, request: Any) -> CaptureInput:
+        if isinstance(request, CaptureInput):
+            return request
+        try:
+            return CaptureInput.model_validate_json(canonical_json(request))
+        except Exception as error:
+            raise ContractError(
+                ErrorCode.INPUT_VALIDATION_FAILED,
+                "the capture input is invalid",
+                field_errors=[FieldError(
+                    path="input", code="type", message=str(error).splitlines()[0],
+                )],
+            ) from error
+
+    def _capture_adapter(self, adapter_id: str, adapter_version: str) -> Any:
+        registry = self.capture_registry
+        adapter = None if registry is None else registry.get(adapter_id, adapter_version)
+        if adapter is None:
+            raise _invalid(
+                "adapter_id", "enum",
+                "only a registered and verified capture adapter may run",
+            )
+        return adapter
+
+    def _capture_guard(
+        self, uow: UnitOfWork, request: CaptureInput, user_scope_id: str,
+        *, exclude_task_id: str | None = None,
+    ) -> tuple[PlaySession, SessionSegment]:
+        session = self._load_session(uow, request.session_id)
+        self._require_session_owner(uow, session, user_scope_id)
+        if session.lifecycle is not SessionLifecycle.active:
+            raise ContractError(
+                ErrorCode.PRECONDITION_UNVERIFIED,
+                "a capture needs an active session",
+            )
+        segment = self._load_segment_revision(
+            uow, request.segment_ref.segment_id, request.segment_ref.segment_revision
+        )
+        if segment.session_id != session.id:
+            raise ContractError(
+                ErrorCode.REFERENCE_INVALID,
+                "the capture segment belongs to another session",
+            )
+        head = self._load_segment(uow, segment.id)
+        if (
+            head.revision != request.segment_ref.segment_revision
+            or head.binding_revision != request.segment_ref.binding_revision
+        ):
+            raise ContractError(
+                ErrorCode.BINDING_REVISION_CONFLICT,
+                "the segment or its binding changed; re-read it before capturing",
+                details=empty_details(
+                    expected_revision=request.segment_ref.segment_revision,
+                    current_revision=head.revision,
+                    current_resource_ref=ObjectRef(
+                        entity_type="SessionSegment", entity_id=head.id,
+                    ),
+                ),
+            )
+        if segment.lifecycle is not SessionLifecycle.active:
+            raise ContractError(
+                ErrorCode.PRECONDITION_UNVERIFIED,
+                "a capture needs an active segment",
+            )
+        binding = self._load_binding(uow, segment.id, request.segment_ref.binding_revision)
+        if binding.effective_range.end is not None:
+            raise ContractError(
+                ErrorCode.PRECONDITION_UNVERIFIED,
+                "a capture needs an open binding revision",
+            )
+        if request.protocol_id is not None:
+            self._test_protocol_ref(uow, request.protocol_id, session.game_id)
+
+        # The lease is the primary guard; a capture task that has not yet
+        # finished closing also keeps the single slot.
+        active_tasks = uow.query(
+            "SELECT t.task_id, i.input FROM tasks t JOIN task_inputs i"
+            " ON t.task_id=i.task_id AND i.input_revision=t.current_input_revision"
+            " WHERE t.type='capture' AND t.state IN ('queued','running')"
+        )
+        for active in active_tasks:
+            if active["task_id"] == exclude_task_id:
+                continue
+            payload = json.loads(active["input"])
+            if payload.get("session_id") == session.id:
+                raise ContractError(
+                    ErrorCode.ACTIVE_CAPTURE_EXISTS,
+                    "this session already has a queued or running capture",
+                    resource_refs=[ObjectRef(
+                        entity_type="TaskRun", entity_id=active["task_id"],
+                    )],
+                )
+        lease = uow.query(
+            "SELECT * FROM capture_leases WHERE session_id=? AND state <> 'finalized'"
+            " ORDER BY created_at LIMIT 1",
+            (session.id,),
+        )
+        if lease:
+            task_state = self._task_state(uow, lease[0]["task_id"])
+            reference = ObjectRef(
+                entity_type="TaskRun", entity_id=lease[0]["task_id"],
+            )
+            if task_state in (TaskState.queued, TaskState.running):
+                raise ContractError(
+                    ErrorCode.ACTIVE_CAPTURE_EXISTS,
+                    "this session already has a queued or running capture",
+                    resource_refs=[reference],
+                )
+            raise ContractError(
+                ErrorCode.PRECONDITION_UNVERIFIED,
+                "an unfinished capture lease blocks a second capture",
+                resource_refs=[reference],
+                field_errors=[FieldError(
+                    path="session_id", code="conflict",
+                    message=f"lease state is {lease[0]['state']}",
+                )],
+            )
+        return session, segment
+
+    def _lease_companion(self, request: CaptureInput, user_scope_id: str):
+        def companion(uow: UnitOfWork, task_id: str) -> None:
+            session, _ = self._capture_guard(
+                uow, request, user_scope_id, exclude_task_id=task_id,
+            )
+            now = self.clock()
+            native_name = f"game-app-capture-{task_id}"
+            file_id = self.files.artifact_file_id(f"capture:{task_id}")
+            lease = CaptureLease(
+                id=task_id,
+                schema_version=PRODUCT_CONTRACT_VERSION,
+                created_at=now,
+                created_by_task_id=task_id,
+                task_id=task_id,
+                session_id=session.id,
+                native_name=native_name,
+                process_pid=None,
+                process_started_at=None,
+                file_id=file_id,
+                state="prepared",
+            )
+            uow.insert_object("CaptureLease", lease)
+            try:
+                uow.execute(
+                    "INSERT INTO capture_leases(task_id, session_id, native_name,"
+                    " process_pid, process_started_at, file_id, state, created_at, updated_at)"
+                    " VALUES(?, ?, ?, NULL, NULL, ?, 'prepared', ?, ?)",
+                    (task_id, session.id, native_name, file_id, now, now),
+                )
+            except sqlite3.IntegrityError as error:
+                concurrent = uow.query(
+                    "SELECT task_id FROM capture_leases WHERE session_id=?"
+                    " AND state <> 'finalized' LIMIT 1",
+                    (session.id,),
+                )
+                reference = ObjectRef(
+                    entity_type="TaskRun",
+                    entity_id=concurrent[0]["task_id"] if concurrent else task_id,
+                )
+                raise ContractError(
+                    ErrorCode.ACTIVE_CAPTURE_EXISTS,
+                    "this session already has an unfinished capture lease",
+                    resource_refs=[reference],
+                ) from error
+            self._append_lease_event(
+                uow, task_id, None, "prepared", "capture_prepared",
+                now=now, file_id=file_id,
+            )
+
+        return companion
+
+    def handle_capture(self, context: TaskContext) -> HandlerOutcome:
+        task_input = context.task_input
+        if not isinstance(task_input, CaptureInput):
+            raise ContractError(
+                ErrorCode.INPUT_VALIDATION_FAILED,
+                "the capture handler received another task type",
+            )
+        adapter = self._capture_adapter(
+            task_input.adapter_id, task_input.adapter_version
+        )
+        with self.repository.unit_of_work() as uow:
+            lease = self._lease_row(uow, context.task_id)
+        if lease is None:
+            raise ContractError(
+                ErrorCode.INTERNAL_ERROR, "the capture task has no lease"
+            )
+        state = lease["state"]
+        if state == "finalized":
+            return self._capture_existing_result(context.task_id)
+        if state == "unresolved":
+            raise ContractError(
+                ErrorCode.PRECONDITION_UNVERIFIED,
+                "the capture lease is unresolved; ownership cannot be proven",
+            )
+        if state == "prepared":
+            context.phase("capture")
+            with self.repository.unit_of_work() as uow:
+                self._transition_lease(
+                    uow, context.task_id, "prepared", "owned", "capture_owned",
+                )
+            try:
+                handle = adapter.start(native_name=lease["native_name"])
+            except Exception as error:  # noqa: BLE001 - launch outcome is unknown
+                self._mark_lease_unresolved(
+                    context.task_id, "capture_launch_failed"
+                )
+                raise ContractError(
+                    ErrorCode.INTERNAL_ERROR,
+                    "the capture tool could not be started; the lease is unresolved",
+                ) from error
+            with self.repository.unit_of_work() as uow:
+                self._record_lease_ownership(uow, context.task_id, handle)
+        else:
+            handle = self._capture_handle(lease)
+
+        if not (
+            self._stop_requested(context.task_id)
+            or self._cancel_requested(context.task_id)
+        ):
+            # The task keeps the single running slot; stop_capture appends the
+            # intent and the next run_once call re-enters this handler.
+            return HandlerOutcome(state=TaskState.running)
+        context.phase("finalize")
+        return self._finalize_capture(context, task_input, adapter, handle)
+
+    def _capture_handle(self, lease: Mapping[str, Any]) -> CaptureHandle:
+        if (
+            lease["process_pid"] is None
+            or lease["process_started_at"] is None
+        ):
+            raise ContractError(
+                ErrorCode.PRECONDITION_UNVERIFIED,
+                "the owned lease records no process; a second launch is refused",
+            )
+        return CaptureHandle(
+            native_name=lease["native_name"],
+            pid=lease["process_pid"],
+            started_at=lease["process_started_at"],
+        )
+
+    def _finalize_capture(
+        self,
+        context: TaskContext,
+        task_input: CaptureInput,
+        adapter: Any,
+        handle: CaptureHandle,
+    ) -> HandlerOutcome:
+        task_id = context.task_id
+        user_scope_id = context.user_scope_id
+        if not adapter.verify_ownership(
+            native_name=handle.native_name,
+            pid=handle.pid,
+            started_at=handle.started_at,
+        ):
+            self._mark_lease_unresolved(task_id, "capture_ownership_unverified")
+            return HandlerOutcome(
+                state=TaskState.failed,
+                stop_reason=TaskStopReason(kind="execution", code="validation_failed"),
+                error_code=ErrorCode.PRECONDITION_UNVERIFIED.value,
+            )
+
+        output = adapter.stop(handle)
+        if output.data is None:
+            self._mark_lease_unresolved(task_id, "capture_output_not_ready")
+            return HandlerOutcome(
+                state=TaskState.partial,
+                domain_result=self._capture_domain_result(
+                    context, "retained_only",
+                    "the tool produced no output; the segment keeps its open end",
+                ),
+            )
+
+        relative_name = f"captures/{task_id}.csv"
+        try:
+            file_id = self.files.store_artifact(
+                output.data,
+                relative_name=relative_name,
+                stable_key=f"capture:{task_id}",
+                user_scope_id=user_scope_id,
+            )
+        except ContractError:
+            self._mark_lease_unresolved(task_id, "capture_output_unpublished")
+            raise
+        with self.repository.unit_of_work() as uow:
+            lease = self._lease_row(uow, task_id)
+        if lease is None or lease["file_id"] != file_id:
+            self._mark_lease_unresolved(task_id, "capture_file_identity_changed")
+            raise ContractError(
+                ErrorCode.INTERNAL_ERROR,
+                "the capture output does not match the lease's planned file",
+            )
+
+        content_hash = hashlib.sha256(output.data).hexdigest()
+        evidence = EvidenceRef(
+            kind="artifact", file_id=file_id,
+            content_hash=content_hash, locator=relative_name,
+        )
+        try:
+            parsed = parse_log(
+                output.data, registry=self.log_registry, evidence=evidence,
+            )
+        except ContractError as error:
+            with self.repository.unit_of_work() as uow:
+                self._transition_lease(
+                    uow, task_id, "owned", "finalized", "capture_retained_only",
+                )
+            return HandlerOutcome(
+                state=TaskState.partial,
+                domain_result=self._capture_domain_result(
+                    context, "retained_only",
+                    f"the output is not a verified format ({error.message});"
+                    " the original is retained and the segment is not closed",
+                ),
+                result_refs=[ObjectRef(
+                    entity_type="ManagedFile", entity_id=file_id,
+                )],
+            )
+
+        with self.repository.unit_of_work() as uow:
+            session, segment = self._capture_guard_for_stop(
+                uow, task_input, task_id, user_scope_id
+            )
+        now = self.clock()
+        try:
+            end_s: float | None = self._elapsed_seconds(session, segment)
+        except ContractError:
+            end_s = None
+        offset = _capture_offset(session, handle)
+        mapping = _capture_time_mapping(parsed, offset, now)
+        stream = _capture_stream(parsed, now)
+        artifact_id = _deterministic_id(task_id, "capture-artifact")
+        closed: ConfigurationBinding | None = None
+        updated_segment: SessionSegment | None = None
+        with self.repository.unit_of_work() as uow:
+            head = self._load_segment(uow, segment.id)
+            can_close = (
+                end_s is not None
+                and head.lifecycle is SessionLifecycle.active
+                and head.revision == task_input.segment_ref.segment_revision
+                and head.binding_revision == task_input.segment_ref.binding_revision
+            )
+            if can_close:
+                closed = self._close_segment(uow, segment, session, end_s, now=now)
+                updated_segment = segment.model_copy(update={
+                    "revision": segment.revision + 1,
+                    "end_s": end_s,
+                    "lifecycle": SessionLifecycle.ended,
+                    "binding_revision": closed.binding_revision,
+                    "stream_selection": stream,
+                })
+                self._write_segment_revision(
+                    uow, segment, updated_segment, session, cause="capture_stopped",
+                )
+            artifact = CaptureArtifact(
+                id=artifact_id,
+                schema_version=PRODUCT_CONTRACT_VERSION,
+                created_at=now,
+                created_by_task_id=task_id,
+                session_id=session.id,
+                segment_ids=[segment.id],
+                file_id=file_id,
+                tool_name=adapter.adapter_id,
+                tool_version=adapter.adapter_version,
+                options={"native_name": handle.native_name},
+                source_schema=parsed.source_schema,
+                source_column_map=list(parsed.column_map),
+                time_mapping=mapping,
+                quality=parsed.quality,
+                checks=list(parsed.checks) + [
+                    _capture_check(
+                        "capture.ownership", CheckStatus.pass_,
+                        "the stopped process matched the lease's native name, pid and"
+                        " start time", now,
+                    ),
+                    _capture_check(
+                        "capture.stop", CheckStatus.pass_,
+                        "only this task's verified process was stopped", now,
+                    ),
+                    _capture_check(
+                        "capture.time_origin",
+                        CheckStatus.pass_ if mapping.offset is not None
+                        else CheckStatus.unknown,
+                        "the output's zero is the backend-measured tool start"
+                        if mapping.offset is not None else
+                        "the output's clock cannot be mapped to the session", now,
+                    ),
+                ],
+            )
+            uow.insert_object("CaptureArtifact", artifact)
+            uow.insert_reference(artifact.id, "session", ObjectRef(
+                entity_type="PlaySession", entity_id=session.id,
+            ))
+            uow.insert_reference(artifact.id, "segment", ObjectRef(
+                entity_type="SessionSegment", entity_id=segment.id,
+            ))
+            uow.insert_reference(artifact.id, "file", ObjectRef(
+                entity_type="ManagedFile", entity_id=file_id,
+            ))
+            self._transition_lease(
+                uow, task_id, "owned", "finalized",
+                "capture_finalized" if can_close else "capture_retained_only",
+            )
+
+        refs = [
+            ObjectRef(entity_type="CaptureArtifact", entity_id=artifact_id),
+            ObjectRef(entity_type="ManagedFile", entity_id=file_id),
+        ]
+        if can_close and closed is not None and updated_segment is not None:
+            refs.extend([
+                ObjectRef(entity_type="SessionSegment", entity_id=updated_segment.id),
+                ObjectRef(
+                    entity_type="ConfigurationBinding", entity_id=closed.id,
+                ),
+            ])
+        return HandlerOutcome(
+            state=TaskState.completed if can_close else TaskState.partial,
+            domain_result=self._capture_domain_result(
+                context, "captured" if can_close else "retained_only",
+                "the original is published and the segment is closed"
+                if can_close else
+                "the original is published; the segment keeps its open end",
+            ),
+            result_refs=refs,
+        )
+
+    def _capture_guard_for_stop(
+        self, uow: UnitOfWork, request: CaptureInput, task_id: str, user_scope_id: str
+    ) -> tuple[PlaySession, SessionSegment]:
+        session = self._load_session(uow, request.session_id)
+        self._require_session_owner(uow, session, user_scope_id)
+        segment = self._load_segment_revision(
+            uow, request.segment_ref.segment_id, request.segment_ref.segment_revision
+        )
+        if segment.session_id != session.id:
+            raise ContractError(
+                ErrorCode.REFERENCE_INVALID,
+                "the capture segment belongs to another session",
+            )
+        return session, segment
+
+    def _capture_domain_result(
+        self, context: TaskContext, code: str, note: str
+    ) -> DomainResult:
+        return DomainResult(
+            domain=TaskType.capture,
+            code=code,
+            input_revision=context.task_input_revision,
+            checks=[_capture_check(
+                "capture.result",
+                CheckStatus.pass_ if code == "captured" else CheckStatus.unknown,
+                note, self.clock(),
+            )],
+        )
+
+    def _capture_existing_result(self, task_id: str) -> HandlerOutcome:
+        view = self.tasks.get_task(task_id)
+        return HandlerOutcome(
+            state=TaskState.completed, result_refs=list(view.task.result_refs),
+        )
+
+    def stop_capture(
+        self,
+        request: Any,
+        context: MutationContext,
+        *,
+        request_schema_version: str = PRODUCT_CONTRACT_VERSION,
+    ) -> ResourceResult:
+        typed = self._stop_capture_input(request)
+        route = CAPTURE_STOP_ROUTE.format(task_id=typed.task_id)
+        request_hash = _request_hash(route, request_schema_version, typed)
+        with self.repository.unit_of_work() as uow:
+            replay = self._replay_resource(
+                uow, context, route, request_schema_version, request_hash
+            )
+            if replay is not None:
+                return replay
+            row = self.tasks._task_row(uow, typed.task_id)
+            if row["user_scope_id"] != context.user_scope_id:
+                raise ContractError(
+                    ErrorCode.RESOURCE_NOT_FOUND, "the requested task is not available"
+                )
+            if row["type"] != TaskType.capture.value:
+                raise ContractError(
+                    ErrorCode.REFERENCE_INVALID, "the task is not a capture"
+                )
+            state = TaskState(row["state"])
+            reference = ObjectRef(entity_type="TaskRun", entity_id=typed.task_id)
+            if state in TERMINAL_TASK_STATES:
+                result = ResourceResult(
+                    refs=list(
+                        [ObjectRef.model_validate(item) for item in
+                         json.loads(row["result_refs"] or "[]")]
+                    ) or [reference]
+                )
+                self._record_resource(
+                    uow, context, route, request_schema_version, request_hash, result,
+                )
+                return result
+            now = self.clock()
+            revision = row["revision"] + 1
+            if state in (TaskState.queued, TaskState.waiting_input):
+                stop = TaskStopReason(kind="execution", code="user_cancelled")
+                uow.execute(
+                    "UPDATE tasks SET state='cancelled', cancel_requested=1,"
+                    " stop_reason=?, revision=?, updated_at=? WHERE task_id=?",
+                    (stop.model_dump_json(), revision, now, typed.task_id),
+                )
+                self.tasks._append_event(
+                    uow, typed.task_id, self.tasks._next_sequence(uow, typed.task_id),
+                    row["current_input_revision"], state, TaskState.cancelled,
+                    "capture_stop_cancelled",
+                    active_elapsed=row["active_elapsed_seconds"],
+                )
+                self._finalize_unstarted_lease(uow, typed.task_id)
+                result = ResourceResult(refs=[reference])
+            else:
+                uow.execute(
+                    "UPDATE tasks SET revision=?, updated_at=? WHERE task_id=?",
+                    (revision, now, typed.task_id),
+                )
+                if not self._stop_event(uow, typed.task_id):
+                    self.tasks._append_event(
+                        uow, typed.task_id,
+                        self.tasks._next_sequence(uow, typed.task_id),
+                        row["current_input_revision"], TaskState.running, TaskState.running,
+                        "capture_stop_requested",
+                        active_elapsed=row["active_elapsed_seconds"],
+                    )
+                result = ResourceResult(refs=[reference])
+            self._record_resource(
+                uow, context, route, request_schema_version, request_hash, result,
+            )
+            return result
+
+    def _stop_capture_input(self, request: Any) -> StopCaptureInput:
+        if isinstance(request, StopCaptureInput):
+            return request
+        try:
+            return StopCaptureInput.model_validate_json(canonical_json(request))
+        except Exception as error:
+            raise ContractError(
+                ErrorCode.INPUT_VALIDATION_FAILED,
+                "the stop-capture input is invalid",
+                field_errors=[FieldError(
+                    path="input", code="type", message=str(error).splitlines()[0],
+                )],
+            ) from error
+
+    def _finalize_unstarted_lease(self, uow: UnitOfWork, task_id: str) -> None:
+        lease = self._lease_row(uow, task_id)
+        if lease is None or lease["state"] not in ("prepared", "owned"):
+            return
+        self._transition_lease(
+            uow, task_id, lease["state"], "finalized",
+            "capture_cancelled_before_start",
+        )
+
+    def get_capture_lease(self, task_id: str, user_scope_id: str) -> CaptureLease:
+        with self.repository.unit_of_work() as uow:
+            row = self.tasks._task_row(uow, task_id)
+            if row["user_scope_id"] != user_scope_id:
+                raise ContractError(
+                    ErrorCode.RESOURCE_NOT_FOUND, "the requested task is not available"
+                )
+            lease = self._lease_row(uow, task_id)
+        if lease is None:
+            raise ContractError(
+                ErrorCode.RESOURCE_NOT_FOUND, "the requested capture lease is not available"
+            )
+        return CaptureLease(
+            id=lease["task_id"],
+            schema_version=PRODUCT_CONTRACT_VERSION,
+            created_at=lease["created_at"],
+            created_by_task_id=lease["task_id"],
+            task_id=lease["task_id"],
+            session_id=lease["session_id"],
+            native_name=lease["native_name"],
+            process_pid=lease["process_pid"],
+            process_started_at=lease["process_started_at"],
+            file_id=lease["file_id"],
+            state=lease["state"],
+        )
+
+    def reconcile_capture_leases(self) -> list[str]:
+        """After a restart, only stop a process this task can prove it owns."""
+        unresolved: list[str] = []
+        with self.repository.unit_of_work() as uow:
+            leases = uow.query(
+                "SELECT * FROM capture_leases WHERE state IN ('prepared','owned')"
+            )
+        for lease in leases:
+            task_id = lease["task_id"]
+            with self.repository.unit_of_work() as uow:
+                state = self._task_state(uow, task_id)
+            if state not in TERMINAL_TASK_STATES:
+                continue
+            if lease["state"] == "prepared":
+                with self.repository.unit_of_work() as uow:
+                    self._transition_lease(
+                        uow, task_id, "prepared", "finalized", "capture_never_started",
+                    )
+                continue
+            try:
+                handle = self._capture_handle(lease)
+                task_input = self.tasks._load_input(task_id)
+                adapter = self._capture_adapter(
+                    task_input.adapter_id, task_input.adapter_version
+                )
+                owned = adapter.verify_ownership(
+                    native_name=handle.native_name,
+                    pid=handle.pid,
+                    started_at=handle.started_at,
+                )
+            except (ContractError, AttributeError):
+                owned = False
+                adapter = None
+                handle = None
+            if not owned or adapter is None or handle is None:
+                self._mark_lease_unresolved(task_id, "capture_ownership_unverified")
+                unresolved.append(task_id)
+                continue
+            output = adapter.stop(handle)
+            if output.data is None:
+                self._mark_lease_unresolved(task_id, "capture_output_not_ready")
+                unresolved.append(task_id)
+                continue
+            try:
+                self.files.store_artifact(
+                    output.data,
+                    relative_name=f"captures/{task_id}.csv",
+                    stable_key=f"capture:{task_id}",
+                    user_scope_id=self._task_owner(task_id),
+                )
+            except ContractError:
+                self._mark_lease_unresolved(task_id, "capture_output_unpublished")
+                unresolved.append(task_id)
+                continue
+            with self.repository.unit_of_work() as uow:
+                self._transition_lease(
+                    uow, task_id, "owned", "finalized", "capture_recovered",
+                )
+        return unresolved
+
+    def _task_owner(self, task_id: str) -> str:
+        with self.repository.unit_of_work() as uow:
+            return str(self.tasks._task_row(uow, task_id)["user_scope_id"])
+
+    def _task_state(self, uow: UnitOfWork, task_id: str) -> TaskState | None:
+        rows = uow.query("SELECT state FROM tasks WHERE task_id=?", (task_id,))
+        return None if not rows else TaskState(rows[0]["state"])
+
+    def _lease_row(self, uow: UnitOfWork, task_id: str) -> Any:
+        rows = uow.query("SELECT * FROM capture_leases WHERE task_id=?", (task_id,))
+        return None if not rows else rows[0]
+
+    def _append_lease_event(
+        self,
+        uow: UnitOfWork,
+        task_id: str,
+        previous_state: str | None,
+        next_state: str,
+        cause: str,
+        *,
+        now: str,
+        process_pid: int | None = None,
+        process_started_at: str | None = None,
+        file_id: str | None = None,
+    ) -> None:
+        sequence = uow.query(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 AS n FROM capture_lease_events"
+            " WHERE task_id=?",
+            (task_id,),
+        )[0]["n"]
+        uow.execute(
+            "INSERT INTO capture_lease_events(task_id, sequence, previous_state,"
+            " next_state, cause, process_pid, process_started_at, file_id, created_at)"
+            " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id, sequence, previous_state, next_state, cause,
+                process_pid, process_started_at, file_id, now,
+            ),
+        )
+
+    def _transition_lease(
+        self,
+        uow: UnitOfWork,
+        task_id: str,
+        expected: str,
+        next_state: str,
+        cause: str,
+        *,
+        process_pid: int | None = None,
+        process_started_at: str | None = None,
+    ) -> Any:
+        lease = self._lease_row(uow, task_id)
+        if lease is None:
+            raise ContractError(
+                ErrorCode.RESOURCE_NOT_FOUND, "the capture lease is not available"
+            )
+        if lease["state"] != expected:
+            raise ContractError(
+                ErrorCode.TASK_STATE_CONFLICT,
+                f"the capture lease is {lease['state']}, not {expected}",
+            )
+        now = self.clock()
+        pid = process_pid if process_pid is not None else lease["process_pid"]
+        started = (
+            process_started_at if process_started_at is not None
+            else lease["process_started_at"]
+        )
+        cursor = uow.execute(
+            "UPDATE capture_leases SET state=?, process_pid=?, process_started_at=?,"
+            " updated_at=? WHERE task_id=? AND state=?",
+            (next_state, pid, started, now, task_id, expected),
+        )
+        if cursor.rowcount != 1:
+            raise ContractError(
+                ErrorCode.TASK_STATE_CONFLICT,
+                "the capture lease changed while it was being updated",
+            )
+        self._append_lease_event(
+            uow, task_id, expected, next_state, cause,
+            now=now, process_pid=pid, process_started_at=started,
+            file_id=lease["file_id"],
+        )
+        return lease
+
+    def _record_lease_ownership(
+        self, uow: UnitOfWork, task_id: str, handle: CaptureHandle
+    ) -> None:
+        lease = self._lease_row(uow, task_id)
+        if lease is None or lease["state"] != "owned":
+            raise ContractError(
+                ErrorCode.TASK_STATE_CONFLICT,
+                "ownership facts can only be recorded on an owned lease",
+            )
+        now = self.clock()
+        uow.execute(
+            "UPDATE capture_leases SET process_pid=?, process_started_at=?, updated_at=?"
+            " WHERE task_id=? AND state='owned'",
+            (handle.pid, handle.started_at, now, task_id),
+        )
+        self._append_lease_event(
+            uow, task_id, "owned", "owned", "capture_started",
+            now=now, process_pid=handle.pid,
+            process_started_at=handle.started_at, file_id=lease["file_id"],
+        )
+
+    def _mark_lease_unresolved(self, task_id: str, cause: str) -> None:
+        with self.repository.unit_of_work() as uow:
+            lease = self._lease_row(uow, task_id)
+            if lease is None or lease["state"] not in ("prepared", "owned"):
+                return
+            self._transition_lease(
+                uow, task_id, lease["state"], "unresolved", cause,
+            )
+
+    def _stop_event(self, uow: UnitOfWork, task_id: str) -> bool:
+        return bool(uow.query(
+            "SELECT 1 FROM task_events WHERE task_id=?"
+            " AND cause='capture_stop_requested' LIMIT 1",
+            (task_id,),
+        ))
+
+    def _stop_requested(self, task_id: str) -> bool:
+        with self.repository.unit_of_work() as uow:
+            return self._stop_event(uow, task_id)
+
+    def _cancel_requested(self, task_id: str) -> bool:
+        with self.repository.unit_of_work() as uow:
+            row = self.tasks._task_row(uow, task_id)
+            return bool(row["cancel_requested"])
+
     # -- segment internals --------------------------------------------------
     def _segment_and_session(
         self, uow: UnitOfWork, segment_id: str, user_scope_id: str
@@ -4159,6 +4969,78 @@ def _compare_long_frame_rate(*args: Any, **kwargs: Any) -> MetricComparison:
 
 def _compare_long_frame_share(*args: Any, **kwargs: Any) -> MetricComparison:
     return _compare_long_frame(*args, kind="share", **kwargs)
+
+
+
+
+def _capture_check(
+    check_id: str, status: CheckStatus, note: str, now: str
+) -> CheckResult:
+    return CheckResult(
+        check_id=check_id,
+        definition_version=CAPTURE_RULE_VERSION,
+        status=status,
+        input_refs=[],
+        evidence_refs=[],
+        checked_at=None if status is CheckStatus.not_run else now,
+        method="deterministic capture rule",
+        note=note,
+    )
+
+
+def _capture_offset(
+    session: PlaySession, handle: CaptureHandle
+) -> float | None:
+    """The output's zero is the backend-measured tool start, never a guess."""
+    try:
+        started = datetime.fromisoformat(handle.started_at)
+        session_started = datetime.fromisoformat(session.started_at)
+    except ValueError:
+        return None
+    offset = (started - session_started).total_seconds()
+    if not math.isfinite(offset) or offset < 0:
+        return None
+    return offset
+
+
+def _capture_time_mapping(
+    parsed: LogParseResult, offset: float | None, now: str
+) -> TimeMapping:
+    scale = parsed.time_mapping.scale
+    return TimeMapping(
+        source_basis=parsed.time_mapping.source_basis,
+        target_basis=LOG_TARGET_TIME_BASIS,
+        source_unit=parsed.time_mapping.source_unit,
+        target_unit="s",
+        offset=offset if scale is not None else None,
+        scale=scale,
+        checks=[_capture_check(
+            "time.origin",
+            CheckStatus.pass_ if offset is not None and scale is not None
+            else CheckStatus.unknown,
+            "the output's zero is mapped from the backend tool start"
+            if offset is not None and scale is not None else
+            "the output's clock cannot be mapped without a verified unit/origin",
+            now,
+        )],
+    )
+
+
+def _capture_stream(parsed: LogParseResult, now: str) -> StreamSelection:
+    process = parsed.frames[0].process if parsed.frames else None
+    return StreamSelection(
+        process=process,
+        swapchain_id=None,
+        frame_stream_kind=parsed.frame_stream_kind,
+        checks=[_capture_check(
+            "segment.stream",
+            CheckStatus.pass_ if parsed.observed_streams else CheckStatus.unknown,
+            "the captured output states its frame stream"
+            if parsed.observed_streams else
+            "the captured output does not state a frame stream",
+            now,
+        )],
+    )
 
 
 def _unconfirmed_stream(now: str) -> StreamSelection:    return StreamSelection(

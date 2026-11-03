@@ -53,6 +53,28 @@ class AnalysisInput(StrictModel):
     cleaning_protocol_version: str
 
 
+class CaptureInput(StrictModel):
+    """One owned capture into a fixed segment/binding revision (04 §5).
+
+    Only an adapter registered as verified may run; the segment and binding are
+    fixed at submission and the lease is registered in the same transaction.
+    """
+
+    kind: Literal["capture"]
+    session_id: ID
+    segment_ref: BindingRef
+    adapter_id: str
+    adapter_version: str
+    protocol_id: ID | None
+
+    @field_validator("adapter_id", "adapter_version")
+    @classmethod
+    def names_are_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("an adapter id and version must not be blank")
+        return value
+
+
 class DeviceScanInput(StrictModel):
     kind: Literal["device_scan"]
     game_context_id: ID | None
@@ -86,6 +108,7 @@ TaskInputPayload = Annotated[
         KnowledgeInput,
         KnowledgeImportInput,
         AnalysisInput,
+        CaptureInput,
         DeviceScanInput,
         LogImportInput,
     ],
@@ -154,6 +177,7 @@ __all__ = [
     "KnowledgeInput",
     "KnowledgeImportInput",
     "AnalysisInput",
+    "CaptureInput",
     "DeviceScanInput",
     "LogImportInput",
     "TaskInputPayload",

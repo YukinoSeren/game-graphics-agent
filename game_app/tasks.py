@@ -46,6 +46,7 @@ DEFAULT_ROUTES = {
     "knowledge": "/api/knowledge-tasks",
     "knowledge_import": "/api/knowledge-imports",
     "analysis": "/api/analyses",
+    "capture": "/api/captures",
     "device_scan": "/api/device-scans",
     "log_import": "/api/log-imports",
 }
@@ -248,6 +249,7 @@ class TaskService:
         canonical_route: str | None = None,
         method: str = "POST",
         budget: Budget | None = None,
+        companion: Callable[[UnitOfWork, str], None] | None = None,
     ) -> TaskAccepted:
         typed = _validate_task_input(task_input)
         route = canonical_route or DEFAULT_ROUTES[typed.kind]
@@ -285,6 +287,10 @@ class TaskService:
                 (task_id, canonical_json(typed.model_dump(mode="json")).decode("utf-8"), now),
             )
             self._append_event(uow, task_id, 1, 1, None, TaskState.queued, "registered")
+            if companion is not None:
+                # The task and its domain-owned companion (a capture lease)
+                # commit together: a committed task never lacks its lease.
+                companion(uow, task_id)
             accepted = TaskAccepted(task_id=task_id, input_revision=1, state=TaskState.queued)
             uow.insert_idempotency(
                 user_scope_id=context.user_scope_id,
@@ -430,7 +436,8 @@ class TaskService:
                     (stop.model_dump_json(), revision, now, row["task_id"]),
                 )
                 self._append_event(
-                    uow, row["task_id"], revision, row["current_input_revision"],
+                    uow, row["task_id"], self._next_sequence(uow, row["task_id"]),
+                    row["current_input_revision"],
                     TaskState(row["state"]), TaskState.interrupted, "restart_detected",
                     active_elapsed=row["active_elapsed_seconds"],
                 )
@@ -756,6 +763,10 @@ class TaskService:
         if context.suspended:
             return RunOutcome(task_id=task_id, state=TaskState.waiting_input)
         final = outcome or HandlerOutcome.completed()
+        if final.state is TaskState.running:
+            # An owned capture stays in the single running slot until a stop
+            # intent is registered; no "finished" event is fabricated.
+            return RunOutcome(task_id=task_id, state=TaskState.running)
         state = self._finish(
             task_id,
             final.state,
@@ -768,7 +779,25 @@ class TaskService:
 
     def _claim_next(self) -> tuple[str, TaskType, bool] | None:
         with self.repository.unit_of_work() as uow:
-            if uow.query("SELECT 1 FROM tasks WHERE state='running' LIMIT 1"):
+            running = uow.query(
+                "SELECT * FROM tasks WHERE state='running' ORDER BY created_at, rowid"
+            )
+            if running:
+                # A capture that is already running is re-entered only to honour
+                # a recorded stop intent; anything else keeps the slot.
+                for row in running:
+                    if row["type"] == TaskType.capture.value and (
+                        row["cancel_requested"] or uow.query(
+                            "SELECT 1 FROM task_events WHERE task_id=?"
+                            " AND cause='capture_stop_requested' LIMIT 1",
+                            (row["task_id"],),
+                        )
+                    ):
+                        return (
+                            row["task_id"],
+                            TaskType.capture,
+                            bool(row["resume_blocked_unknown_call"]),
+                        )
                 return None
             rows = uow.query(
                 "SELECT * FROM tasks WHERE state='queued' ORDER BY created_at, rowid LIMIT 1"

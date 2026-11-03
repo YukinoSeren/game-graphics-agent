@@ -1720,13 +1720,22 @@ class KnowledgeService:
                 )
             return prior
         with self.repository.unit_of_work() as uow:
-            latest = uow.latest_for_series("KnowledgePackage", series_id)
-        if latest is None:
-            return None
-        candidate = KnowledgePackage.model_validate_json(latest.payload_bytes)
-        if candidate.publication_status is not PublicationStatus.published:
-            return None
-        return candidate
+            # The series is keyed by game and declared scope only, so several
+            # players can own a package in it.  Another player's package is
+            # never this caller's prior: it would drive the query plan and
+            # would be refused later as a parent (02 §5).
+            rows = uow.query(
+                "SELECT payload FROM objects WHERE entity_type='KnowledgePackage'"
+                " AND series_id=? ORDER BY version DESC",
+                (series_id,),
+            )
+            for row in rows:
+                candidate = KnowledgePackage.model_validate_json(bytes(row["payload"]))
+                if candidate.publication_status is not PublicationStatus.published:
+                    continue
+                if self._package_owned_by(uow, candidate, user_scope_id):
+                    return candidate
+        return None
 
     def _initial_gaps(self, prior: KnowledgePackage | None) -> list[GapSpec]:
         if prior is None:

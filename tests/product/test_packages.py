@@ -774,6 +774,47 @@ def test_another_players_snapshot_is_never_packaged(tmp_path):
     assert _count(repository, "KnowledgePackage") == 0
 
 
+def test_another_players_package_is_never_the_implicit_prior(tmp_path):
+    """Without a prior of their own, a player starts from the seed gap."""
+    repository = _repository(tmp_path)
+    files = FileService(repository, tmp_path / "managed")
+    game = _store_game(repository)
+    context = _store_context(repository, files, game)
+    other = _uid(4242)
+    other_snapshot = _publish_import(
+        repository, files, game, context, run_id="run-other", user_scope_id=other
+    )
+    other_package = _service(repository, files).build_package(
+        [other_snapshot], None, KNOWLEDGE_TASK_SCOPE,
+        game_context_id=context.id,
+        user_scope_id=other,
+        idempotency_key="pkg-other",
+    ).package
+    other_questions = {
+        gap.question
+        for gap in [*other_package.critical_gaps, *other_package.noncritical_gaps]
+    }
+    assert other_questions, "the other player's package has open gaps to leak"
+
+    provider = _NoDiscoveryProvider()
+    service = TaskService(repository, provider=provider, files=files)
+    service.handlers["knowledge"] = _service(repository, files).handle
+    task_input, mutation = _knowledge_input(context)
+
+    service.register_task(task_input, mutation)
+    outcome = service.run_once()
+
+    assert outcome.state is TaskState.partial
+    assert provider.calls
+    # The plan comes from this player's own (empty) history, never from
+    # another player's package: no query repeats their gap questions.
+    queries = {call["payload"]["query"] for call in provider.calls}
+    assert not queries & other_questions
+    assert all(
+        query.startswith("collect the declared public graphics facts")
+        for query in queries
+    )
+
 def test_a_published_package_belongs_to_the_player_who_built_it(tmp_path):
     repository = _repository(tmp_path)
     files = FileService(repository, tmp_path / "managed")
@@ -1216,9 +1257,11 @@ class _NoDiscoveryProvider:
 
     def __init__(self) -> None:
         self.sends = 0
+        self.calls: list[dict] = []
 
     def send(self, request):
         self.sends += 1
+        self.calls.append(dict(request))
         return {"urls": []}
 
 

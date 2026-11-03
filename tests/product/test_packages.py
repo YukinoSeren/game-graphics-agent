@@ -1140,7 +1140,9 @@ def test_get_package_reports_a_missing_original_as_unavailable(tmp_path):
 # --- the task entry ----------------------------------------------------------
 
 
-def _knowledge_input(context: GameContext, *, key: str = "task-1", **budget) -> tuple:
+def _knowledge_input(
+    context: GameContext, *, key: str = "task-1", prior: str | None = None, **budget
+) -> tuple:
     values = {"max_urls": 12, "max_searches": 12, "max_followup_rounds": 2,
               "max_queries_per_gap": 2, "max_model_calls": 16, "max_read_calls": 36}
     values.update(budget)
@@ -1149,7 +1151,7 @@ def _knowledge_input(context: GameContext, *, key: str = "task-1", **budget) -> 
             kind="knowledge",
             game_context_id=context.id,
             device_snapshot_id=None,
-            prior_package_id=None,
+            prior_package_id=prior,
             budget=values,
         ),
         MutationContext(user_scope_id=SCOPE, idempotency_key=key, request_id=_uid(4000)),
@@ -1212,6 +1214,33 @@ def test_the_knowledge_task_without_an_import_is_partial_and_packages_nothing(tm
     view = service.get_task(accepted.task_id)
     assert view.task.stop_reason.kind == "collection"
     assert view.task.stop_reason.code == "low_information_gain"
+
+
+def test_a_foreign_prior_package_is_a_pure_conflict_before_registration(tmp_path):
+    repository = _repository(tmp_path)
+    files = FileService(repository, tmp_path / "managed")
+    game = _store_game(repository)
+    context = _store_context(repository, files, game)
+    other_scope = _uid(9999)
+    snapshot = _publish_import(
+        repository, files, game, context, user_scope_id=other_scope
+    )
+    foreign = KnowledgeService(repository, files).build_package(
+        [snapshot], None, KNOWLEDGE_TASK_SCOPE,
+        game_context_id=context.id, user_scope_id=other_scope,
+        idempotency_key="pkg-other",
+    ).package
+    knowledge = _service(repository, files)
+    task_input, _mutation = _knowledge_input(context, key="task-1", prior=foreign.id)
+
+    # The prior package is invisible to this caller, so the attempt is a pure
+    # conflict and no task key is consumed (error §4.2).
+    with pytest.raises(ContractError) as caught:
+        knowledge.precheck_collection(task_input, user_scope_id=SCOPE)
+
+    assert caught.value.code is ErrorCode.RESOURCE_NOT_FOUND
+    with repository.unit_of_work() as uow:
+        assert uow.query("SELECT COUNT(*) AS n FROM tasks")[0]["n"] == 0
 
 
 def test_a_zero_budget_is_a_pure_conflict_before_registration(tmp_path):

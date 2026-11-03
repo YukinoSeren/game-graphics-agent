@@ -1963,6 +1963,12 @@ class KnowledgeService:
         )
         game_context = self._context_for(typed.game_context_id, user_scope_id)
         self._game_for_context(game_context, user_scope_id)
+        if typed.prior_package_id is not None:
+            # An invisible or wrong-series prior package is a pure conflict;
+            # it must fail before the task key is consumed (error §4.2).
+            self._task_prior_package(
+                typed.prior_package_id, game_context, user_scope_id
+            )
         if game_context.platform.value_state is not ValueState.known:
             raise ContractError(
                 ErrorCode.PRECONDITION_UNVERIFIED,

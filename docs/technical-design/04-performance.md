@@ -99,7 +99,7 @@ exploratory=true明确表示探索；false只声明预先计划的用途，不�
 
 NormalizedFrame 为分析器内存值，不入产品表：`event_index:int,timestamp:float,time_basis:string,process:ProcessIdentity,swapchain_id:string?,frame_stream_kind:FrameStreamKind,interval_ms:float?,frame_type:string?,gpu_busy_ms:float?,cpu_busy_ms:float?,validity:string`；全R，未知计时null，validity为valid/break/invalid。原工具列与单位在CaptureArtifact.source_column_map固定；来源区间型间隔需说明对应前/后事件，不按相似列名猜。
 
-CaptureLease 是04局部恢复日志（含EntityHeader），字段全R：`task_id:ID,session_id:ID,native_name:string,process_pid:int?,process_started_at:Timestamp?,file_id:ID,state:string`；state仅prepared/owned/finalized/unresolved，每次变化保存事件。按session保证未finalized租约唯一，工具启动前先登记owned意图；native_name由后台task ID生成。重启遇到可能仍活动的本次工具进程，先核验PID+启动时刻及native_name；无法确认归属则PRECONDITION_UNVERIFIED，不启动第二采集，不使用停止所有会话的命令。原任务仍按B3 interrupted，新任务不能借旧任务终态绕过租约检查。
+CaptureLease 是04局部恢复日志（含EntityHeader），字段全R：`task_id:ID,session_id:ID,native_name:string,process_pid:int?,process_started_at:Timestamp?,file_id:ID,state:string`；state仅prepared/owned/finalized/unresolved，每次变化保存事件（`capture_lease_events`，逐条记录当时观察到的 pid/启动时刻/文件；`capture_leases` 是可重建头投影，`file_id` 固定为 `capture:<task_id>` 的确定性文件 ID）。按session保证未finalized租约唯一，工具启动前先登记owned意图；native_name由后台task ID生成。重启遇到可能仍活动的本次工具进程，先核验PID+启动时刻及native_name；无法确认归属则PRECONDITION_UNVERIFIED，不启动第二采集，不使用停止所有会话的命令。原任务仍按B3 interrupted，新任务不能借旧任务终态绕过租约检查。
 
 ### 4.4 D-P03 测试协议创建与指标目录
 

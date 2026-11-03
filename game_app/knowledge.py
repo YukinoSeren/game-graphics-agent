@@ -50,11 +50,14 @@ from game_app.contracts.knowledge import (
     GameSelectionRequest,
     IdentityMapping,
     IdentityResolution,
+    ImpactNotice,
     ImportIdentityMappingRequest,
     ImportedRecord,
     KnowledgeGap,
     KnowledgePackage,
     ReuseDecision,
+    Source,
+    SourceRevision,
 )
 from game_app.contracts.primitives import ObjectRef, new_id, utc_now
 from game_app.contracts.tasks import DomainResult, KnowledgeInput
@@ -928,6 +931,8 @@ class IdentityService:
 # --- KNW-T02: coverage reduction and package publication --------------------
 
 PACKAGE_ROUTE = "/internal/knowledge-packages"
+IMPACT_ROUTE = "/internal/knowledge-impact-notices"
+IMPACT_RULE_VERSION = "impact-rules/0.4"
 PACKAGE_RULE_VERSION = "coverage/0.4"
 # KnowledgeInput carries no declared scope (data §9 fixes that DTO); the task is
 # public collection, so its one scope is the registered collection scope.
@@ -1026,6 +1031,25 @@ class _CollectionRun:
                 else "no read or extraction error was recorded",
             ),
         ]
+
+
+def image_adapter_enabled(adapter_id: str) -> bool:
+    """True only for an adapter with independent G-IMAGE evidence."""
+    return adapter_id in IMAGE_ADAPTERS_VERIFIED
+
+
+def _affected_hash(affected_record_ids: Sequence[str], rule_version: str) -> str:
+    return hashlib.sha256(canonical_json({
+        "affected_record_ids": sorted(affected_record_ids),
+        "rule_version": rule_version,
+    })).hexdigest()
+
+
+def _notice_id(old_package_id: str, new_package_id: str, affected_hash: str) -> str:
+    return uuid5(
+        _PACKAGE_NS,
+        f"impact:{old_package_id}:{new_package_id}:{affected_hash}",
+    ).hex
 
 
 def image_adapter_status() -> tuple[bool, CheckResult]:
@@ -2185,6 +2209,281 @@ class KnowledgeService:
         for file_id in file_ids:
             self.files.read_managed_file(file_id)
 
+    # -- impact notices (KNW-T04) ------------------------------------------
+    def notify_impacts(
+        self,
+        old_package_id: str,
+        new_package_id: str,
+        *,
+        user_scope_id: str,
+        idempotency_key: str,
+        request_id: str,
+        request_schema_version: str = PRODUCT_CONTRACT_VERSION,
+        method: str = "POST",
+        canonical_route: str = IMPACT_ROUTE,
+    ) -> ImpactNotice | None:
+        """Register the affected records between two packages, once.
+
+        Only the notice is written: no recommendation content, no current
+        applied pointer and no old session/outcome is touched.  When nothing is
+        actually affected, no notice is created and the key stays unconsumed
+        (the branch is fixed by ``test_impacts.py``).
+        """
+        if old_package_id == new_package_id:
+            raise ContractError(
+                ErrorCode.INPUT_VALIDATION_FAILED,
+                "an impact notice compares two different package versions",
+                field_errors=[FieldError(
+                    path="new_package_id", code="conflict", message="same package",
+                )],
+            )
+        request_hash = hashlib.sha256(canonical_json({
+            "schema_version": request_schema_version,
+            "method": method,
+            "route": canonical_route,
+            "user_scope_id": user_scope_id,
+            "old_package_id": old_package_id,
+            "new_package_id": new_package_id,
+            "rule_version": IMPACT_RULE_VERSION,
+        })).hexdigest()
+        with self.repository.unit_of_work() as uow:
+            # A registered key replays before any new-submission guard runs.
+            existing = uow.find_idempotency(
+                user_scope_id, method, canonical_route, idempotency_key
+            )
+            if existing is not None:
+                return self._replay_impact(
+                    uow, existing, request_schema_version, request_hash
+                )
+
+            old = self._require_published_package(uow, old_package_id)
+            new = self._require_published_package(uow, new_package_id)
+            if old.game_id != new.game_id:
+                raise ContractError(
+                    ErrorCode.REFERENCE_INVALID,
+                    "the two packages belong to different games",
+                )
+            affected, evidence_refs, reason = self._affected_records(uow, old, new)
+            if not affected:
+                return None
+
+            affected_hash = _affected_hash(affected, IMPACT_RULE_VERSION)
+            notice_id = _notice_id(old.id, new.id, affected_hash)
+            row = uow.query(
+                "SELECT notice_id FROM impact_notices WHERE old_package_id=?"
+                " AND new_package_id=? AND affected_hash=? AND rule_version=?",
+                (old.id, new.id, affected_hash, IMPACT_RULE_VERSION),
+            )
+            if row:
+                stored = uow.find_object("ImpactNotice", row[0]["notice_id"])
+                notice = ImpactNotice.model_validate_json(stored.payload_bytes)
+            else:
+                notice = ImpactNotice(
+                    id=notice_id,
+                    schema_version=PRODUCT_CONTRACT_VERSION,
+                    created_at=self.clock(),
+                    created_by_task_id=None,
+                    notice_id=notice_id,
+                    old_package_id=old.id,
+                    new_package_id=new.id,
+                    affected_record_ids=affected,
+                    reason=reason,
+                    evidence_refs=evidence_refs,
+                )
+                uow.insert_object("ImpactNotice", notice)
+                uow.execute(
+                    "INSERT INTO impact_notices(notice_id, old_package_id,"
+                    " new_package_id, affected_hash, rule_version,"
+                    " affected_record_ids, reason, created_at)"
+                    " VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        notice.id,
+                        old.id,
+                        new.id,
+                        affected_hash,
+                        IMPACT_RULE_VERSION,
+                        canonical_json(affected).decode("utf-8"),
+                        reason,
+                        notice.created_at,
+                    ),
+                )
+            result = ResourceResult(refs=[
+                ObjectRef(entity_type="ImpactNotice", entity_id=notice.id)
+            ])
+            uow.insert_idempotency(
+                user_scope_id=user_scope_id,
+                method=method,
+                canonical_route=canonical_route,
+                key=idempotency_key,
+                request_schema_version=request_schema_version,
+                request_hash=request_hash,
+                response_status=201,
+                response_body=canonical_json(result.model_dump(mode="json")),
+                result_refs=[ref.model_dump(mode="json") for ref in result.refs],
+            )
+            return notice
+
+    def _replay_impact(
+        self,
+        uow: UnitOfWork,
+        existing: Any,
+        request_schema_version: str,
+        request_hash: str,
+    ) -> ImpactNotice:
+        if existing.lifecycle.value == "tombstoned":
+            raise ContractError(
+                ErrorCode.RESOURCE_GONE,
+                "this submission was cleaned up; start a new logical submission",
+            )
+        if (
+            existing.request_schema_version != request_schema_version
+            or existing.request_hash != request_hash
+        ):
+            raise ContractError(
+                ErrorCode.IDEMPOTENCY_CONFLICT,
+                "the same key was already used with different business content",
+                field_errors=[FieldError(
+                    path="idempotency_key", code="conflict",
+                    message="different request hash",
+                )],
+            )
+        result = ResourceResult.model_validate(json.loads(existing.response_body))
+        stored = uow.find_object("ImpactNotice", result.refs[0].entity_id)
+        if stored is None:
+            raise ContractError(
+                ErrorCode.RESOURCE_NOT_FOUND, "the registered notice is not available"
+            )
+        return ImpactNotice.model_validate_json(stored.payload_bytes)
+
+    @staticmethod
+    def _require_published_package(uow: UnitOfWork, package_id: str) -> KnowledgePackage:
+        stored = uow.find_object("KnowledgePackage", package_id)
+        if stored is None:
+            raise ContractError(
+                ErrorCode.RESOURCE_NOT_FOUND, "the requested package is not available"
+            )
+        package = KnowledgePackage.model_validate_json(stored.payload_bytes)
+        if package.publication_status is not PublicationStatus.published:
+            raise ContractError(
+                ErrorCode.REFERENCE_INVALID,
+                "an unpublished package cannot raise an impact notice",
+            )
+        return package
+
+    def _affected_records(
+        self, uow: UnitOfWork, old: KnowledgePackage, new: KnowledgePackage
+    ) -> tuple[list[str], list[EvidenceRef], str]:
+        old_records = self._package_records(uow, old)
+        new_records = self._package_records(uow, new)
+        old_index = {
+            (record.capture_scope_id, record.record_type, record.local_record_id): record
+            for record in old_records
+        }
+        new_index = {
+            (record.capture_scope_id, record.record_type, record.local_record_id): record
+            for record in new_records
+        }
+        old_sources = self._source_index(uow, old)
+        new_sources = self._source_index(uow, new)
+        changed_urls = {
+            url for url, (_revision, content_hash) in old_sources.items()
+            if url in new_sources and new_sources[url][1] != content_hash
+        }
+        affected: dict[tuple[str, str, str], str] = {}
+        removed = 0
+        changed = 0
+        for key, old_record in old_index.items():
+            new_record = new_index.get(key)
+            if new_record is None:
+                affected[key] = old_record.id
+                removed += 1
+            elif new_record.payload_hash != old_record.payload_hash:
+                affected[key] = new_record.id
+                changed += 1
+            elif (
+                self._record_source_url(uow, old_record) in changed_urls
+                and self._record_source_url(uow, new_record) in changed_urls
+            ):
+                # The payload is byte-identical but the source revision it
+                # cites changed: only members citing that source are affected.
+                affected[key] = new_record.id
+                changed += 1
+
+        dependent = 0
+        propagated = True
+        while propagated:
+            propagated = False
+            for key, record in new_index.items():
+                if key in affected:
+                    continue
+                for target_type, local_id, _path in record_payload_references(
+                    record.record_type, record.payload
+                ):
+                    if (record.capture_scope_id, target_type, local_id) in affected:
+                        affected[key] = record.id
+                        dependent += 1
+                        propagated = True
+                        break
+
+        affected_ids = sorted(set(affected.values()))
+        by_id = {record.id: record for record in new_records}
+        old_by_id = {record.id: record for record in old_records}
+        evidence_refs: list[EvidenceRef] = []
+        for record_id in affected_ids:
+            if record_id in by_id:
+                evidence_refs.append(EvidenceRef(
+                    kind="knowledge", record=_record_ref(new.id, by_id[record_id]),
+                ))
+            else:
+                evidence_refs.append(EvidenceRef(
+                    kind="knowledge", record=_record_ref(old.id, old_by_id[record_id]),
+                ))
+        reason = (
+            f"{removed} record(s) removed, {changed} record(s) changed or backed by"
+            f" a changed source revision, {dependent} record(s) depend on a changed"
+            " member; no recommendation, applied pointer or old result was modified"
+        )
+        return affected_ids, evidence_refs, reason
+
+    @staticmethod
+    def _package_records(
+        uow: UnitOfWork, package: KnowledgePackage
+    ) -> list[ImportedRecord]:
+        records: list[ImportedRecord] = []
+        for record_id in package.record_snapshot_ids:
+            stored = uow.find_object("ImportedRecord", record_id)
+            if stored is not None:
+                records.append(ImportedRecord.model_validate_json(stored.payload_bytes))
+        return records
+
+    @staticmethod
+    def _source_index(
+        uow: UnitOfWork, package: KnowledgePackage
+    ) -> dict[str, tuple[str, str | None]]:
+        index: dict[str, tuple[str, str | None]] = {}
+        for revision_id in package.source_revision_ids:
+            stored = uow.find_object("SourceRevision", revision_id)
+            if stored is None:
+                continue
+            revision = SourceRevision.model_validate_json(stored.payload_bytes)
+            source_stored = uow.find_object("Source", revision.source_id)
+            if source_stored is None:
+                continue
+            source = Source.model_validate_json(source_stored.payload_bytes)
+            index[source.canonical_url] = (revision.id, revision.content_hash)
+        return index
+
+    @staticmethod
+    def _record_source_url(uow: UnitOfWork, record: ImportedRecord) -> str | None:
+        stored = uow.find_object("SourceRevision", record.source_revision_id)
+        if stored is None:
+            return None
+        revision = SourceRevision.model_validate_json(stored.payload_bytes)
+        source_stored = uow.find_object("Source", revision.source_id)
+        if source_stored is None:
+            return None
+        return Source.model_validate_json(source_stored.payload_bytes).canonical_url
+
     # -- helpers -----------------------------------------------------------
     def _context_for(self, context_id: str, user_scope_id: str) -> GameContext:
         stored = self.repository.find_object("GameContext", context_id)
@@ -2447,6 +2746,8 @@ __all__ = [
     "IDENTITY_RULE_VERSION",
     "IMAGE_ADAPTERS_VERIFIED",
     "IMAGE_DIMENSION",
+    "IMPACT_ROUTE",
+    "IMPACT_RULE_VERSION",
     "IMPORT_IDENTITY_ROUTE",
     "IdentityService",
     "KNOWLEDGE_TASK_SCOPE",
@@ -2457,5 +2758,7 @@ __all__ = [
     "CoverageEvaluator",
     "SELECTION_ROUTE",
     "SELECTION_RULE_VERSION",
+    "image_adapter_enabled",
     "image_adapter_status",
+    "package_series_id",
 ]

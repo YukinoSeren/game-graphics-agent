@@ -159,6 +159,20 @@ class Application:
             package_id, user_scope_id=user_scope_id, **kwargs
         )
 
+    def notify_impacts(
+        self, old_package_id: str, new_package_id: str,
+        context: MutationContext, **kwargs: Any,
+    ):
+        """Register an impact notice; the 03 consumer interface is not built."""
+        return self.knowledge.notify_impacts(
+            old_package_id,
+            new_package_id,
+            user_scope_id=context.user_scope_id,
+            idempotency_key=context.idempotency_key,
+            request_id=context.request_id,
+            **kwargs,
+        )
+
     # -- 04 performance entries (synchronous, thin wrappers) ----------------
     def create_session(self, request: Any, context: MutationContext, **kwargs: Any):
         return self.performance.create_session(request, context, **kwargs)

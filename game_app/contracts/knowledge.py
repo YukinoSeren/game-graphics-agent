@@ -384,6 +384,38 @@ class KnowledgePackage(StrictModel):
         return self
 
 
+class ImpactNotice(StrictModel):
+    """02's immutable impact message (02 §5); it never rewrites a consumer.
+
+    ``notice_id`` is the entity id as well: one deterministic notice per
+    ``(old, new, affected set, rule version)`` tuple, so a re-delivery can only
+    find the original notice.
+    """
+
+    id: ID
+    schema_version: str
+    created_at: Timestamp
+    created_by_task_id: ID | None
+    notice_id: ID
+    old_package_id: ID
+    new_package_id: ID
+    affected_record_ids: list[ID]
+    reason: str
+    evidence_refs: list[EvidenceRef]
+
+    @model_validator(mode="after")
+    def shape(self) -> "ImpactNotice":
+        if self.notice_id != self.id:
+            raise ValueError("notice_id is the entity id; it is never a second identity")
+        if self.old_package_id == self.new_package_id:
+            raise ValueError("an impact notice compares two different packages")
+        if not self.affected_record_ids:
+            raise ValueError("a notice is only recorded when records are affected")
+        if not self.reason.strip():
+            raise ValueError("a notice states why the records are affected")
+        return self
+
+
 class SettingIdentityMapping(StrictModel):
     id: ID
     schema_version: str
@@ -510,6 +542,7 @@ __all__ = [
     "CoverageCell",
     "KnowledgeGap",
     "KnowledgePackage",
+    "ImpactNotice",
     "SettingIdentityMapping",
     "GameCatalogQuery",
     "GameChoice",

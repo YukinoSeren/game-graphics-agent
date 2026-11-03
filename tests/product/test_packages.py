@@ -943,13 +943,24 @@ def _knowledge_input(context: GameContext, *, key: str = "task-1", **budget) -> 
     )
 
 
+class _NoDiscoveryProvider:
+    """A search that finds nothing: the task must still package what it has."""
+
+    def __init__(self) -> None:
+        self.sends = 0
+
+    def send(self, request):
+        self.sends += 1
+        return {"urls": []}
+
+
 def test_the_knowledge_task_builds_a_package_from_published_imports(tmp_path):
     repository = _repository(tmp_path)
     files = FileService(repository, tmp_path / "managed")
     game = _store_game(repository)
     context = _store_context(repository, files, game)
     _publish_import(repository, files, game, context)
-    provider = SpyProvider()
+    provider = _NoDiscoveryProvider()
     service = TaskService(repository, provider=provider, files=files)
     knowledge = _service(repository, files)
     service.handlers["knowledge"] = knowledge.handle
@@ -963,10 +974,12 @@ def test_the_knowledge_task_builds_a_package_from_published_imports(tmp_path):
     view = service.get_task(accepted.task_id)
     assert view.task.domain_result.code in ("completed_scope", "partial_scope")
     assert _count(repository, "KnowledgePackage") == 1
+    # The package builder itself makes no provider call; the two audited
+    # searches come from the collection rounds.
     assert knowledge.provider_sends == 0
-    assert provider.sends == 0
     with repository.unit_of_work() as uow:
-        assert uow.query("SELECT COUNT(*) AS n FROM external_calls")[0]["n"] == 0
+        assert uow.query("SELECT COUNT(*) AS n FROM external_calls")[0]["n"] == 2
+    assert provider.sends == 2
 
 
 def test_the_knowledge_task_without_an_import_is_partial_and_packages_nothing(tmp_path):
@@ -974,7 +987,7 @@ def test_the_knowledge_task_without_an_import_is_partial_and_packages_nothing(tm
     files = FileService(repository, tmp_path / "managed")
     game = _store_game(repository)
     context = _store_context(repository, files, game)
-    service = TaskService(repository, provider=SpyProvider(), files=files)
+    service = TaskService(repository, provider=_NoDiscoveryProvider(), files=files)
     service.handlers["knowledge"] = _service(repository, files).handle
     task_input, mutation = _knowledge_input(context)
 
@@ -984,7 +997,8 @@ def test_the_knowledge_task_without_an_import_is_partial_and_packages_nothing(tm
     assert outcome.state is TaskState.partial
     assert _count(repository, "KnowledgePackage") == 0
     view = service.get_task(accepted.task_id)
-    assert view.task.stop_reason.code == "source_unavailable"
+    assert view.task.stop_reason.kind == "collection"
+    assert view.task.stop_reason.code == "low_information_gain"
 
 
 def test_a_zero_budget_is_a_pure_conflict_before_registration(tmp_path):
@@ -1002,4 +1016,5 @@ def test_a_zero_budget_is_a_pure_conflict_before_registration(tmp_path):
         knowledge.precheck_collection(task_input, user_scope_id=SCOPE)
 
     assert caught.value.code is ErrorCode.PRECONDITION_UNVERIFIED
-    assert _count(repository, "TaskRun") == 0
+    with repository.unit_of_work() as uow:
+        assert uow.query("SELECT COUNT(*) AS n FROM tasks")[0]["n"] == 0

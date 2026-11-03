@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Sequence
 from uuid import UUID, uuid5
 
@@ -59,10 +59,24 @@ from game_app.contracts.knowledge import (
 from game_app.contracts.primitives import ObjectRef, new_id, utc_now
 from game_app.contracts.tasks import DomainResult, KnowledgeInput
 from game_app.errors import ContractError, ErrorCode, FieldError
+from game_app.collection import (
+    COLLECTION_RULE_VERSION,
+    CollectedGap,
+    CollectedSource,
+    CollectionProtocolError,
+    CollectionSnapshotWriter,
+    FollowupPlanner,
+    GapSpec,
+    canonical_url,
+    parse_extraction_reply,
+    parse_search_reply,
+    source_revision_id,
+    source_scope_id,
+)
 from game_app.files import FileService, PublishHooks
-from game_app.importer import record_payload_references
+from game_app.importer import ImportPublisher, record_payload_references
 from game_app.repository import ProductRepository, StoredObject, UnitOfWork, canonical_json
-from game_app.tasks import BudgetExhausted, HandlerOutcome, TaskContext, TaskStopReason
+from game_app.tasks import BudgetExhausted, HandlerOutcome, TaskContext, TaskStopReason, UnknownCall
 
 PRODUCT_CONTRACT_VERSION = "product-contract/0.4"
 SELECTION_ROUTE = "/api/game-selections"
@@ -951,6 +965,68 @@ _SCOPE_DIMENSIONS: dict[str, tuple[str, ...]] = {
 }
 _DIAGNOSIS_DIMENSIONS = ("graphics.catalog", "version.dependencies")
 
+# Which record types close a cell gap, so the planner knows what a gain is.
+_CELL_EXPECTS: dict[str, tuple[str, ...]] = {
+    "graphics.catalog": ("settings", "configurations"),
+    "hardware.device_forms": ("environments",),
+    "display.capabilities": ("evidence", "constraints"),
+    "tradeoffs.directions": ("configurations",),
+    "measurement.environment": ("evidence",),
+    "version.dependencies": ("version_impacts", "constraints"),
+    "graphics.image_figures": ("evidence",),
+}
+
+
+def package_series_id(game_id: str, declared_scope: str) -> str:
+    """One version series per (game, declared operation scope)."""
+    return uuid5(_PACKAGE_NS, f"package-series:{game_id}:{declared_scope}").hex
+
+
+@dataclass
+class _CollectionRun:
+    """What one collection attempt produced; never a task-state projection."""
+
+    started_at: str = ""
+    sources: dict[str, CollectedSource] = field(default_factory=dict)
+    open_gaps: dict[str, GapSpec] = field(default_factory=dict)
+    used: dict[str, int] = field(default_factory=dict)
+    read_urls: set[str] = field(default_factory=set)
+    errors: list[str] = field(default_factory=list)
+    rounds: int = 0
+    gained: int = 0
+    stop_reason: CollectionStopReason | None = None
+    unknown_call: bool = False
+    budget_exhausted: bool = False
+
+    def checks(self) -> list[CheckResult]:
+        return [
+            _rule_check(
+                "collection.rounds",
+                CheckStatus.pass_ if self.rounds else CheckStatus.not_run,
+                f"{self.rounds} follow-up round(s) ran; {len(self.read_urls)} URL(s)"
+                " were read once each",
+            ),
+            _rule_check(
+                "collection.gain",
+                CheckStatus.pass_ if self.gained else CheckStatus.unknown,
+                f"{self.gained} key field(s) were added; the number of pages is"
+                " not information gain",
+            ),
+            _rule_check(
+                "collection.stop",
+                CheckStatus.pass_ if self.stop_reason is not None else CheckStatus.unknown,
+                "the run stopped with "
+                + ("no reason recorded" if self.stop_reason is None
+                   else self.stop_reason.value),
+            ),
+            _rule_check(
+                "collection.read_errors",
+                CheckStatus.fail if self.errors else CheckStatus.pass_,
+                "; ".join(self.errors) if self.errors
+                else "no read or extraction error was recorded",
+            ),
+        ]
+
 
 def image_adapter_status() -> tuple[bool, CheckResult]:
     """The image gate: disabled until G-IMAGE evidence verifies an adapter."""
@@ -1349,51 +1425,134 @@ class KnowledgeService:
                 ErrorCode.INPUT_VALIDATION_FAILED,
                 "the knowledge handler received another task type",
             )
-        context.phase("decide")
+        context.phase("acquire")
         game_context = self._context_for(task_input.game_context_id, context.user_scope_id)
-        snapshot_ids = self._published_snapshots(game_context.game_id)
-        if not snapshot_ids:
+        prior = self._task_prior_package(
+            task_input.prior_package_id, game_context, context.user_scope_id
+        )
+        if prior is not None and self._coverage_complete(prior):
+            # Nothing is missing for this scope: reuse the published package
+            # instead of manufacturing an identical new version.
             return HandlerOutcome(
+                state=TaskState.completed,
+                domain_result=DomainResult(
+                    domain=TaskType.knowledge,
+                    code=CollectionResult.completed_scope.value,
+                    input_revision=context.task_input_revision,
+                    checks=[_rule_check(
+                        "collection.reuse",
+                        CheckStatus.pass_,
+                        "the prior package already covers every declared cell; no"
+                        " provider call was made",
+                    )],
+                ),
+                result_refs=[ObjectRef(
+                    entity_type="KnowledgePackage", entity_id=prior.id,
+                )],
+            )
+
+        context.phase("collect")
+        run = self._collect(
+            context, game_context, prior,
+            started_at=context.service.get_task(context.task_id).task.created_at,
+        )
+
+        snapshot_ids = self._published_snapshots(game_context.game_id)
+        if run.sources:
+            context.phase("extract")
+            started_at = run.started_at
+            writer = CollectionSnapshotWriter(
+                self.repository, self.files, clock=self.clock
+            )
+            group, mapping_id = writer.write(
+                task_id=context.task_id,
+                run_id=f"run-{context.task_id}",
+                game_series_id=game_context.game_id,
+                user_scope_id=context.user_scope_id,
+                started_at=started_at,
+                collection_result=(
+                    CollectionResult.partial_scope
+                    if run.unknown_call
+                    else self._collection_result(run)
+                ),
+                stop_reason=run.stop_reason,
+                sources=list(run.sources.values()),
+                gaps=self._remaining_gaps(run, task_input.prior_package_id),
+            )
+            imported = ImportPublisher(self.repository, self.files).publish(
+                frozen=group,
+                game_context_id=game_context.id,
+                mapping_version="collector-import/1",
+                identity_mapping_ids=[mapping_id],
+                user_scope_id=context.user_scope_id,
+                idempotency_key=(
+                    f"collection-import:{context.task_id}:{context.task_input_revision}"
+                ),
+                created_by_task_id=context.task_id,
+            )
+            if imported.snapshot_id not in snapshot_ids:
+                snapshot_ids.append(imported.snapshot_id)
+
+        if not snapshot_ids:
+            return self._apply_call_state(HandlerOutcome(
                 state=TaskState.partial,
                 domain_result=DomainResult(
                     domain=TaskType.knowledge,
                     code=CollectionResult.partial_scope.value,
                     input_revision=context.task_input_revision,
-                    checks=[_rule_check(
-                        "package.input",
-                        CheckStatus.unknown,
-                        "no published import snapshot covers this game; nothing was"
-                        " packaged and no gap is invented",
-                    )],
+                    checks=[
+                        _rule_check(
+                            "package.input",
+                            CheckStatus.unknown,
+                            "no published import snapshot covers this game and the"
+                            " collection produced no record; nothing was packaged",
+                        ),
+                        *run.checks(),
+                    ],
                 ),
-                stop_reason=TaskStopReason(kind="collection", code="source_unavailable"),
+                stop_reason=TaskStopReason(
+                    kind="collection",
+                    code=(
+                        run.stop_reason.value
+                        if run.stop_reason is not None
+                        else "source_unavailable"
+                    ),
+                ),
                 result_refs=[ObjectRef(
                     entity_type="GameContext", entity_id=game_context.id,
                 )],
-            )
+            ), run)
 
         context.phase("finalize")
         try:
             built = self.build_package(
                 snapshot_ids,
-                task_input.prior_package_id,
+                prior.id if prior is not None else None,
                 KNOWLEDGE_TASK_SCOPE,
                 game_context_id=task_input.game_context_id,
                 user_scope_id=context.user_scope_id,
                 idempotency_key=f"package:{context.task_id}:{context.task_input_revision}",
+                collection_result=self._collection_result(run),
+                stop_reason=run.stop_reason,
+                collection_execution_ref=ObjectRef(
+                    entity_type="TaskRun", entity_id=context.task_id,
+                ),
             )
         except ContractError as error:
             if error.code is not ErrorCode.PRECONDITION_UNVERIFIED:
                 raise
-            # The snapshots are kept and their diagnostics stay readable; only
-            # the "matched" package is withheld until identity/platform closes.
-            return HandlerOutcome(
+            # The snapshot is kept and its diagnostics stay readable; only the
+            # "matched" package is withheld until identity/platform closes.
+            return self._apply_call_state(HandlerOutcome(
                 state=TaskState.partial,
                 domain_result=DomainResult(
                     domain=TaskType.knowledge,
                     code=CollectionResult.partial_scope.value,
                     input_revision=context.task_input_revision,
-                    checks=[_rule_check("package.identity", CheckStatus.unknown, error.message)],
+                    checks=[
+                        _rule_check("package.identity", CheckStatus.unknown, error.message),
+                        *run.checks(),
+                    ],
                 ),
                 stop_reason=TaskStopReason(kind="collection", code="source_unavailable"),
                 result_refs=[
@@ -1401,11 +1560,11 @@ class KnowledgeService:
                       for snapshot_id in snapshot_ids),
                     ObjectRef(entity_type="GameContext", entity_id=game_context.id),
                 ],
-            )
+            ), run)
 
         package = built.package
-        covered = self._coverage_complete(package)
-        return HandlerOutcome(
+        covered = self._coverage_complete(package) and not run.unknown_call
+        outcome = HandlerOutcome(
             state=TaskState.completed if covered else TaskState.partial,
             domain_result=DomainResult(
                 domain=TaskType.knowledge,
@@ -1415,7 +1574,11 @@ class KnowledgeService:
                     else CollectionResult.partial_scope.value
                 ),
                 input_revision=context.task_input_revision,
-                checks=list(package.checks),
+                checks=[*package.checks, *run.checks()],
+            ),
+            stop_reason=(
+                None if run.stop_reason is None
+                else TaskStopReason(kind="collection", code=run.stop_reason.value)
             ),
             result_refs=[
                 ObjectRef(entity_type="KnowledgePackage", entity_id=package.id),
@@ -1426,6 +1589,275 @@ class KnowledgeService:
                   for snapshot_id in snapshot_ids),
             ],
         )
+        if run.unknown_call:
+            outcome.state = TaskState.partial
+            outcome.error_code = ErrorCode.CALL_OUTCOME_UNKNOWN.value
+            outcome.stop_reason = TaskStopReason(kind="execution", code="process_exit")
+        return outcome
+
+    @staticmethod
+    def _apply_call_state(
+        outcome: HandlerOutcome, run: "_CollectionRun"
+    ) -> HandlerOutcome:
+        """An unknown provider call dominates the execution outcome."""
+        if run.unknown_call:
+            outcome.state = TaskState.partial
+            outcome.error_code = ErrorCode.CALL_OUTCOME_UNKNOWN.value
+            outcome.stop_reason = TaskStopReason(kind="execution", code="process_exit")
+        return outcome
+
+    # -- collection --------------------------------------------------------
+    def _task_prior_package(
+        self, prior_package_id: str | None, game_context: GameContext, user_scope_id: str
+    ) -> KnowledgePackage | None:
+        series_id = package_series_id(game_context.game_id, KNOWLEDGE_TASK_SCOPE)
+        if prior_package_id is not None:
+            prior = self.get_package(
+                prior_package_id, user_scope_id=user_scope_id, verify_artifacts=False
+            )
+            if prior.series_id != series_id:
+                raise ContractError(
+                    ErrorCode.REFERENCE_INVALID,
+                    "the prior package belongs to another game or declared scope",
+                )
+            return prior
+        with self.repository.unit_of_work() as uow:
+            latest = uow.latest_for_series("KnowledgePackage", series_id)
+        if latest is None:
+            return None
+        candidate = KnowledgePackage.model_validate_json(latest.payload_bytes)
+        if candidate.publication_status is not PublicationStatus.published:
+            return None
+        return candidate
+
+    def _initial_gaps(self, prior: KnowledgePackage | None) -> list[GapSpec]:
+        if prior is None:
+            return [GapSpec(
+                key="coverage.seed",
+                priority="P0",
+                operation_scope=KNOWLEDGE_TASK_SCOPE,
+                question="collect the declared public graphics facts for this game",
+                expects=("settings", "configurations", "evidence", "environments"),
+            )]
+        gaps: list[GapSpec] = []
+        for gap in [*prior.critical_gaps, *prior.noncritical_gaps]:
+            if gap.status is not GapStatus.open:
+                continue
+            cell_key = next(
+                (
+                    check.check_id[len("coverage."):]
+                    for check in gap.checks
+                    if check.check_id.startswith("coverage.")
+                ),
+                None,
+            )
+            gaps.append(GapSpec(
+                key=gap.id,
+                priority=gap.priority.value,
+                operation_scope=gap.operation_scope,
+                question=gap.question,
+                expects=_CELL_EXPECTS.get(cell_key or "", ()),
+            ))
+        return gaps
+
+    def _collect(
+        self,
+        context: TaskContext,
+        game_context: GameContext,
+        prior: KnowledgePackage | None,
+        *,
+        started_at: str,
+    ) -> "_CollectionRun":
+        budget = context.budget
+        planner = FollowupPlanner(max_queries_per_gap=budget.max_queries_per_gap)
+        run = _CollectionRun(
+            started_at=started_at,
+            open_gaps={gap.key: gap for gap in self._initial_gaps(prior)},
+        )
+        seen: set[tuple[str, str, str]] = set()
+        rounds_without_gain = 0
+        for _round in range(budget.max_followup_rounds):
+            planned = planner.plan_round(run.open_gaps.values(), used=run.used)
+            if not planned:
+                run.stop_reason = CollectionStopReason.coverage_reached
+                break
+            run.rounds += 1
+            gained = 0
+            stopped = False
+            for step in planned:
+                run.used[step.gap_key] = run.used.get(step.gap_key, 0) + 1
+                try:
+                    reply = context.invoke_provider(
+                        kind="search",
+                        provider_name="stub",
+                        payload={
+                            "query": step.query,
+                            "operation_scope": step.operation_scope,
+                        },
+                    )
+                except BudgetExhausted:
+                    run.stop_reason = CollectionStopReason.budget_exhausted
+                    run.budget_exhausted = True
+                    stopped = True
+                    break
+                except UnknownCall:
+                    run.unknown_call = True
+                    stopped = True
+                    break
+                try:
+                    urls = parse_search_reply(reply)
+                except CollectionProtocolError as error:
+                    run.errors.append(f"search {step.gap_key}: {error}")
+                    continue
+                step_gain = 0
+                for url in urls:
+                    result = self._read_and_extract(context, run, url, step, seen)
+                    if result == "stop":
+                        stopped = True
+                        break
+                    step_gain += result
+                gained += step_gain
+                if step_gain:
+                    run.open_gaps.pop(step.gap_key, None)
+                if stopped:
+                    break
+            if stopped:
+                break
+            if gained:
+                rounds_without_gain = 0
+                run.gained += gained
+            else:
+                rounds_without_gain += 1
+                if rounds_without_gain >= 2:
+                    run.stop_reason = CollectionStopReason.low_information_gain
+                    break
+        if run.stop_reason is None:
+            run.stop_reason = (
+                CollectionStopReason.coverage_reached
+                if not run.open_gaps
+                else CollectionStopReason.budget_exhausted
+            )
+        return run
+
+    def _read_and_extract(
+        self,
+        context: TaskContext,
+        run: "_CollectionRun",
+        url: str,
+        step: Any,
+        seen: set[tuple[str, str, str]],
+    ) -> int | str:
+        """One read and one extraction per URL; several bad rows share both."""
+        url = canonical_url(url)
+        if url in run.read_urls:
+            return 0
+        if len(run.read_urls) >= context.budget.max_urls:
+            run.stop_reason = CollectionStopReason.budget_exhausted
+            run.budget_exhausted = True
+            return "stop"
+        try:
+            read_reply = context.invoke_provider(
+                kind="read", provider_name="stub", payload={"url": url},
+            )
+        except BudgetExhausted:
+            run.stop_reason = CollectionStopReason.budget_exhausted
+            run.budget_exhausted = True
+            return "stop"
+        except UnknownCall:
+            run.unknown_call = True
+            return "stop"
+        run.read_urls.add(url)
+        scope_id = source_scope_id(url)
+        try:
+            extract_reply = context.invoke_provider(
+                kind="model",
+                provider_name="stub",
+                payload={
+                    "url": url,
+                    "document": (
+                        read_reply.get("document")
+                        if isinstance(read_reply, dict) else None
+                    ),
+                },
+                requested_model="stub-model",
+                prompt_version="collector-extract/1",
+                output_schema_version="extraction/0.1",
+            )
+        except BudgetExhausted:
+            run.stop_reason = CollectionStopReason.budget_exhausted
+            run.budget_exhausted = True
+            return "stop"
+        except UnknownCall:
+            run.unknown_call = True
+            return "stop"
+        try:
+            records, errors = parse_extraction_reply(
+                extract_reply, scope_id=scope_id
+            )
+        except CollectionProtocolError as error:
+            run.errors.append(f"extract {scope_id}: {error}")
+            return 0
+        run.errors.extend(errors)
+        retrieved_at = (
+            extract_reply.get("retrieved_at")
+            if isinstance(extract_reply, dict)
+            and isinstance(extract_reply.get("retrieved_at"), str)
+            else run.started_at
+        )
+        source = run.sources.get(scope_id)
+        if source is None:
+            source = CollectedSource(
+                scope_id=scope_id,
+                url=url,
+                revision_id=source_revision_id(url),
+                retrieved_at=retrieved_at,
+                model_requested="stub-model",
+                raw_extraction=(
+                    extract_reply if isinstance(extract_reply, dict) else {}
+                ),
+            )
+            run.sources[scope_id] = source
+        gained = 0
+        for record in records:
+            key = (scope_id, record.record_type, record.local_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            source.records.append(record)
+            if record.record_type in step.expects:
+                gained += 1
+        return gained
+
+    @staticmethod
+    def _collection_result(run: "_CollectionRun") -> CollectionResult:
+        if run.stop_reason is CollectionStopReason.coverage_reached and not run.open_gaps:
+            return CollectionResult.completed_scope
+        return CollectionResult.partial_scope
+
+    def _remaining_gaps(
+        self, run: "_CollectionRun", prior_package_id: str | None
+    ) -> list[CollectedGap]:
+        gaps = [
+            CollectedGap(
+                gap_id=gap.key if len(gap.key) <= 64 else gap.key[:64],
+                priority=gap.priority,
+                question=gap.question,
+                reason="not closed by the collected evidence",
+                field="coverage",
+                status="open",
+            )
+            for gap in run.open_gaps.values()
+        ]
+        for index, error in enumerate(run.errors):
+            gaps.append(CollectedGap(
+                gap_id=f"read-error-{index + 1}",
+                priority="P1",
+                question="re-read the source or correct the extraction",
+                reason=error,
+                field="record",
+                status="open",
+            ))
+        return gaps
 
     def precheck_collection(
         self, task_input: Any, *, user_scope_id: str
@@ -1525,9 +1957,7 @@ class KnowledgeService:
         game = self._game_for_context(game_context, user_scope_id)
         self._require_publishable_identity(game)
         platform_scope = self._platform_scope(game_context)
-        series_id = uuid5(
-            _PACKAGE_NS, f"package-series:{game_context.game_id}:{declared_scope}"
-        ).hex
+        series_id = package_series_id(game_context.game_id, declared_scope)
         prior = self._prior_package(prior_package_id, series_id)
         records, diagnostics = self._snapshot_members(snapshot_ids, game_context.game_id)
         self._require_dependency_closure(records)
@@ -1539,6 +1969,13 @@ class KnowledgeService:
             diagnostics=diagnostics,
             image_required=image_required,
         )
+        if collection_result is CollectionResult.completed_scope and not all(
+            cell.status in (CoverageStatus.covered, CoverageStatus.not_applicable)
+            for cell in cells
+        ):
+            # 02 §4: completed_scope needs every declared cell covered or
+            # provably not applicable; a run that stopped early cannot claim it.
+            collection_result = CollectionResult.partial_scope
         critical = [gap for gap in gaps if gap.priority is GapPriority.P0]
         noncritical = [gap for gap in gaps if gap.priority is not GapPriority.P0]
         package = KnowledgePackage(

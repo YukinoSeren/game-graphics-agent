@@ -55,7 +55,12 @@ class Application:
         )
         self.amendments = AmendmentService(repository, self.files, clock=clock)
         self.identity = IdentityService(repository, self.files)
-        self.performance = PerformanceService(repository, self.files, clock=clock)
+        self.performance = PerformanceService(
+            repository, self.files, clock=clock, tasks=self.tasks
+        )
+        # Analysis is a durable domain task; the entry pre-validates before the
+        # key is consumed, and the handler runs once the task is claimed.
+        self.tasks.handlers["analysis"] = self.performance.handle_analysis
 
     # -- task control -------------------------------------------------------
     def register_task(
@@ -150,6 +155,12 @@ class Application:
 
     def associate_log(self, request: Any, context: MutationContext, **kwargs: Any):
         return self.performance.associate_log(request, context, **kwargs)
+
+    def analyze(self, request: Any, context: MutationContext, **kwargs: Any):
+        return self.performance.analyze(request, context)
+
+    def get_summary(self, summary_id: str, user_scope_id: str):
+        return self.performance.get_summary(summary_id, user_scope_id)
 
     def get_session(self, session_id: str, user_scope_id: str):
         return self.performance.get_session(session_id, user_scope_id)

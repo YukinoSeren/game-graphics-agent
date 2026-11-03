@@ -231,7 +231,9 @@ def test_an_unregistered_task_type_is_rejected_without_creating_a_task(tmp_path)
     with pytest.raises(ContractError) as caught:
         application.register_task(
             {
-                "kind": "analysis",
+                # ``analysis`` is registered by this batch; ``capture`` is not
+                # registered until its handler exists, so it keeps the refusal.
+                "kind": "capture",
                 "artifact_id": _uid(1),
                 "bindings": [],
                 "analyzer_version": "a",

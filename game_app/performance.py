@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable, Mapping, Sequence
 from uuid import UUID, uuid5
@@ -65,11 +66,38 @@ from game_app.contracts.primitives import (
     BindingRef,
     ObjectRef,
     Scalar,
+    TimeRange,
     utc_now,
 )
 from game_app.errors import ContractError, ErrorCode, FieldError, empty_details
 from game_app.files import FileService, PublishHooks
 from game_app import metrics
+from game_app.analyzer import (
+    ANALYZER_VERSION,
+    CLEANING_PROTOCOL_VERSION,
+    TAIL_SAMPLE_FLOOR,
+    ContinuousRun,
+    adaptive_threshold_ms,
+    clean_frames,
+    cleaning_manifest,
+    long_frame_statistics,
+    mean_present_rate,
+    percentile_nearest_rank,
+    quality_for_sample,
+    slowest_tail_inverse_mean,
+    tail_sample_count,
+)
+from game_app.contracts.performance import (
+    AdaptiveLongFrame,
+    MetricDenominator,
+    MetricValue,
+    NumericValueV01,
+    PerformanceSummary,
+)
+from game_app.contracts.tasks import AnalysisInput, DomainResult
+from game_app.contracts.common import TaskAccepted
+from game_app.contracts.enums import LogQuality, TaskState, TaskType
+from game_app.tasks import HandlerOutcome, TaskContext
 from game_app.repository import ProductRepository, UnitOfWork, canonical_json
 
 PRODUCT_CONTRACT_VERSION = "product-contract/0.4"
@@ -83,6 +111,9 @@ TEST_PROTOCOL_ROUTE = "/api/test-protocols"
 TEST_PROTOCOL_RULE_VERSION = "test-protocol/0.4"
 LOG_ASSOCIATION_ROUTE = "/api/log-associations"
 LOG_ASSOCIATION_RULE_VERSION = "log-association/0.4"
+ANALYSIS_ROUTE = "/api/analyses"
+ANALYSIS_RULE_VERSION = "analysis/0.4"
+COMPARISON_ROUTE = "/api/comparisons"
 LOG_TARGET_TIME_BASIS = "session"
 SESSION_TIME_BASIS = "session"
 
@@ -178,6 +209,7 @@ class PerformanceService:
         *,
         clock: Callable[[], str] = utc_now,
         log_registry: Any = None,
+        tasks: Any = None,
     ) -> None:
         self.repository = repository
         self.files = files
@@ -185,6 +217,9 @@ class PerformanceService:
         # Only formats verified against an offline sample are enabled; the
         # default registry does not claim PresentMon support.
         self.log_registry = log_registry or default_registry()
+        # Set by Application: analysis is registered as a durable task, so the
+        # submission guards can run *before* a key is consumed.
+        self.tasks = tasks
 
     # -- reads (every read resolves the caller's ownership) ------------------
     def get_session(self, session_id: str, user_scope_id: str) -> PlaySession:
@@ -1810,6 +1845,422 @@ class PerformanceService:
             ObjectRef(entity_type="ManagedFile", entity_id=managed[0].id),
         ]
 
+    # -- deterministic analysis (04 §5/§6) ----------------------------------
+    def analyze(self, request: Any, context: MutationContext) -> TaskAccepted:
+        """Submit an analysis task; pure conflicts are refused before the key.
+
+        The guards run *before* ``register_task`` so an open revision or a
+        missing original never consumes the caller's idempotency key
+        (error-conventions §4.2).
+        """
+        task_input = self._analysis_input(request)
+        self._load_analysis_targets(task_input, context.user_scope_id)
+        if self.tasks is None:
+            raise ContractError(
+                ErrorCode.INTERNAL_ERROR, "the analysis handler is not wired"
+            )
+        return self.tasks.register_task(task_input, context)
+
+    def _analysis_input(self, request: Any) -> AnalysisInput:
+        if isinstance(request, AnalysisInput):
+            return request
+        try:
+            return AnalysisInput.model_validate(request)
+        except Exception as error:  # pydantic ValidationError, no writes yet
+            raise ContractError(
+                ErrorCode.INPUT_VALIDATION_FAILED,
+                "the analysis input is invalid",
+                field_errors=[FieldError(
+                    path="input", code="type", message=str(error).splitlines()[0],
+                )],
+            ) from error
+
+    def _load_artifact(self, uow: UnitOfWork, artifact_id: str) -> CaptureArtifact:
+        stored = uow.find_object("CaptureArtifact", artifact_id)
+        if stored is None:
+            raise ContractError(
+                ErrorCode.RESOURCE_NOT_FOUND, "the requested artifact is not available"
+            )
+        return CaptureArtifact.model_validate_json(stored.payload_bytes)
+
+    def _load_analysis_targets(
+        self, request: AnalysisInput, user_scope_id: str
+    ) -> "_AnalysisTargets":
+        if request.analyzer_version != ANALYZER_VERSION:
+            raise _invalid(
+                "analyzer_version", "enum",
+                "the requested analyzer version is not the packaged one",
+            )
+        if request.cleaning_protocol_version != CLEANING_PROTOCOL_VERSION:
+            raise _invalid(
+                "cleaning_protocol_version", "enum",
+                "the requested cleaning version is not the packaged one",
+            )
+        if not request.bindings:
+            raise _invalid(
+                "bindings", "required", "an analysis names at least one closed binding"
+            )
+        keys = [
+            (item.segment_id, item.segment_revision, item.binding_revision)
+            for item in request.bindings
+        ]
+        if len(set(keys)) != len(keys):
+            raise _invalid("bindings", "conflict", "a binding is listed more than once")
+
+        with self.repository.unit_of_work() as uow:
+            artifact = self._load_artifact(uow, request.artifact_id)
+            session = self._load_session(uow, artifact.session_id)
+            # Visibility first: another user's artifact must be indistinguishable
+            # from a missing one, and the backing original needs an owner too.
+            self._require_session_owner(uow, session, user_scope_id)
+            file_row = uow.find_object("ManagedFile", artifact.file_id)
+            if file_row is None:
+                raise ContractError(
+                    ErrorCode.ARTIFACT_UNAVAILABLE,
+                    "the artifact's original is not registered",
+                )
+            file_payload = file_row.payload
+            if file_payload.get("user_scope_id") != user_scope_id:
+                raise ContractError(
+                    ErrorCode.RESOURCE_NOT_FOUND, "the requested artifact is not available"
+                )
+            if file_payload.get("file_status") != "published":
+                raise ContractError(
+                    ErrorCode.ARTIFACT_UNAVAILABLE,
+                    "the artifact's original is not consumable",
+                )
+            content_hash = file_payload["manifest"]["sha256"]
+
+        for binding_ref in request.bindings:
+            self.require_analyzeable(binding_ref, user_scope_id)
+
+        bindings: list[tuple[SessionSegment, ConfigurationBinding]] = []
+        with self.repository.unit_of_work() as uow:
+            for binding_ref in request.bindings:
+                segment = self._load_segment_revision(
+                    uow, binding_ref.segment_id, binding_ref.segment_revision
+                )
+                binding = self._load_binding(
+                    uow, segment.id, binding_ref.binding_revision
+                )
+                if segment.session_id != artifact.session_id:
+                    raise ContractError(
+                        ErrorCode.REFERENCE_INVALID,
+                        "the artifact and the binding name different sessions",
+                    )
+                if segment.id not in artifact.segment_ids:
+                    raise ContractError(
+                        ErrorCode.REFERENCE_INVALID,
+                        "the artifact does not cover the named segment",
+                    )
+                if binding.effective_range.end is None:
+                    raise ContractError(
+                        ErrorCode.PRECONDITION_UNVERIFIED,
+                        "an open binding cannot be analyzed",
+                    )
+                bindings.append((segment, binding))
+
+        # The managed read re-verifies the bytes against the manifest hash; a
+        # replaced original is never silently analyzed.
+        data = self.files.read_managed_file(artifact.file_id)
+        if hashlib.sha256(data).hexdigest() != content_hash:
+            raise ContractError(
+                ErrorCode.ARTIFACT_UNAVAILABLE,
+                "the artifact's original no longer matches its recorded hash",
+            )
+        return _AnalysisTargets(
+            artifact=artifact,
+            session=session,
+            bindings=bindings,
+            file_payload=file_payload,
+            data=data,
+        )
+
+    def handle_analysis(self, context: TaskContext) -> HandlerOutcome:
+        """Task handler: parse, clean, summarize and publish a new summary."""
+        task_input = context.task_input
+        if not isinstance(task_input, AnalysisInput):
+            raise ContractError(
+                ErrorCode.INPUT_VALIDATION_FAILED,
+                "the analysis handler received another task type",
+            )
+        context.phase("analyze")
+        targets = self._load_analysis_targets(task_input, context.user_scope_id)
+        plan = self._prepare_analysis(task_input, targets)
+        context.phase("finalize")
+        published = self._publish_analysis(
+            task_input, targets, plan,
+            user_scope_id=context.user_scope_id,
+            task_id=context.task_id,
+        )
+        refs = [ObjectRef.model_validate(item) for item in published.refs]
+        state = (
+            TaskState.partial
+            if plan.quality is LogQuality.invalid
+            else TaskState.completed
+        )
+        return HandlerOutcome(
+            state=state,
+            domain_result=DomainResult(
+                domain=TaskType.analysis,
+                code=plan.quality.value,
+                input_revision=context.task_input_revision,
+                checks=list(plan.checks),
+            ),
+            result_refs=refs,
+        )
+
+    def _prepare_analysis(
+        self, request: AnalysisInput, targets: "_AnalysisTargets"
+    ) -> "_AnalysisPlan":
+        parsed = parse_log(
+            targets.data,
+            registry=self.log_registry,
+            evidence=_artifact_evidence(targets.file_payload),
+        )
+        if parsed.format_id != targets.artifact.source_schema:
+            raise ContractError(
+                ErrorCode.PRECONDITION_UNVERIFIED,
+                "the original no longer matches the artifact's verified schema",
+            )
+        mapping = targets.artifact.time_mapping
+        if mapping.scale is None or mapping.offset is None:
+            raise ContractError(
+                ErrorCode.PRECONDITION_UNVERIFIED,
+                "the artifact has no verified time mapping; its frames cannot be placed"
+                " in the session",
+            )
+
+        analyses: list[_BindingCleaning] = []
+        for segment, binding in targets.bindings:
+            window = _analysis_window(segment, binding)
+            cleaning = clean_frames(
+                parsed.frames,
+                time_mapping=mapping,
+                window=window,
+                excluded_ranges=segment.excluded_ranges,
+            )
+            analyses.append(_BindingCleaning(
+                segment=segment, binding=binding, window=window, cleaning=cleaning
+            ))
+
+        stream_problem = _unconfirmed_stream_reason(parsed)
+        confirmed = stream_problem is None
+        stream_reason = None if stream_problem is None else stream_problem[0]
+        stream_unknown = "not_provided" if stream_problem is None else stream_problem[1]
+        # Two candidates are two streams: reporting their merged intervals would
+        # invent a stream nobody selected, so nothing is aggregated at all.
+        mergeable = len(parsed.observed_streams) <= 1
+        intervals = (
+            [interval for item in analyses for interval in item.cleaning.intervals]
+            if mergeable else []
+        )
+        valid_count = len(intervals)
+        duration = sum(intervals) / 1000.0
+
+        if valid_count == 0:
+            quality = LogQuality.invalid
+        else:
+            quality = quality_for_sample(valid_count, duration)
+            quality = LogQuality(quality)
+            if not confirmed:
+                quality = _worse_quality(quality, LogQuality.limited)
+        quality = _worse_quality(quality, parsed.quality)
+
+        now = self.clock()
+        artifact_ref = ObjectRef(
+            entity_type="CaptureArtifact", entity_id=targets.artifact.id
+        )
+        metric_values = [
+            _metric_value(
+                rule,
+                intervals=intervals,
+                confirmed=confirmed,
+                stream_unknown=stream_unknown,
+                stream_kind=parsed.frame_stream_kind,
+                artifact_ref=artifact_ref,
+            )
+            for rule in metrics.RULES
+        ]
+
+        adaptive: list[AdaptiveLongFrame] = []
+        if mergeable:
+            for item in analyses:
+                for run in item.cleaning.runs:
+                    adaptive.append(_adaptive_long_frame(run, item.segment))
+
+        checks = [
+            _analysis_check(
+                "analysis.artifact", CheckStatus.pass_,
+                "the original hash and the artifact's schema were re-verified", now,
+            ),
+            _analysis_check(
+                "analysis.bindings", CheckStatus.pass_,
+                f"{len(analyses)} named closed binding revision(s) were read", now,
+            ),
+            _analysis_check(
+                "analysis.stream",
+                CheckStatus.pass_ if confirmed else CheckStatus.unknown,
+                stream_reason or "the frame stream is confirmed as application_present",
+                now,
+            ),
+            _analysis_check(
+                "analysis.cleaning",
+                CheckStatus.pass_ if valid_count else CheckStatus.unknown,
+                f"{valid_count} valid interval(s) in {len(adaptive)} continuous run(s);"
+                f" {sum(len(item.cleaning.breaks) for item in analyses)} break(s);"
+                " spikes are retained and nothing is reconnected across a break",
+                now,
+            ),
+            _analysis_check(
+                "analysis.sample",
+                CheckStatus.pass_ if quality is LogQuality.valid else CheckStatus.unknown,
+                f"effective duration {duration:.6f}s with {valid_count} interval(s);"
+                " the project's 30s/1000-interval gate decides whether the summary is"
+                " limited",
+                now,
+            ),
+        ]
+
+        manifest = {
+            "kind": "analysis_manifest",
+            "rule_version": ANALYSIS_RULE_VERSION,
+            "analyzer_version": ANALYZER_VERSION,
+            "cleaning_protocol_version": CLEANING_PROTOCOL_VERSION,
+            "artifact_id": targets.artifact.id,
+            "artifact_file_id": targets.artifact.file_id,
+            "source_schema": targets.artifact.source_schema,
+            "source_hash": targets.file_payload["manifest"]["sha256"],
+            "stream_kind": parsed.frame_stream_kind.value,
+            "stream_reason": stream_reason,
+            "bindings": [
+                {
+                    "ref": {
+                        "segment_id": item.binding.segment_id,
+                        "segment_revision": item.segment.revision,
+                        "binding_revision": item.binding.binding_revision,
+                    },
+                    "analyzed_range": item.window.model_dump(mode="json"),
+                    "cleaning": cleaning_manifest(
+                        item.cleaning,
+                        mapping=mapping,
+                        column_map=targets.artifact.source_column_map,
+                    ),
+                }
+                for item in analyses
+            ],
+            "valid_interval_count": valid_count,
+            "effective_duration_s": duration,
+            "quality": quality.value,
+            "metrics": [item.model_dump(mode="json") for item in metric_values],
+            "adaptive_long_frames": [
+                item.model_dump(mode="json") for item in adaptive
+            ],
+        }
+        return _AnalysisPlan(
+            metrics=metric_values,
+            adaptive=adaptive,
+            quality=quality,
+            checks=checks,
+            manifest=manifest,
+            analyzed_ranges=[item.window for item in analyses],
+            valid_interval_count=valid_count,
+            effective_duration_s=duration,
+        )
+
+    def _publish_analysis(
+        self,
+        request: AnalysisInput,
+        targets: "_AnalysisTargets",
+        plan: "_AnalysisPlan",
+        *,
+        user_scope_id: str,
+        task_id: str,
+    ):
+        manifest_bytes = canonical_json(plan.manifest)
+        summary_id = _deterministic_id(user_scope_id, task_id, "summary")
+        now = self.clock()
+        published = self.files.publish(
+            kind="import",
+            files={f"analyses/{task_id}/manifest.json": manifest_bytes},
+            user_scope_id=user_scope_id,
+            method="POST",
+            canonical_route=f"{ANALYSIS_ROUTE}/{task_id}/manifest",
+            key=task_id,
+            request_schema_version=PRODUCT_CONTRACT_VERSION,
+            request_hash=hashlib.sha256(manifest_bytes).hexdigest(),
+            writer=lambda uow, operation, managed: self._write_summary(
+                uow,
+                summary_id=summary_id,
+                task_id=task_id,
+                now=now,
+                request=request,
+                targets=targets,
+                plan=plan,
+                manifest_file_id=managed[0].id,
+            ),
+        )
+        return published
+
+    def _write_summary(
+        self,
+        uow: UnitOfWork,
+        *,
+        summary_id: str,
+        task_id: str,
+        now: str,
+        request: AnalysisInput,
+        targets: "_AnalysisTargets",
+        plan: "_AnalysisPlan",
+        manifest_file_id: str,
+    ) -> list[ObjectRef]:
+        # The summary references the definitions it used; register them in the
+        # same transaction so no dangling definition id is published.
+        self._register_definitions(uow, metrics.RULES, now)
+        summary = PerformanceSummary(
+            id=summary_id,
+            schema_version=PRODUCT_CONTRACT_VERSION,
+            created_at=now,
+            created_by_task_id=task_id,
+            artifact_id=targets.artifact.id,
+            bindings=list(request.bindings),
+            analyzed_ranges=list(plan.analyzed_ranges),
+            analyzer_version=ANALYZER_VERSION,
+            cleaning_protocol_version=CLEANING_PROTOCOL_VERSION,
+            manifest_file_id=manifest_file_id,
+            valid_interval_count=plan.valid_interval_count,
+            effective_duration_s=plan.effective_duration_s,
+            metrics=list(plan.metrics),
+            adaptive_long_frames=list(plan.adaptive),
+            quality=plan.quality,
+            checks=list(plan.checks),
+        )
+        uow.insert_object("PerformanceSummary", summary)
+        uow.insert_reference(summary.id, "artifact", ObjectRef(
+            entity_type="CaptureArtifact", entity_id=targets.artifact.id,
+        ))
+        for segment, binding in targets.bindings:
+            uow.insert_reference(summary.id, "binding", ObjectRef(
+                entity_type="ConfigurationBinding", entity_id=binding.id,
+            ))
+        return [
+            ObjectRef(entity_type="PerformanceSummary", entity_id=summary.id),
+            ObjectRef(entity_type="ManagedFile", entity_id=manifest_file_id),
+        ]
+
+    def get_summary(self, summary_id: str, user_scope_id: str) -> PerformanceSummary:
+        with self.repository.unit_of_work() as uow:
+            stored = uow.find_object("PerformanceSummary", summary_id)
+            if stored is None:
+                raise ContractError(
+                    ErrorCode.RESOURCE_NOT_FOUND, "the requested summary is not available"
+                )
+            summary = PerformanceSummary.model_validate_json(stored.payload_bytes)
+            artifact = self._load_artifact(uow, summary.artifact_id)
+            session = self._load_session(uow, artifact.session_id)
+            self._require_session_owner(uow, session, user_scope_id)
+            return summary
+
     # -- segment internals --------------------------------------------------
     def _segment_and_session(
         self, uow: UnitOfWork, segment_id: str, user_scope_id: str
@@ -2461,6 +2912,218 @@ class PerformanceService:
 
 
 # -- pure helpers -------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _AnalysisTargets:
+    artifact: CaptureArtifact
+    session: PlaySession
+    bindings: list[tuple[SessionSegment, ConfigurationBinding]]
+    file_payload: Mapping[str, Any]
+    data: bytes
+
+
+@dataclass(frozen=True)
+class _BindingCleaning:
+    segment: SessionSegment
+    binding: ConfigurationBinding
+    window: TimeRange
+    cleaning: Any
+
+
+@dataclass(frozen=True)
+class _AnalysisPlan:
+    metrics: list[MetricValue]
+    adaptive: list[AdaptiveLongFrame]
+    quality: LogQuality
+    checks: list[CheckResult]
+    manifest: dict[str, Any]
+    analyzed_ranges: list[TimeRange]
+    valid_interval_count: int
+    effective_duration_s: float
+
+
+_QUALITY_ORDER = {
+    LogQuality.invalid: 0,
+    LogQuality.limited: 1,
+    LogQuality.valid: 2,
+}
+
+
+def _worse_quality(left: LogQuality, right: LogQuality) -> LogQuality:
+    return left if _QUALITY_ORDER[left] <= _QUALITY_ORDER[right] else right
+
+
+def _analysis_check(
+    check_id: str, status: CheckStatus, note: str, now: str
+) -> CheckResult:
+    return CheckResult(
+        check_id=check_id,
+        definition_version=ANALYZER_VERSION,
+        status=status,
+        input_refs=[],
+        evidence_refs=[],
+        checked_at=None if status is CheckStatus.not_run else now,
+        method="deterministic analysis rule",
+        note=note,
+    )
+
+
+def _seconds(value: float, unit: str) -> float:
+    return value if unit == "s" else value / 1000.0
+
+
+def _analysis_window(
+    segment: SessionSegment, binding: ConfigurationBinding
+) -> TimeRange:
+    if segment.end_s is None or binding.effective_range.end is None:
+        raise ContractError(
+            ErrorCode.PRECONDITION_UNVERIFIED,
+            "an open segment or binding cannot be analyzed",
+        )
+    start = max(segment.start_s, _seconds(
+        binding.effective_range.start, binding.effective_range.unit
+    ))
+    end = min(segment.end_s, _seconds(
+        binding.effective_range.end, binding.effective_range.unit
+    ))
+    if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+        raise ContractError(
+            ErrorCode.REFERENCE_INVALID,
+            "the named binding lies outside the named segment revision",
+        )
+    return TimeRange(
+        start=start, end=end, time_basis=segment.time_basis, unit="s",
+    )
+
+
+def _unconfirmed_stream_reason(parsed: Any) -> tuple[str, str] | None:
+    """Why the artifact's stream cannot carry an ``application_present`` metric.
+
+    Returns the human note and the legacy ``NumericValueV01`` unknown reason.
+    """
+    if len(parsed.observed_streams) > 1:
+        return (
+            "the log mixes frame streams without evidence selecting one;"
+            " the streams are not merged",
+            "conflicting",
+        )
+    if parsed.frame_stream_kind is not FrameStreamKind.application_present:
+        return (
+            "the frame stream is not confirmed as application_present;"
+            " the packaged metric definitions do not apply",
+            "scope_ambiguous",
+        )
+    return None
+
+
+def _unknown_numeric(reason: str) -> NumericValueV01:
+    return NumericValueV01(
+        number_kind="unknown",
+        value=None,
+        lower=None,
+        upper=None,
+        unknown_reason=reason,
+    )
+
+
+def _known_numeric(value: float) -> NumericValueV01:
+    return NumericValueV01(
+        number_kind="exact",
+        value=value,
+        lower=None,
+        upper=None,
+        unknown_reason=None,
+    )
+
+
+def _metric_value(
+    rule: Any,
+    *,
+    intervals: Sequence[float],
+    confirmed: bool,
+    stream_unknown: str,
+    stream_kind: FrameStreamKind,
+    artifact_ref: ObjectRef,
+) -> MetricValue:
+    """Compute one packaged rule; insufficient or unconfirmed input is unknown."""
+    if not confirmed:
+        numeric = _unknown_numeric(stream_unknown)
+    elif not intervals:
+        numeric = _unknown_numeric("not_provided")
+    elif rule.metric_key == "average_present_rate":
+        value = mean_present_rate(intervals)
+        numeric = _known_numeric(value) if value is not None else _unknown_numeric(
+            "not_provided"
+        )
+    elif rule.metric_key == "interval_p95_nearest_rank":
+        value = percentile_nearest_rank(intervals, 0.95)
+        numeric = _known_numeric(value) if value is not None else _unknown_numeric(
+            "not_provided"
+        )
+    elif rule.metric_key == "interval_p99_nearest_rank":
+        value = percentile_nearest_rank(intervals, 0.99)
+        numeric = _known_numeric(value) if value is not None else _unknown_numeric(
+            "not_provided"
+        )
+    elif rule.metric_key == "slowest_1pct_inverse_mean":
+        # The raw algorithm value is defined for any sample, but the project's
+        # 20-sample tail gate keeps it away from the user.
+        value = slowest_tail_inverse_mean(intervals)
+        count = tail_sample_count(intervals)
+        if value is None:
+            numeric = _unknown_numeric("not_provided")
+        elif count < TAIL_SAMPLE_FLOOR:
+            numeric = _unknown_numeric("not_provided")
+        else:
+            numeric = _known_numeric(value)
+    else:  # pragma: no cover - the packaged registry is fixed
+        numeric = _unknown_numeric("not_provided")
+
+    denominator = None
+    if rule.metric_key == "average_present_rate" and intervals:
+        total = sum(intervals) / 1000.0
+        if total > 0:
+            denominator = MetricDenominator(
+                value=total, unit="s", input_refs=[artifact_ref],
+            )
+    return MetricValue(
+        definition_id=_metric_definition_id(rule),
+        numeric=numeric,
+        unit=rule.unit,
+        frame_stream_kind=stream_kind,
+        input_refs=[artifact_ref],
+        denominator=denominator,
+        method=rule.algorithm_ref,
+    )
+
+
+def _adaptive_long_frame(run: ContinuousRun, segment: SessionSegment) -> AdaptiveLongFrame:
+    threshold = adaptive_threshold_ms(run.intervals)
+    if threshold is None:  # pragma: no cover - runs always carry intervals
+        return AdaptiveLongFrame(
+            range=TimeRange(
+                start=run.start_s, end=run.end_s,
+                time_basis=segment.time_basis, unit="s",
+            ),
+            threshold_ms=None,
+            cluster_count=None,
+            interval_count=None,
+            long_frame_duration_ms=None,
+            reason="the run carries no valid interval",
+        )
+    clusters, count, duration = long_frame_statistics(run.intervals, threshold)
+    return AdaptiveLongFrame(
+        range=TimeRange(
+            start=run.start_s, end=run.end_s,
+            time_basis=segment.time_basis, unit="s",
+        ),
+        threshold_ms=threshold,
+        cluster_count=clusters,
+        interval_count=count,
+        long_frame_duration_ms=duration,
+        reason=None,
+    )
 
 
 def _unconfirmed_stream(now: str) -> StreamSelection:

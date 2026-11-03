@@ -13,7 +13,12 @@ from typing import Annotated, Literal, Union
 
 from pydantic import Field, field_validator, model_validator
 
-from game_app.contracts.common import CheckResult, EvidenceRef, FieldValue
+from game_app.contracts.common import (
+    CheckResult,
+    EvidenceRef,
+    FieldValue,
+    LegacyUnknownReason,
+)
 from game_app.contracts.device import ProcessIdentity, Resolution
 from game_app.contracts.enums import (
     ConfigurationState,
@@ -26,6 +31,8 @@ from game_app.contracts.primitives import (
     BindingRef,
     Hash,
     ID,
+    NonNegativeInt,
+    ObjectRef,
     Revision,
     Scalar,
     StrictModel,
@@ -489,6 +496,163 @@ class LogAssociationRequest(StrictModel):
         return value
 
 
+# --- deterministic analysis and summaries (04 §6, data §6.2) ----------------
+
+
+class NumericValueV01(StrictModel):
+    """The legacy numeric shape, reused verbatim for measured statistics.
+
+    An unavailable statistic is ``number_kind=unknown`` with a legacy reason;
+    a finite value is never silently omitted and unknown is never stored as 0.
+    """
+
+    number_kind: Literal[
+        "exact", "approximate", "interval", "lower_bound", "upper_bound", "unknown"
+    ]
+    value: int | float | None
+    lower: int | float | None
+    upper: int | float | None
+    unknown_reason: LegacyUnknownReason | None
+
+    @model_validator(mode="after")
+    def shape_matches_kind(self) -> "NumericValueV01":
+        if self.number_kind in {"exact", "approximate"}:
+            valid = (
+                self.value is not None and self.lower is None and self.upper is None
+                and self.unknown_reason is None
+            )
+        elif self.number_kind == "interval":
+            valid = (
+                self.value is None and self.lower is not None and self.upper is not None
+                and self.lower <= self.upper and self.unknown_reason is None
+            )
+        elif self.number_kind == "lower_bound":
+            valid = (
+                self.value is None and self.lower is not None and self.upper is None
+                and self.unknown_reason is None
+            )
+        elif self.number_kind == "upper_bound":
+            valid = (
+                self.value is None and self.upper is not None and self.lower is None
+                and self.unknown_reason is None
+            )
+        else:
+            valid = (
+                self.value is None and self.lower is None and self.upper is None
+                and self.unknown_reason is not None
+            )
+        if not valid:
+            raise ValueError("the numeric value shape does not match its kind")
+        return self
+
+
+class MetricDenominator(StrictModel):
+    value: float
+    unit: str
+    input_refs: list[ObjectRef]
+
+    @field_validator("value")
+    @classmethod
+    def non_negative(cls, value: float) -> float:
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("a denominator is finite and >= 0")
+        return value
+
+    @field_validator("unit")
+    @classmethod
+    def unit_is_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("a denominator names its unit")
+        return value
+
+
+class MetricValue(StrictModel):
+    """One defined statistic; insufficient input stays unknown with a reason."""
+
+    definition_id: ID
+    numeric: NumericValueV01
+    unit: str
+    frame_stream_kind: FrameStreamKind
+    input_refs: list[ObjectRef]
+    denominator: MetricDenominator | None
+    method: str
+
+
+class AdaptiveLongFrame(StrictModel):
+    """One continuous valid run and the segment-adaptive threshold it used.
+
+    ``threshold_ms`` is ``max(50, 2 × the run's median interval)``.  A run with
+    no usable statistics records nulls and a non-blank reason instead of 0.
+    """
+
+    range: TimeRange
+    threshold_ms: float | None
+    cluster_count: int | None
+    interval_count: int | None
+    long_frame_duration_ms: float | None
+    reason: str | None
+
+    @model_validator(mode="after")
+    def shape_matches_data(self) -> "AdaptiveLongFrame":
+        statistics = (
+            self.threshold_ms, self.cluster_count, self.interval_count,
+            self.long_frame_duration_ms,
+        )
+        if any(item is None for item in statistics):
+            if any(item is not None for item in statistics):
+                raise ValueError("adaptive long-frame statistics are all present or all null")
+            if not self.reason or not self.reason.strip():
+                raise ValueError("missing adaptive statistics need a reason")
+        elif self.reason and not self.reason.strip():
+            raise ValueError("a reason must not be blank")
+        if self.threshold_ms is not None and (
+            not math.isfinite(self.threshold_ms) or self.threshold_ms <= 0
+        ):
+            raise ValueError("a long-frame threshold is finite and > 0")
+        if self.interval_count is not None and self.interval_count < 0:
+            raise ValueError("an interval count is >= 0")
+        if self.cluster_count is not None and self.cluster_count < 0:
+            raise ValueError("a cluster count is >= 0")
+        if self.long_frame_duration_ms is not None and self.long_frame_duration_ms < 0:
+            raise ValueError("a long-frame duration is >= 0")
+        return self
+
+
+class PerformanceSummary(StrictModel):
+    """An immutable analysis result; a second run creates a new summary."""
+
+    id: ID
+    schema_version: str
+    created_at: Timestamp
+    created_by_task_id: ID | None
+    artifact_id: ID
+    bindings: list[BindingRef]
+    analyzed_ranges: list[TimeRange]
+    analyzer_version: str
+    cleaning_protocol_version: str
+    manifest_file_id: ID
+    valid_interval_count: NonNegativeInt
+    effective_duration_s: float
+    metrics: list[MetricValue]
+    adaptive_long_frames: list[AdaptiveLongFrame]
+    quality: LogQuality
+    checks: list[CheckResult]
+
+    @field_validator("bindings")
+    @classmethod
+    def has_bindings(cls, value: list[BindingRef]) -> list[BindingRef]:
+        if not value:
+            raise ValueError("a summary names at least one closed binding")
+        return value
+
+    @field_validator("effective_duration_s")
+    @classmethod
+    def duration_is_finite(cls, value: float) -> float:
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("the effective duration is finite and >= 0")
+        return value
+
+
 __all__ = [
     "ColumnMapping",
     "TimeMapping",
@@ -518,4 +682,9 @@ __all__ = [
     "HistoricalLogTarget",
     "LogTarget",
     "LogAssociationRequest",
+    "NumericValueV01",
+    "MetricDenominator",
+    "MetricValue",
+    "AdaptiveLongFrame",
+    "PerformanceSummary",
 ]

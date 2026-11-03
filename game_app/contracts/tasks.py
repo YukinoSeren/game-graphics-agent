@@ -103,6 +103,30 @@ class LogImportInput(StrictModel):
         return value
 
 
+class RecommendationInput(StrictModel):
+    """The exact input snapshot of one recommendation (data §9).
+
+    The input names fixed, immutable ids; it never carries a target FPS, a
+    device field or a scope argument.  ``preference_ids`` is tolerated only as
+    an empty list until 05 exists, and every id list is duplicate-free.
+    """
+
+    kind: Literal["recommendation"]
+    game_context_id: ID
+    device_snapshot_id: ID
+    package_id: ID
+    preference_ids: list[ID] = Field(default_factory=list)
+    applied_id: ID | None = None
+    history_summary_ids: list[ID] = Field(default_factory=list)
+
+    @field_validator("preference_ids", "history_summary_ids")
+    @classmethod
+    def ids_are_unique(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("each id appears once")
+        return value
+
+
 TaskInputPayload = Annotated[
     Union[
         KnowledgeInput,
@@ -180,6 +204,7 @@ __all__ = [
     "CaptureInput",
     "DeviceScanInput",
     "LogImportInput",
+    "RecommendationInput",
     "TaskInputPayload",
     "TaskInputAdapter",
     "DomainResult",

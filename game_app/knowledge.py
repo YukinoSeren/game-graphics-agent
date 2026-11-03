@@ -2684,6 +2684,15 @@ class KnowledgeService:
             return None
         return Source.model_validate_json(source_stored.payload_bytes).canonical_url
 
+    # -- public read-only wrappers -----------------------------------------
+    def resolve_context(self, context_id: str, user_scope_id: str) -> GameContext:
+        """Read a context exactly as the knowledge module does, without writing."""
+        return self._context_for(context_id, user_scope_id)
+
+    def resolve_game(self, game_context: GameContext, user_scope_id: str) -> Game:
+        """Read the game revision a context names, without writing."""
+        return self._game_for_context(game_context, user_scope_id)
+
     # -- helpers -----------------------------------------------------------
     def _context_for(self, context_id: str, user_scope_id: str) -> GameContext:
         stored = self.repository.find_object("GameContext", context_id)

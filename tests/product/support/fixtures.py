@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Literal
 from uuid import UUID, uuid5
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 
 from game_app.contracts.primitives import Hash, NonNegativeInt, Revision, StrictModel, Timestamp
 
@@ -73,6 +73,20 @@ class CaseResult(StrictModel):
     evidence_level: Literal["static_design", "offline_fixture", "integration", "local_effect"]
     observed_files: list[FileEntry]
     failure_notes: list[str]
+    # A result is evidence only when the step actually ran.  ``not_run`` and
+    # ``blocked`` are honest records, never a euphemism for a pass.
+    executed: bool = False
+    requirement_ids: list[str] = []
+    steps: list[str] = []
+    expected_assertions: list[str] = []
+    mock_components: list[str] = []
+    observations: list[str] = []
+
+    @model_validator(mode="after")
+    def passed_requires_execution(self) -> "CaseResult":
+        if self.status == "passed" and not self.executed:
+            raise ValueError("an unexecuted case cannot be recorded as passed")
+        return self
 
 
 class RunManifest(StrictModel):
@@ -167,6 +181,11 @@ class FixtureLoader:
             evidence_level=evidence_level,
             observed_files=[_as_file_entry(item) for item in observed_files],
             failure_notes=list(failure_notes),
+            executed=True,
+            requirement_ids=list(spec.requirement_ids),
+            steps=list(spec.steps),
+            expected_assertions=list(spec.expected_assertions),
+            mock_components=list(spec.mock_components),
         )
 
     def write_report(

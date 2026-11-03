@@ -11,7 +11,7 @@ import hashlib
 import json
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 from uuid import UUID, uuid5
 
 from game_app.contracts.common import (
@@ -1072,6 +1072,26 @@ def image_adapter_status() -> tuple[bool, CheckResult]:
     )
 
 
+def _constraint_applies(
+    payload: Mapping[str, Any], platform_scope: Sequence[str]
+) -> bool:
+    """A constraint with ``when`` predicates applies only if they match.
+
+    Only declarative equality predicates on the package's declared platform are
+    evaluated; any other predicate cannot be decided here, so the constraint is
+    not treated as proved for this package.
+    """
+    when = payload.get("when")
+    if not isinstance(when, dict) or not when:
+        return True
+    for key, value in when.items():
+        if key != "platform":
+            return False
+        if not isinstance(value, str) or value not in platform_scope:
+            return False
+    return True
+
+
 def _text(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
@@ -1146,6 +1166,7 @@ class CoverageEvaluator:
         records: Sequence[ImportedRecord],
         diagnostics: Sequence[ImportedRecord] = (),
         image_required: bool = False,
+        platform_scope: Sequence[str] = (),
     ) -> tuple[list[CoverageCell], list[KnowledgeGap]]:
         by_type: dict[str, list[ImportedRecord]] = {}
         for record in records:
@@ -1153,7 +1174,9 @@ class CoverageEvaluator:
 
         cells: list[CoverageCell] = []
         for key in self.dimensions_for(declared_scope, image_required=image_required):
-            status, basis, note = self._reduce(key, by_type, package_id)
+            status, basis, note = self._reduce(
+                key, by_type, package_id, platform_scope=platform_scope
+            )
             cells.append(CoverageCell(
                 key=key,
                 dimensions={},
@@ -1221,6 +1244,8 @@ class CoverageEvaluator:
         key: str,
         by_type: dict[str, list[ImportedRecord]],
         package_id: str,
+        *,
+        platform_scope: Sequence[str] = (),
     ) -> tuple[CoverageStatus, list[ImportedRecord], str]:
         if key == "graphics.catalog":
             entries = by_type.get("settings", [])
@@ -1268,11 +1293,13 @@ class CoverageEvaluator:
                 record for record in by_type.get("constraints", [])
                 if _payload(record).get("kind") == "exclusion"
                 and _payload(record).get("verified_scope") is True
+                and _constraint_applies(_payload(record), platform_scope)
             ]
             if exclusions:
                 return (
                     CoverageStatus.not_applicable, exclusions,
-                    "a verified exclusion constraint states the capability is not applicable",
+                    "a verified exclusion constraint that applies to this package's"
+                    " platform states the capability is not applicable",
                 )
             observations = [
                 record for record in by_type.get("evidence", [])
@@ -1286,6 +1313,7 @@ class CoverageEvaluator:
             supports = [
                 record for record in by_type.get("constraints", [])
                 if _payload(record).get("kind") in ("support", "exclusion")
+                and _constraint_applies(_payload(record), platform_scope)
             ]
             if supports:
                 return (
@@ -1368,7 +1396,11 @@ class CoverageEvaluator:
                     CoverageStatus.unknown, [],
                     "no accepted version impact or dependency constraint is recorded",
                 )
-            if impacts and all(_text(_payload(item).get("version_raw")) for item in impacts):
+            if impacts and all(
+                _text(_payload(item).get("version_raw"))
+                and _text(_payload(item).get("platform"))
+                for item in impacts
+            ):
                 return (
                     CoverageStatus.covered, impacts,
                     "accepted version impacts name the platform and version they apply to",
@@ -1481,7 +1513,10 @@ class KnowledgeService:
             started_at=context.service.get_task(context.task_id).task.created_at,
         )
 
-        snapshot_ids = self._published_snapshots(game_context.game_id)
+        snapshot_ids = self._published_snapshots(
+            game_context.game_id, context.user_scope_id
+        )
+        produced_snapshot_id: str | None = None
         if run.sources:
             context.phase("extract")
             started_at = run.started_at
@@ -1514,8 +1549,12 @@ class KnowledgeService:
                 ),
                 created_by_task_id=context.task_id,
             )
-            if imported.snapshot_id not in snapshot_ids:
+            if imported.code != "retained_only" and imported.snapshot_id not in snapshot_ids:
+                # A run that gained no usable record is still written as a
+                # standard group for diagnosis, but 02 §4.1 forbids a
+                # retained-only snapshot from being a package member.
                 snapshot_ids.append(imported.snapshot_id)
+                produced_snapshot_id = imported.snapshot_id
 
         if not snapshot_ids:
             return self._apply_call_state(HandlerOutcome(
@@ -1548,6 +1587,11 @@ class KnowledgeService:
             ), run)
 
         context.phase("finalize")
+        # 02 §4: only a package that stands on one real execution may carry
+        # the collection facts.  A follow-up run aggregates the earlier
+        # published snapshots with its own, so the three fields stay null
+        # rather than being back-filled from this run's coverage.
+        single_execution = snapshot_ids == [produced_snapshot_id]
         try:
             built = self.build_package(
                 snapshot_ids,
@@ -1556,10 +1600,15 @@ class KnowledgeService:
                 game_context_id=task_input.game_context_id,
                 user_scope_id=context.user_scope_id,
                 idempotency_key=f"package:{context.task_id}:{context.task_input_revision}",
-                collection_result=self._collection_result(run),
-                stop_reason=run.stop_reason,
-                collection_execution_ref=ObjectRef(
-                    entity_type="TaskRun", entity_id=context.task_id,
+                image_required=True,
+                collection_result=(
+                    self._collection_result(run) if single_execution else None
+                ),
+                stop_reason=run.stop_reason if single_execution else None,
+                collection_execution_ref=(
+                    ObjectRef(entity_type="TaskRun", entity_id=context.task_id)
+                    if single_execution
+                    else None
                 ),
             )
         except ContractError as error:
@@ -1975,15 +2024,26 @@ class KnowledgeService:
             f"{user_scope_id}:{PACKAGE_ROUTE}:{idempotency_key}:{request_hash}",
         ).hex
 
-        # Every guard runs before ``files.publish``: a pure conflict never
-        # consumes the idempotency key (error §4.2).
+        # A registered key replays before every new-submission guard, even if
+        # the world has changed since (error §4.2).  A key registered with
+        # other content is a conflict, not a validation failure.
+        replay = self._replay_build(
+            user_scope_id, idempotency_key, request_schema_version, request_hash
+        )
+        if replay is not None:
+            return replay
+
+        # Every other guard runs before ``files.publish``: a pure conflict
+        # never consumes the idempotency key (error §4.2).
         game_context = self._context_for(game_context_id, user_scope_id)
         game = self._game_for_context(game_context, user_scope_id)
         self._require_publishable_identity(game)
         platform_scope = self._platform_scope(game_context)
         series_id = package_series_id(game_context.game_id, declared_scope)
-        prior = self._prior_package(prior_package_id, series_id)
-        records, diagnostics = self._snapshot_members(snapshot_ids, game_context.game_id)
+        prior = self._prior_package(prior_package_id, series_id, user_scope_id)
+        records, diagnostics = self._snapshot_members(
+            snapshot_ids, game_context.game_id, user_scope_id
+        )
         self._require_dependency_closure(records)
 
         cells, gaps = self.evaluator.evaluate(
@@ -1992,6 +2052,7 @@ class KnowledgeService:
             records=records,
             diagnostics=diagnostics,
             image_required=image_required,
+            platform_scope=platform_scope,
         )
         if collection_result is CollectionResult.completed_scope and not all(
             cell.status in (CoverageStatus.covered, CoverageStatus.not_applicable)
@@ -2166,34 +2227,26 @@ class KnowledgeService:
                 ErrorCode.RESOURCE_NOT_FOUND, "the requested package is not available"
             )
         package = KnowledgePackage.model_validate_json(stored.payload_bytes)
-        if package.publication_status is not PublicationStatus.published:
-            # An unpublished package exists only for the player whose
-            # declaration produced it; everyone else sees nothing.
-            if not self._caller_declared_package(package, user_scope_id):
-                raise ContractError(
-                    ErrorCode.RESOURCE_NOT_FOUND,
-                    "the requested package is not available",
-                )
+        # A package inherits the ownership of the snapshots it was built from:
+        # another player's package (published or not) is indistinguishable from
+        # a missing one, and its originals are never read on their behalf.
+        if not self._caller_owns_package(package, user_scope_id):
+            raise ContractError(
+                ErrorCode.RESOURCE_NOT_FOUND, "the requested package is not available"
+            )
         if verify_artifacts:
             self._verify_package_artifacts(package)
         return package
 
-    def _caller_declared_package(
+    def _caller_owns_package(
         self, package: KnowledgePackage, user_scope_id: str
     ) -> bool:
         with self.repository.unit_of_work() as uow:
             for snapshot_id in package.import_snapshot_ids:
-                row = uow.query(
-                    "SELECT declaration_file_id FROM import_snapshots"
-                    " WHERE import_snapshot_id=?",
-                    (snapshot_id,),
-                )
-                if not row:
-                    continue
-                stored = uow.find_object("ManagedFile", row[0]["declaration_file_id"])
-                if stored is not None and stored.payload.get("user_scope_id") == user_scope_id:
-                    return True
-        return False
+                owner = self._snapshot_owner(uow, snapshot_id)
+                if owner != user_scope_id:
+                    return False
+        return True
 
     def _verify_package_artifacts(self, package: KnowledgePackage) -> None:
         """A consumed package must still locate readable originals (state §8.2)."""
@@ -2554,20 +2607,22 @@ class KnowledgeService:
         return [str(game_context.platform.value)]
 
     def _prior_package(
-        self, prior_package_id: str | None, series_id: str
+        self, prior_package_id: str | None, series_id: str, user_scope_id: str
     ) -> KnowledgePackage | None:
         if prior_package_id is None:
             return None
         stored = self.repository.find_object("KnowledgePackage", prior_package_id)
         if stored is None:
             raise ContractError(
-                ErrorCode.REFERENCE_INVALID,
-                "the prior package does not exist",
-                field_errors=[FieldError(
-                    path="prior_package_id", code="reference", message="unknown package",
-                )],
+                ErrorCode.RESOURCE_NOT_FOUND,
+                "the prior package is not available",
             )
         prior = KnowledgePackage.model_validate_json(stored.payload_bytes)
+        if not self._caller_owns_package(prior, user_scope_id):
+            raise ContractError(
+                ErrorCode.RESOURCE_NOT_FOUND,
+                "the prior package is not available",
+            )
         if prior.publication_status is not PublicationStatus.published:
             raise ContractError(
                 ErrorCode.REFERENCE_INVALID,
@@ -2581,15 +2636,15 @@ class KnowledgeService:
         return prior
 
     def _snapshot_members(
-        self, snapshot_ids: Sequence[str], game_id: str
+        self, snapshot_ids: Sequence[str], game_id: str, user_scope_id: str
     ) -> tuple[list[ImportedRecord], list[ImportedRecord]]:
         records: list[ImportedRecord] = []
         diagnostics: list[ImportedRecord] = []
         with self.repository.unit_of_work() as uow:
             for snapshot_id in snapshot_ids:
                 row = uow.query(
-                    "SELECT import_status, mapped_game_id FROM import_snapshots"
-                    " WHERE import_snapshot_id=?",
+                    "SELECT import_status, mapped_game_id, declaration_file_id"
+                    " FROM import_snapshots WHERE import_snapshot_id=?",
                     (snapshot_id,),
                 )
                 if not row:
@@ -2601,10 +2656,23 @@ class KnowledgeService:
                             message="unknown snapshot",
                         )],
                     )
+                if self._snapshot_owner(uow, snapshot_id) != user_scope_id:
+                    # The declaration file and the frozen originals belong to
+                    # the player who published the import (batch A ruling).
+                    raise ContractError(
+                        ErrorCode.RESOURCE_NOT_FOUND,
+                        "the referenced import snapshot is not available",
+                    )
                 if row[0]["import_status"] != PublicationStatus.published.value:
                     raise ContractError(
                         ErrorCode.REFERENCE_INVALID,
                         "an unpublished import snapshot cannot be a package member",
+                    )
+                if not self._has_usable_records(uow, snapshot_id):
+                    raise ContractError(
+                        ErrorCode.REFERENCE_INVALID,
+                        "a retained-only import snapshot has no usable record and"
+                        " cannot be a package member",
                     )
                 if row[0]["mapped_game_id"] is None:
                     raise ContractError(
@@ -2731,7 +2799,12 @@ class KnowledgeService:
             and not any(gap.status is GapStatus.open for gap in package.critical_gaps)
         )
 
-    def _published_snapshots(self, game_id: str) -> list[str]:
+    def _published_snapshots(self, game_id: str, user_scope_id: str) -> list[str]:
+        """Only this player's published snapshots with a usable record.
+
+        A retained-only import keeps its originals but contributes no facts, and
+        another player's import is never drawn into this player's package.
+        """
         with self.repository.unit_of_work() as uow:
             rows = uow.query(
                 "SELECT import_snapshot_id FROM import_snapshots"
@@ -2739,7 +2812,79 @@ class KnowledgeService:
                 " ORDER BY created_at, rowid",
                 (game_id,),
             )
-        return [row["import_snapshot_id"] for row in rows]
+            return [
+                row["import_snapshot_id"]
+                for row in rows
+                if self._snapshot_owner(uow, row["import_snapshot_id"]) == user_scope_id
+                and self._has_usable_records(uow, row["import_snapshot_id"])
+            ]
+
+    @staticmethod
+    def _snapshot_owner(uow: UnitOfWork, snapshot_id: str) -> str | None:
+        row = uow.query(
+            "SELECT declaration_file_id FROM import_snapshots"
+            " WHERE import_snapshot_id=?",
+            (snapshot_id,),
+        )
+        if not row:
+            return None
+        stored = uow.find_object("ManagedFile", row[0]["declaration_file_id"])
+        if stored is None:
+            return None
+        return stored.payload.get("user_scope_id")
+
+    @staticmethod
+    def _has_usable_records(uow: UnitOfWork, snapshot_id: str) -> bool:
+        row = uow.query(
+            "SELECT COUNT(*) AS n FROM imported_record_keys"
+            " WHERE import_snapshot_id=? AND usable=1",
+            (snapshot_id,),
+        )[0]
+        return int(row["n"]) > 0
+
+    def _replay_build(
+        self,
+        user_scope_id: str,
+        idempotency_key: str,
+        request_schema_version: str,
+        request_hash: str,
+    ) -> PackageBuildResult | None:
+        """Return the original package for a registered key, before any guard."""
+        existing = self.repository.find_idempotency(
+            user_scope_id, "POST", PACKAGE_ROUTE, idempotency_key
+        )
+        if existing is None:
+            return None
+        if existing.lifecycle.value == "tombstoned":
+            raise ContractError(
+                ErrorCode.RESOURCE_GONE,
+                "this submission was cleaned up; start a new logical submission",
+            )
+        if (
+            existing.request_schema_version != request_schema_version
+            or existing.request_hash != request_hash
+        ):
+            raise ContractError(
+                ErrorCode.IDEMPOTENCY_CONFLICT,
+                "the same key was already used with different package content",
+                field_errors=[FieldError(
+                    path="idempotency_key", code="conflict",
+                    message="different request hash",
+                )],
+            )
+        body = json.loads(existing.response_body)
+        refs = [ObjectRef.model_validate(item) for item in body["refs"]]
+        package_id = refs[0].entity_id
+        stored = self.repository.find_object("KnowledgePackage", package_id)
+        if stored is None:
+            raise ContractError(
+                ErrorCode.RESOURCE_NOT_FOUND, "the registered package is not available"
+            )
+        return PackageBuildResult(
+            package=KnowledgePackage.model_validate_json(stored.payload_bytes),
+            declaration_file_id=body["file_ids"][0],
+            refs=refs,
+        )
 
 
 __all__ = [

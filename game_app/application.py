@@ -21,7 +21,7 @@ from game_app.importer import ImportService
 from game_app.knowledge import IdentityService, KnowledgeService
 from game_app.performance import PerformanceService
 from game_app.repository import ProductRepository
-from game_app.tasks import TaskService
+from game_app.tasks import DEFAULT_ROUTES, TaskService
 
 
 class Application:
@@ -145,10 +145,20 @@ class Application:
 
     # -- 02 knowledge entries ----------------------------------------------
     def collect_knowledge(self, task_input: Any, context: MutationContext, **kwargs: Any):
-        """Register a knowledge task; pure conflicts do not consume the key."""
-        self.knowledge.precheck_collection(
-            task_input, user_scope_id=context.user_scope_id
+        """Register a knowledge task; pure conflicts do not consume the key.
+
+        A registered key is replayed before these prechecks: a retry must return
+        the original acceptance (or an IDEMPOTENCY_CONFLICT) even when the
+        world changed since (error §4.2).
+        """
+        registered = self.repository.find_idempotency(
+            context.user_scope_id, "POST", DEFAULT_ROUTES["knowledge"],
+            context.idempotency_key,
         )
+        if registered is None:
+            self.knowledge.precheck_collection(
+                task_input, user_scope_id=context.user_scope_id
+            )
         return self.register_task(task_input, context, **kwargs)
 
     def build_package(self, *args: Any, **kwargs: Any):

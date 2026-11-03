@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from game_app.application import Application
 from game_app.contracts.common import (
     CheckResult,
     EvidenceRef,
@@ -365,6 +366,7 @@ def _publish_import(
     stop_reason: str = "coverage_reached",
     legacy_game_id: str = "0123456789abcdef",
     mapping_game: Game | None = None,
+    user_scope_id: str = SCOPE,
 ) -> str:
     group = _group(
         files,
@@ -385,7 +387,7 @@ def _publish_import(
         game_context_id=context.id,
         mapping_version="collector-import/1",
         identity_mapping_ids=[mapping_id],
-        user_scope_id=SCOPE,
+        user_scope_id=user_scope_id,
         idempotency_key=f"import:{run_id}",
     )
     return result.snapshot_id
@@ -674,8 +676,8 @@ def test_a_multi_run_package_has_no_single_execution_fact(tmp_path):
     assert execution_check.status is CheckStatus.not_run
 
 
-def test_a_fully_covered_import_is_completed_scope(tmp_path):
-    """Coverage, not a product execution, decides the domain result."""
+def test_a_fully_covered_text_scope_still_records_the_image_gap(tmp_path):
+    """The task never claims completion while figures were not read."""
     repository = _repository(tmp_path)
     files = FileService(repository, tmp_path / "managed")
     game = _store_game(repository)
@@ -695,21 +697,232 @@ def test_a_fully_covered_import_is_completed_scope(tmp_path):
     snapshot = _publish_import(repository, files, game, context, records=records)
     service = _service(repository, files)
 
-    built = _build(service, [snapshot], context)
-    assert all(
-        cell.status in (CoverageStatus.covered, CoverageStatus.not_applicable)
-        for cell in built.package.coverage_matrix
-    )
-
-    task = TaskService(repository, provider=SpyProvider(), files=files)
+    task = TaskService(repository, provider=_NoDiscoveryProvider(), files=files)
     task.handlers["knowledge"] = service.handle
     task_input, mutation = _knowledge_input(context)
     accepted = task.register_task(task_input, mutation)
     outcome = task.run_once()
 
-    assert outcome.state is TaskState.completed
+    assert outcome.state is TaskState.partial
     view = task.get_task(accepted.task_id)
-    assert view.task.domain_result.code == "completed_scope"
+    assert view.task.domain_result.code == "partial_scope"
+    with repository.unit_of_work() as uow:
+        package = json.loads(uow.latest_objects("KnowledgePackage")[0].payload_bytes)
+    cells = {cell["key"]: cell for cell in package["coverage_matrix"]}
+    assert cells["graphics.image_figures"]["status"] == "unknown"
+    assert "not_run" in cells["graphics.image_figures"]["note"]
+    assert package["critical_gaps"], "the unread image condition stays a gap"
+
+
+# --- ownership ---------------------------------------------------------------
+
+
+def test_another_players_snapshot_is_never_packaged(tmp_path):
+    repository = _repository(tmp_path)
+    files = FileService(repository, tmp_path / "managed")
+    game = _store_game(repository)
+    context = _store_context(repository, files, game)
+    foreign = _publish_import(
+        repository, files, game, context, run_id="run-foreign",
+        user_scope_id=_uid(4242),
+    )
+
+    with pytest.raises(ContractError) as caught:
+        _build(_service(repository, files), [foreign], context)
+
+    assert caught.value.code is ErrorCode.RESOURCE_NOT_FOUND
+    assert _count(repository, "KnowledgePackage") == 0
+
+
+def test_a_published_package_belongs_to_the_player_who_built_it(tmp_path):
+    repository = _repository(tmp_path)
+    files = FileService(repository, tmp_path / "managed")
+    game = _store_game(repository)
+    context = _store_context(repository, files, game)
+    snapshot = _publish_import(repository, files, game, context)
+    built = _build(_service(repository, files), [snapshot], context)
+
+    with pytest.raises(ContractError) as caught:
+        _service(repository, files).get_package(
+            built.package.id, user_scope_id=_uid(4242)
+        )
+
+    assert caught.value.code is ErrorCode.RESOURCE_NOT_FOUND
+    assert _service(repository, files).get_package(
+        built.package.id, user_scope_id=SCOPE
+    ).id == built.package.id
+
+
+def test_a_retained_only_snapshot_cannot_be_a_package_member(tmp_path):
+    repository = _repository(tmp_path)
+    files = FileService(repository, tmp_path / "managed")
+    game = _store_game(repository)
+    context = _store_context(repository, files, game)
+    # Every record is isolated: the configuration names a setting that is not
+    # in the group, so the snapshot has no usable member at all.
+    snapshot = _publish_import(
+        repository, files, game, context,
+        records=[_record("cfg-9999", "configurations", {
+            "id": "cfg-9999", "name": "Broken", "kind": "resolved_configuration",
+            "assignments": [{
+                "setting_id": "set-9999",
+                "value": {"value_kind": "fixed", "value": "Ultra"},
+                "evidence_ids": ["evi-9999"],
+            }],
+            "preset_reference": None, "environment_ids": [],
+        })],
+    )
+
+    with pytest.raises(ContractError) as caught:
+        _build(_service(repository, files), [snapshot], context)
+
+    assert caught.value.code is ErrorCode.REFERENCE_INVALID
+    assert _count(repository, "KnowledgePackage") == 0
+
+
+# --- replay before new-submission guards -------------------------------------
+
+
+def test_a_registered_key_replays_after_the_world_changed(tmp_path):
+    repository = _repository(tmp_path)
+    files = FileService(repository, tmp_path / "managed")
+    game = _store_game(repository)
+    context = _store_context(repository, files, game)
+    snapshot = _publish_import(repository, files, game, context)
+    service = _service(repository, files)
+    first = _build(service, [snapshot], context, key="pkg-1")
+
+    # The snapshot is no longer usable for a *new* submission.
+    with repository.unit_of_work() as uow:
+        uow.execute(
+            "UPDATE import_snapshots SET import_status='staging'"
+            " WHERE import_snapshot_id=?",
+            (snapshot,),
+        )
+    replay = _build(service, [snapshot], context, key="pkg-1")
+
+    assert replay.package.id == first.package.id
+    assert replay.declaration_file_id == first.declaration_file_id
+    assert _count(repository, "KnowledgePackage") == 1
+
+
+def test_a_registered_key_with_other_content_conflicts_before_validation(tmp_path):
+    repository = _repository(tmp_path)
+    files = FileService(repository, tmp_path / "managed")
+    game = _store_game(repository)
+    context = _store_context(repository, files, game)
+    snapshot = _publish_import(repository, files, game, context)
+    other = _publish_import(repository, files, game, context, run_id="run-2")
+    service = _service(repository, files)
+    _build(service, [snapshot], context, key="pkg-1")
+    with repository.unit_of_work() as uow:
+        uow.execute(
+            "UPDATE import_snapshots SET import_status='staging'"
+            " WHERE import_snapshot_id=?",
+            (other,),
+        )
+
+    with pytest.raises(ContractError) as caught:
+        _build(service, [other], context, key="pkg-1")
+
+    assert caught.value.code is ErrorCode.IDEMPOTENCY_CONFLICT
+
+
+def test_collect_knowledge_replays_before_its_prechecks(tmp_path):
+    repository = _repository(tmp_path)
+    files = FileService(repository, tmp_path / "managed")
+    game = _store_game(repository)
+    context = _store_context(repository, files, game)
+    application = Application(repository, file_root=str(tmp_path / "managed"))
+    task_input, mutation = _knowledge_input(context)
+
+    accepted = application.collect_knowledge(task_input, mutation)
+    # The world changes: the platform is no longer known.
+    with repository.unit_of_work() as uow:
+        stored = uow.find_object("GameContext", context.id)
+        payload = json.loads(stored.payload_bytes)
+    payload["platform"] = {
+        "value_state": "unknown", "value": None, "unknown_reason": "not_provided",
+        "candidates": [], "provenance": [], "acquisition_status": "not_attempted",
+        "attempts": [], "applicability_note": None, "resolution": None,
+    }
+    with repository.unit_of_work() as uow:
+        uow.execute(
+            "UPDATE objects SET payload=? WHERE id=?",
+            (canonical_json(payload), context.id),
+        )
+
+    replay = application.collect_knowledge(task_input, mutation)
+
+    assert replay.task_id == accepted.task_id
+
+
+def test_collect_knowledge_conflicts_before_its_prechecks(tmp_path):
+    repository = _repository(tmp_path)
+    files = FileService(repository, tmp_path / "managed")
+    game = _store_game(repository)
+    context = _store_context(repository, files, game)
+    application = Application(repository, file_root=str(tmp_path / "managed"))
+    task_input, mutation = _knowledge_input(context)
+    application.collect_knowledge(task_input, mutation)
+
+    zero_budget, same_mutation = _knowledge_input(
+        context, key="task-1",
+        max_urls=0, max_searches=0, max_read_calls=0, max_model_calls=0,
+    )
+    with pytest.raises(ContractError) as caught:
+        application.collect_knowledge(zero_budget, same_mutation)
+
+    assert caught.value.code is ErrorCode.IDEMPOTENCY_CONFLICT
+
+
+# --- coverage honesty --------------------------------------------------------
+
+
+def test_version_dependencies_need_the_platform_too(tmp_path):
+    repository = _repository(tmp_path)
+    files = FileService(repository, tmp_path / "managed")
+    game = _store_game(repository)
+    context = _store_context(repository, files, game)
+    records = _dataset()
+    records.append(_record("ver-0001", "version_impacts", {
+        "id": "ver-0001", "evidence_id": "evi-0001", "setting_id": "set-0001",
+        "affected_value": None, "platform": None, "version_raw": "1.0",
+        "effective_date": None,
+    }))
+    snapshot = _publish_import(repository, files, game, context, records=records)
+
+    built = _build(_service(repository, files), [snapshot], context)
+    cell = next(
+        item for item in built.package.coverage_matrix
+        if item.key == "version.dependencies"
+    )
+
+    assert cell.status is CoverageStatus.partially_covered
+
+
+def test_a_console_only_exclusion_does_not_close_display_capabilities(tmp_path):
+    repository = _repository(tmp_path)
+    files = FileService(repository, tmp_path / "managed")
+    game = _store_game(repository)
+    context = _store_context(repository, files, game)
+    records = _dataset()
+    records.append(_record("con-0001", "constraints", {
+        "id": "con-0001", "evidence_id": "evi-0001", "kind": "exclusion",
+        "setting_id": "set-0001", "affected_values": [],
+        "when": {"platform": "console"}, "requires": {},
+        "verified_scope": True, "scope_note": "console versions only",
+    }))
+    snapshot = _publish_import(repository, files, game, context, records=records)
+
+    built = _build(_service(repository, files), [snapshot], context)
+    cell = next(
+        item for item in built.package.coverage_matrix
+        if item.key == "display.capabilities"
+    )
+
+    # The exclusion is about consoles, not this Steam package.
+    assert cell.status is not CoverageStatus.not_applicable
 
 
 def test_private_objects_never_enter_a_package(tmp_path):

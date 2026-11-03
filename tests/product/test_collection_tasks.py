@@ -326,17 +326,18 @@ def test_budget_exhaustion_keeps_the_members_and_gaps_already_found(tmp_path):
     game = _store_game(repository)
     context = _store_context(repository, files, game)
 
-    # First run: nothing is gained, so the package keeps every cell open.
-    first = _app(repository, files, StubCollectionProvider(empty=True))
+    # First run: the default stub yields records, so a package is published.
+    first = _app(repository, files, StubCollectionProvider())
     task_input, mutation = _knowledge_input(context, key="task-1")
     _accepted, _outcome, _view = _run(first[0], task_input, mutation)
     with repository.unit_of_work() as uow:
         packages = uow.latest_objects("KnowledgePackage")
-    assert packages
+    assert len(packages) == 1
     prior_package_id = packages[0].object_id
 
     # Second run against the open package with a budget that allows one call
-    # of each kind: the first gap is closed, the next search cannot start.
+    # of each kind: the first round gains records, the next search cannot
+    # start, and the package keeps what was found.
     provider = StubCollectionProvider()
     service, _knowledge = _app(repository, files, provider)
     task_input, mutation = _knowledge_input(
@@ -351,9 +352,14 @@ def test_budget_exhaustion_keeps_the_members_and_gaps_already_found(tmp_path):
     with repository.unit_of_work() as uow:
         latest = uow.latest_objects("KnowledgePackage")[0]
     package = json.loads(latest.payload_bytes)
+    assert latest.object_id != prior_package_id
     assert package["record_snapshot_ids"]
     assert package["critical_gaps"]
-    assert package["collection_result"] == "partial_scope"
+    # This package aggregates two runs, so the three execution facts stay null
+    # and only the task reports the stop reason (02 §4).
+    assert package["collection_result"] is None
+    assert package["stop_reason"] is None
+    assert package["collection_execution_ref"] is None
 
 
 def test_one_url_with_several_bad_records_is_read_once(tmp_path):

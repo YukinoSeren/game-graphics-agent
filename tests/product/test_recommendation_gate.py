@@ -435,6 +435,7 @@ def test_numeric_thresholds_and_complex_versions_are_not_executed(tmp_path):
     gate = _gate(repository, files, _input(context, device, package))
     evaluation = ConstraintEvaluator().evaluate(
         _package_records(repository, package), gate.facts,
+        package_id=package.id,
     )
     assert evaluation.exclusions == []
     assert [item.status for item in evaluation.checks] == [

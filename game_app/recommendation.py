@@ -20,10 +20,12 @@ from game_app.contracts.common import (
     FieldValue,
     KnowledgeRecordRef,
     ObjectRef,
+    Provenance,
 )
 from game_app.contracts.configuration import SettingRef
 from game_app.contracts.device import DeviceSnapshot, GameContext
 from game_app.contracts.enums import (
+    AcquisitionMethod,
     AcquisitionStatus,
     CheckStatus,
     FrameStreamKind,
@@ -428,7 +430,11 @@ class ConstraintEvaluator:
         self.clock = clock
 
     def evaluate(
-        self, records: Iterable[ImportedRecord], facts: Mapping[str, str | None]
+        self,
+        records: Iterable[ImportedRecord],
+        facts: Mapping[str, str | None],
+        *,
+        package_id: str,
     ) -> ConstraintEvaluation:
         exclusions: list[ConstraintExclusion] = []
         checks: list[CheckResult] = []
@@ -438,7 +444,9 @@ class ConstraintEvaluator:
                 continue
             if record.upstream_status is not LegacyRecordState.accepted:
                 continue
-            outcome, exclusion, limitation = self._evaluate_one(record, facts)
+            outcome, exclusion, limitation = self._evaluate_one(
+                record, facts, package_id,
+            )
             checks.append(outcome)
             if exclusion is not None:
                 exclusions.append(exclusion)
@@ -449,7 +457,10 @@ class ConstraintEvaluator:
         )
 
     def _evaluate_one(
-        self, record: ImportedRecord, facts: Mapping[str, str | None]
+        self,
+        record: ImportedRecord,
+        facts: Mapping[str, str | None],
+        package_id: str,
     ) -> tuple[CheckResult, ConstraintExclusion | None, str | None]:
         payload = record.payload if isinstance(record.payload, Mapping) else {}
         check_id = "value.constraint"
@@ -469,7 +480,7 @@ class ConstraintEvaluator:
                 _check(
                     check_id, CheckStatus.unknown, clock=self.clock,
                     note=reason, evidence_refs=[_knowledge_evidence(
-                        record.import_snapshot_id, record)],
+                        package_id, record)],
                 ),
                 None,
                 f"constraint {record.local_record_id} is not executable: {reason}",
@@ -512,7 +523,7 @@ class ConstraintEvaluator:
                     setting_id=setting_id,
                     values=values,
                     evidence_ref=_knowledge_evidence(
-                        record.import_snapshot_id, record
+                        package_id, record
                     ),
                 ),
                 None,
@@ -527,7 +538,7 @@ class ConstraintEvaluator:
                     setting_id=setting_id,
                     values=values,
                     evidence_ref=_knowledge_evidence(
-                        record.import_snapshot_id, record
+                        package_id, record
                     ),
                 ),
                 None,
@@ -609,7 +620,9 @@ class CandidateBuilder:
                 (record.capture_scope_id, record.local_record_id), record
             )
         source_facts = self._source_facts(uow, records)
-        evaluation = self.constraints.evaluate(records, gate.facts)
+        evaluation = self.constraints.evaluate(
+            records, gate.facts, package_id=gate.package.id,
+        )
         checks: list[CheckResult] = list(evaluation.checks)
         diagnostics: list[str] = list(evaluation.limitations)
         assessments: list[CandidateAssessment] = []
@@ -1244,6 +1257,13 @@ def validate_actions(
                 "operation.menu", CheckStatus.unknown, clock=clock,
                 note=f"{action_id} states no menu path",
             ))
+        elif kind not in ("set_value", "conditional_strategy") and not menu_path:
+            # An instruction to check, defer or keep needs no menu location;
+            # claiming "known" for an empty path would settle a critical check.
+            checks.append(_check(
+                "operation.menu", CheckStatus.not_applicable, clock=clock,
+                note=f"{action_id} is not an executable value action",
+            ))
         else:
             checks.append(_check(
                 "operation.menu", CheckStatus.pass_, clock=clock,
@@ -1453,11 +1473,22 @@ def _unknown_field(reason: str = "not_provided"):
     )
 
 
-def _known_field(value: Any):
+def _known_field(value: Any, provenance: Provenance):
+    """A known value is only legal with the evidence that produced it."""
     return FieldValue(
         value_state=ValueState.known,
         value=value,
         acquisition_status=AcquisitionStatus.succeeded,
+        provenance=[provenance],
+    )
+
+
+def _source_provenance(package_id: str, record: ImportedRecord, when: str):
+    return Provenance(
+        method=AcquisitionMethod.source_statement,
+        observed_at=None,
+        recorded_at=when,
+        evidence_refs=[_knowledge_evidence(package_id, record)],
     )
 
 
@@ -1738,7 +1769,7 @@ def build_actions(
     actions: list[Any] = []
     checks: list[CheckResult] = []
     limitations: list[str] = []
-    for assignment in _assignment_values(payload):
+    for ordinal, assignment in enumerate(_assignment_values(payload)):
         setting = by_local.get((scope, assignment.setting_id))
         setting_payload = _setting_payload(setting)
         setting_ref = SettingRef(
@@ -1757,8 +1788,14 @@ def build_actions(
         ]
         restart = setting_payload.get("restart_required")
         restart_required = (
-            _known_field(bool(restart))
-            if isinstance(restart, bool) and setting_payload.get("restart_proof")
+            # A restart fact is only ``known`` with its own sourced proof; a
+            # bare boolean would be an unsupported claim (data §5.1).
+            _known_field(
+                bool(restart), _source_provenance(package.id, setting, clock()),
+            )
+            if isinstance(restart, bool)
+            and setting_payload.get("restart_proof")
+            and setting is not None
             else _unknown_field("not_provided")
         )
         group = setting_payload.get("dependency_group")
@@ -1772,8 +1809,14 @@ def build_actions(
         elif assignment.value.value_kind != "fixed":
             kind = "conditional_strategy"
         action = {
+            # The ordinal keeps a configuration that names one setting twice from
+            # producing two actions with one id; it is the payload's own order,
+            # so a retry inside the same task derives the same value.
+            # The ordinal keeps a configuration that names one setting twice from
+            # producing two actions with one id; it is the payload's own order,
+            # so a retry inside the same task derives the same value.
             "action_id": _stable_id(
-                package.id, config.id, assignment.setting_id, kind,
+                package.id, config.id, ordinal, assignment.setting_id, kind,
             ),
             "setting_ref": setting_ref,
             "setting_identity_ref": None,
@@ -2537,7 +2580,10 @@ class RecommendationService:
             user_scope_id=context.user_scope_id,
             applied=gate.applied,
             task_id=context.task_id,
-            extra_checks=reply_checks,
+            # The input gate and the constraint evaluation are critical checks:
+            # dropping them would let an unverified identity or an unreadable
+            # constraint reduce to ``actionable`` (03 §4).
+            extra_checks=[*gate.checks, *screened.checks, *reply_checks],
             extra_limitations=[*screened.diagnostics, *reply_limits],
             clock=self.clock,
         )
@@ -2617,6 +2663,13 @@ class RecommendationService:
         game_context = self.knowledge.resolve_context(
             typed.game_context_id, user_scope_id,
         )
+        # Publication is its own authorization boundary: a caller of this
+        # method with a foreign package or device gets the same answer as a
+        # missing one, whatever ``handle`` did earlier.
+        self.knowledge.get_package(
+            typed.package_id, user_scope_id=user_scope_id,
+            verify_artifacts=False,
+        )
         stored_device = self.repository.find_object(
             "DeviceSnapshot", typed.device_snapshot_id,
         )
@@ -2625,6 +2678,10 @@ class RecommendationService:
                 ErrorCode.RESOURCE_NOT_FOUND, "the device snapshot is not available"
             )
         device = DeviceSnapshot.model_validate_json(stored_device.payload_bytes)
+        if device.user_scope_id != user_scope_id:
+            raise ContractError(
+                ErrorCode.RESOURCE_NOT_FOUND, "the device snapshot is not available"
+            )
         series_id = _stable_id(
             user_scope_id, game_context.game_id, device.device_series_id,
             DECLARED_SCOPE,
@@ -2871,7 +2928,7 @@ class ReviewService:
         notice = ImpactNotice.model_validate_json(stored.payload_bytes)
         # Both packages must belong to this caller.  ``verify_artifacts=False``:
         # a damaged original does not stop a review registration (D-R11).
-        self.knowledge.get_package(
+        old_package = self.knowledge.get_package(
             notice.old_package_id, user_scope_id=user_scope_id,
             verify_artifacts=False,
         )
@@ -2889,74 +2946,86 @@ class ReviewService:
                 return _stored_consumption(row[0])
 
         affected_ids, affected_triples = self._affected_keys(notice)
-        versions = self._owned_versions(user_scope_id)
+        versions = self._owned_versions(
+            user_scope_id, package_series_id=old_package.series_id,
+        )
         matched = [
             version for version in versions
             if _references_affected(version, affected_ids, affected_triples)
         ]
-        states = {version.id: self.derived_state(version.id) for version in matched}
-        current = [
-            version for version in matched
-            if states[version.id] is ReviewState.current
-        ]
-        events = [
-            RecommendationReviewEvent(
-                id=_stable_id(user_scope_id, notice.id, version.id, "needs_review"),
-                schema_version=PRODUCT_VERSION,
-                created_at=self.clock(),
-                created_by_task_id=None,
-                recommendation_id=version.id,
-                previous_state=ReviewState.current,
-                next_state=ReviewState.needs_review,
-                affected_refs=_matching_refs(
-                    version, affected_ids, affected_triples,
-                ),
-                reason=(
-                    f"impact notice {notice.id} changed records this"
-                    " recommendation depends on"
-                ),
-                new_package_id=notice.new_package_id,
-            )
-            for version in current
-        ]
-        if current:
-            outcome = "needs_review"
-        elif any(
-            state is ReviewState.needs_review for state in states.values()
-        ):
-            outcome = "already_needs_review"
-        elif matched:
-            outcome = "superseded_only"
-        else:
-            outcome = "no_affected_dependency"
-
-        recommendation_ids = sorted(version.id for version in matched)
-        event_ids = sorted(event.id for event in events)
-        refs = [ObjectRef(entity_type="ImpactNotice", entity_id=notice.id)]
-        if current:
-            refs.extend(
-                ObjectRef(
-                    entity_type="RecommendationReviewEvent", entity_id=event_id,
-                )
-                for event_id in event_ids
-            )
-            refs.extend(
-                ObjectRef(
-                    entity_type="RecommendationVersion", entity_id=item,
-                )
-                for item in recommendation_ids
-            )
-        result = ResourceResult(refs=refs)
 
         with self.repository.unit_of_work() as uow:
-            # Under BEGIN IMMEDIATE a second delivery cannot interleave here;
-            # the re-check is what makes the notice a one-shot message.
+            # The review state is read under the same write lock that records
+            # the event: a concurrent supersede either lands before this read or
+            # after this commit, so a superseded version is never marked
+            # needs_review by a stale read.  BEGIN IMMEDIATE also makes a second
+            # delivery a replay instead of a second event.
             existing = uow.query(
                 "SELECT * FROM impact_consumptions WHERE user_scope_id=? AND notice_id=?",
                 (user_scope_id, notice.id),
             )
             if existing:
                 return _stored_consumption(existing[0])
+
+            states = {
+                version.id: _derived_state(uow, version.id)
+                for version in matched
+            }
+            current = [
+                version for version in matched
+                if states[version.id] is ReviewState.current
+            ]
+            events = [
+                RecommendationReviewEvent(
+                    id=_stable_id(
+                        user_scope_id, notice.id, version.id, "needs_review",
+                    ),
+                    schema_version=PRODUCT_VERSION,
+                    created_at=self.clock(),
+                    created_by_task_id=None,
+                    recommendation_id=version.id,
+                    previous_state=ReviewState.current,
+                    next_state=ReviewState.needs_review,
+                    affected_refs=_matching_refs(
+                        version, affected_ids, affected_triples,
+                    ),
+                    reason=(
+                        f"impact notice {notice.id} changed records this"
+                        " recommendation depends on"
+                    ),
+                    new_package_id=notice.new_package_id,
+                )
+                for version in current
+            ]
+            if current:
+                outcome = "needs_review"
+            elif any(
+                state is ReviewState.needs_review for state in states.values()
+            ):
+                outcome = "already_needs_review"
+            elif matched:
+                outcome = "superseded_only"
+            else:
+                outcome = "no_affected_dependency"
+
+            recommendation_ids = sorted(version.id for version in matched)
+            event_ids = sorted(event.id for event in events)
+            refs = [ObjectRef(entity_type="ImpactNotice", entity_id=notice.id)]
+            if current:
+                refs.extend(
+                    ObjectRef(
+                        entity_type="RecommendationReviewEvent", entity_id=event_id,
+                    )
+                    for event_id in event_ids
+                )
+                refs.extend(
+                    ObjectRef(
+                        entity_type="RecommendationVersion", entity_id=item,
+                    )
+                    for item in recommendation_ids
+                )
+            result = ResourceResult(refs=refs)
+
             for event in events:
                 uow.insert_object("RecommendationReviewEvent", event)
             uow.execute(
@@ -2999,7 +3068,10 @@ class ReviewService:
                 ))
         return ids, triples
 
-    def _owned_versions(self, user_scope_id: str) -> list[Any]:
+    def _owned_versions(
+        self, user_scope_id: str, *, package_series_id: str | None = None,
+    ) -> list[Any]:
+        from game_app.contracts.knowledge import KnowledgePackage
         from game_app.contracts.recommendation import RecommendationVersion
 
         with self.repository.unit_of_work() as uow:
@@ -3008,12 +3080,33 @@ class ReviewService:
             RecommendationVersion.model_validate_json(row.payload_bytes)
             for row in rows
         ]
-        return [
-            version for version in versions
-            if _recommendation_owned(
+        # A notice only speaks about one package series.  Matching by the
+        # identity triple alone would reach another game that was captured from
+        # the same source ids (a shared settings page), so the series is a
+        # condition of the match, not an optimization.
+        series_of: dict[str, str | None] = {}
+        kept: list[Any] = []
+        for version in versions:
+            if not _recommendation_owned(
                 self.repository, self.knowledge, version, user_scope_id
-            )
-        ]
+            ):
+                continue
+            if package_series_id is not None:
+                package_id = version.input.package_id
+                if package_id not in series_of:
+                    stored = self.repository.find_object(
+                        "KnowledgePackage", package_id
+                    )
+                    series_of[package_id] = (
+                        None if stored is None
+                        else KnowledgePackage.model_validate_json(
+                            stored.payload_bytes
+                        ).series_id
+                    )
+                if series_of[package_id] != package_series_id:
+                    continue
+            kept.append(version)
+        return kept
 
     # -- projection --------------------------------------------------------
 

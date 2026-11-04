@@ -10,24 +10,26 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+import json
+
 import pytest
 
 from game_app.application import Application
 from game_app.contracts.common import MutationContext, ResourceResult
 from game_app.contracts.enums import (
     CheckStatus,
+    GameIdentityStatus,
     RecommendationReadiness,
     ReviewState,
     TaskState,
     TaskType,
-    ValueState,
 )
 from game_app.contracts.primitives import utc_now
 from game_app.errors import ContractError, ErrorCode
 from game_app.knowledge import KnowledgeService
 from game_app.recommendation import (
     DECLARED_SCOPE,
-    InputGate,
+    EXECUTABLE_FACTS,
     RecommendationService,
     ReviewService,
     assess_candidates,
@@ -46,7 +48,7 @@ from tests.product.support.recommendation import (
     dataset,
     external_calls,
     package_records,
-    publish_import,
+    record,
     setup,
     source,
     store_applied,
@@ -152,9 +154,13 @@ def _world(
     applied: bool = True,
     records=None,
     provider: bool = True,
+    game_status: GameIdentityStatus = GameIdentityStatus.verified,
 ):
     repository, files = setup(tmp_path)
-    game = store_game(repository)
+    game = store_game(
+        repository, status=game_status,
+        user=SCOPE if game_status is not GameIdentityStatus.verified else None,
+    )
     context = store_context(repository, files, game)
     device = store_device(repository, files)
     prepared = _ready_records() if records is None else records
@@ -237,6 +243,26 @@ def test_recommend_registers_a_recommendation_task_with_the_canonical_route(tmp_
     assert task.task.state is TaskState.queued
     # Registration writes nothing else: no version exists before a run.
     assert count_objects(world.repository, "RecommendationVersion") == 0
+
+
+def test_the_model_request_carries_no_private_input(tmp_path):
+    world = _world(tmp_path)
+    _run(world)
+
+    request = world.provider.requests[0]["payload"]
+    assert set(request) == {
+        "task", "declared_scope", "device", "game", "candidates",
+    }
+    assert set(request["device"]) <= set(EXECUTABLE_FACTS)
+    serialised = json.dumps(request)
+    # No adopted value, preset, applied id, preference, summary, package id or
+    # device id is ever sent; only the public candidate ids and hardware facts.
+    assert world.applied_id not in serialised
+    assert "Low" not in serialised
+    assert "Synthetic Preset" not in serialised
+    assert world.package.id not in serialised
+    assert world.device.id not in serialised
+    assert request["candidates"][0]["local_record_id"] == "cfg-0001"
 
 
 def test_a_normal_run_publishes_one_version_one_target_and_one_manifest(tmp_path):
@@ -353,6 +379,72 @@ def test_a_candidate_reference_outside_the_package_is_kept_as_a_diagnostic(tmp_p
     )
 
 
+def test_an_unverified_game_revision_never_reaches_actionable(tmp_path):
+    world = _world(tmp_path)
+    # The package was published while the identity was verified; the context
+    # now names a later, merely provisional revision of the same series.
+    from game_app.contracts.knowledge import Game
+    from tests.product.support.recommendation import NOW, check
+
+    provisional = Game(
+        id=uid(612), schema_version="product-contract/0.4", created_at=NOW,
+        created_by_task_id=None, series_id=world.game.series_id, version=2,
+        canonical_name="Synthetic Game", aliases=[], platform_scope=["steam"],
+        identity_status=GameIdentityStatus.provisional,
+        identity_checks=[check()], declaring_user_scope_id=SCOPE,
+    )
+    with world.repository.unit_of_work() as uow:
+        uow.insert_versioned("Game", provisional)
+    context = store_context(
+        world.repository, world.files, provisional,
+        uid_value=613, installation=614,
+    )
+    task_input = _input(
+        context, world.device, world.package, applied_id=world.applied_id,
+    )
+    world.application.recommend(task_input, _context())
+    outcome = world.application.run_once()
+
+    assert outcome is not None and outcome.state is TaskState.completed
+    version = _versions(world.repository)[0]
+    # The gate's verdict is a critical check and must reach the version, not
+    # just the candidate manifest.
+    identity = [
+        check for check in version.checks if check.check_id == "identity.game"
+    ]
+    assert len(identity) == 1
+    assert identity[0].status is CheckStatus.unknown
+    assert version.readiness is not RecommendationReadiness.actionable
+
+
+def test_an_unreadable_constraint_is_kept_in_the_published_checks(tmp_path):
+    records = _ready_records()
+    records.append(record("cns-0001", "constraints", {
+        "id": "cns-0001",
+        "kind": "numeric_threshold",
+        "setting_id": "set-0001",
+        "when": {"vram_gb": 8},
+        "requires": {"dlss": True},
+        "affected_values": ["Ultra"],
+        "verified_scope": True,
+    }))
+    world = _world(tmp_path, records=records)
+    _accepted, outcome, _task = _run(world)
+
+    assert outcome is not None and outcome.state is TaskState.completed
+    version = _versions(world.repository)[0]
+    constraint = [
+        check for check in version.checks if check.check_id == "value.constraint"
+    ]
+    assert len(constraint) == 1
+    # A predicate that cannot be executed is unknown, never silently dropped.
+    assert constraint[0].status is CheckStatus.unknown
+    # Its evidence names the package that holds the record, not an import
+    # snapshot, so a consumer can resolve it.
+    assert constraint[0].evidence_refs[0].record.package_id == world.package.id
+    assert version.readiness is not RecommendationReadiness.actionable
+
+
 def test_without_a_provider_the_run_fails_and_writes_no_external_call(tmp_path):
     world = _world(tmp_path, provider=False)
     _accepted, outcome, task = _run(world)
@@ -366,6 +458,32 @@ def test_without_a_provider_the_run_fails_and_writes_no_external_call(tmp_path):
 
 
 # --- versions and supersession ----------------------------------------------
+
+
+def test_publish_is_its_own_authorization_boundary(tmp_path):
+    world = _world(tmp_path)
+    knowledge = KnowledgeService(world.repository, world.files)
+    service = RecommendationService(world.repository, world.files, knowledge)
+    task_input = _input(
+        world.context, world.device, world.package, applied_id=world.applied_id,
+    )
+    content = build_content(
+        task_input,
+        assess_candidates(
+            task_input, repository=world.repository, knowledge=knowledge,
+            user_scope_id=SCOPE,
+        ),
+        repository=world.repository, knowledge=knowledge, user_scope_id=SCOPE,
+    )
+
+    with pytest.raises(ContractError) as caught:
+        service.publish_recommendation(
+            task_input, content, user_scope_id=OTHER, task_id=uid(5009),
+        )
+
+    assert caught.value.code is ErrorCode.RESOURCE_NOT_FOUND
+    assert count_objects(world.repository, "RecommendationVersion") == 0
+    assert count_objects(world.repository, "TargetProposal") == 0
 
 
 def test_the_same_task_retry_returns_the_same_version_and_a_new_task_makes_another(tmp_path):
@@ -715,6 +833,63 @@ def test_another_players_notice_or_recommendation_is_not_visible(tmp_path):
     assert caught.value.code is ErrorCode.RESOURCE_NOT_FOUND
     assert _events(lineage.repository) == []
     assert _consumptions(lineage.repository) == []
+
+
+def test_a_notice_never_marks_a_recommendation_for_another_game(tmp_path):
+    lineage = _lineage(tmp_path)
+    application, _task_input = _publish_from(lineage, tmp_path, lineage.old)
+    # A second game captured from the same source ids: identical identity
+    # triples, a different game.  A notice about the first game must not touch it.
+    other_game = store_game(
+        lineage.repository, uid_value=610, series=611, name="Other Game",
+    )
+    other_context = store_context(
+        lineage.repository, lineage.files, other_game,
+        uid_value=710, installation=711,
+    )
+    other_package = build_package(
+        lineage.repository, lineage.files, other_game, other_context,
+        key="pkg-other-game", run_id="run-77", records=_ready_records(),
+        sources=[
+            source("src-0001", "rev-0001", content_hash="a" * 64),
+            source("src-0002", "rev-0002", content_hash="c" * 64),
+        ],
+    )
+    other_app = Application(
+        lineage.repository, file_root=str(tmp_path / "managed"),
+        provider=CandidateProvider(
+            reply=_pool_reply(lineage.repository, other_package)
+        ),
+    )
+    other_applied = store_applied(
+        lineage.repository, uid_value=930,
+        game_id=other_game.series_id,
+        installation_id=uid(711),
+        game_context_id=other_context.id,
+        settings=[confirmed_setting(
+            lineage.repository, lineage.files, other_package, "set-0001", "Low",
+        )],
+    )
+    other_app.recommend(
+        _input(
+            other_context, lineage.device, other_package, applied_id=other_applied,
+        ),
+        _context("recommend-other-game"),
+    )
+    assert other_app.run_once().state is TaskState.completed
+    other_version = next(
+        item for item in _versions(lineage.repository)
+        if item.input.package_id == other_package.id
+    )
+    notice = _notice(lineage.repository, lineage.files, lineage.old, lineage.new)
+
+    application.consume_impact(notice.id, _context())
+
+    review = ReviewService(lineage.repository, application.knowledge)
+    assert review.derived_state(other_version.id) is ReviewState.current
+    marked = [event for event in _events(lineage.repository)
+              if event.recommendation_id == other_version.id]
+    assert marked == []
 
 
 def test_a_damaged_member_does_not_block_consumption(tmp_path):

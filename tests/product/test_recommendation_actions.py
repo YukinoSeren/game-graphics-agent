@@ -15,6 +15,7 @@ from game_app.contracts.enums import (
     CheckStatus,
     RecommendationActionKind,
     RecommendationReadiness,
+    ValueState,
 )
 from game_app.contracts.recommendation import TargetProposal
 from game_app.knowledge import KnowledgeService
@@ -598,3 +599,109 @@ def test_a_target_is_immutable_and_writes_no_acceptance(tmp_path):
     with pytest.raises(ValidationError):
         first.note = "rewritten"
     assert count_objects(repository, "TargetAcceptance") == 0
+
+
+def test_two_assignments_for_one_setting_get_distinct_action_ids(tmp_path):
+    records = _applicable(dataset())
+    records[-1]["payload"]["assignments"] = [
+        {"setting_id": "set-0001", "value": {"value_kind": "fixed", "value": "High"},
+         "evidence_ids": ["evi-0001"]},
+        {"setting_id": "set-0001", "value": {"value_kind": "fixed", "value": "Ultra"},
+         "evidence_ids": ["evi-0001"]},
+    ]
+    repository, _, _, _, _, knowledge, task_input, assessments = _world(
+        tmp_path, records=records,
+    )
+    selection = select_baseline(
+        assessments, repository=repository, knowledge=knowledge,
+        user_scope_id=SCOPE,
+    )
+
+    built = build_actions(
+        task_input, selection, repository=repository, knowledge=knowledge,
+        user_scope_id=SCOPE,
+    )
+
+    assert len(built.actions) == 2
+    assert len({action.action_id for action in built.actions}) == 2
+
+
+def test_a_sourced_restart_fact_is_known_and_an_unsourced_one_stays_unknown(tmp_path):
+    sourced = _applicable(dataset(
+        setting_extra={
+            "restart_required": True,
+            "restart_proof": {"url": "https://example.invalid/src-0001"},
+        },
+    ))
+    repository, _, _, _, _, knowledge, task_input, assessments = _world(
+        tmp_path, records=sourced,
+    )
+    selection = select_baseline(
+        assessments, repository=repository, knowledge=knowledge,
+        user_scope_id=SCOPE,
+    )
+    built = build_actions(
+        task_input, selection, repository=repository, knowledge=knowledge,
+        user_scope_id=SCOPE,
+    )
+
+    restart = built.actions[0].restart_required
+    assert restart.value_state is ValueState.known
+    assert restart.value is True
+    assert restart.provenance and restart.provenance[0].evidence_refs
+    content = _content(repository, knowledge, task_input, assessments)
+    restart_check = _by_id(content.checks)["restart.required"]
+    assert restart_check.status is CheckStatus.pass_
+
+    # The same boolean without its proof is not a known fact.
+    unsourced = _applicable(dataset(
+        setting_extra={"restart_required": True},
+    ))
+    repository, _, _, _, _, knowledge, task_input, assessments = _world(
+        tmp_path / "unsourced", records=unsourced,
+    )
+    selection = select_baseline(
+        assessments, repository=repository, knowledge=knowledge,
+        user_scope_id=SCOPE,
+    )
+    built = build_actions(
+        task_input, selection, repository=repository, knowledge=knowledge,
+        user_scope_id=SCOPE,
+    )
+    assert built.actions[0].restart_required.value_state is ValueState.unknown
+
+
+def test_a_non_executable_action_never_claims_a_known_menu(tmp_path):
+    records = _applicable(dataset())
+    records[-1]["payload"]["assignments"] = [
+        {"setting_id": "set-0001", "value": {"value_kind": "fixed", "value": "High"},
+         "evidence_ids": ["evi-0001"]},
+        {"setting_id": "set-0001",
+         "value": {"value_kind": "unknown", "unknown_reason": "not_provided"},
+         "evidence_ids": ["evi-0001"]},
+    ]
+    repository, _, _, _, _, knowledge, task_input, assessments = _world(
+        tmp_path, records=records,
+    )
+    selection = select_baseline(
+        assessments, repository=repository, knowledge=knowledge,
+        user_scope_id=SCOPE,
+    )
+    built = build_actions(
+        task_input, selection, repository=repository, knowledge=knowledge,
+        user_scope_id=SCOPE,
+    )
+    checked = next(
+        action for action in built.actions
+        if action.action is RecommendationActionKind.check_in_game
+    )
+    assert checked.menu_path == []
+
+    checks = validate_actions(
+        task_input, built.actions, repository=repository, knowledge=knowledge,
+        user_scope_id=SCOPE,
+    )
+
+    menu = _by_id(checks)["operation.menu"]
+    assert menu.status is CheckStatus.not_applicable
+    assert "known" not in (menu.note or "")

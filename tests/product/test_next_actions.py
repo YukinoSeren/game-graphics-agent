@@ -7,6 +7,7 @@ a crafted recommendation version whose action chain is the only source of an
 
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
@@ -159,16 +160,47 @@ def _action(
     }
 
 
+_CREATOR_SEQUENCE = [0]
+
+
+def _creator_task(repository, owner: str = USER) -> str:
+    """A persisted task whose scope proves who owns what it created."""
+    _CREATOR_SEQUENCE[0] += 1
+    task_id = uid(
+        int(hashlib.sha256(f"{owner}:{_CREATOR_SEQUENCE[0]}".encode()).hexdigest()[:8], 16)
+    )
+    with repository.unit_of_work() as uow:
+        uow.execute(
+            "INSERT INTO tasks(task_id, type, user_scope_id, parent_id, revision,"
+            " state, current_input_revision, budget, calls, checkpoint_id,"
+            " domain_result, stop_reason, result_refs, cancel_requested,"
+            " last_error_code, active_elapsed_seconds, resume_blocked_unknown_call,"
+            " created_at, updated_at)"
+            " VALUES(?, 'recommendation', ?, NULL, 1, 'completed', 1, ?, ?, NULL,"
+            " NULL, NULL, '[]', 0, NULL, 0, 0, ?, ?)",
+            (
+                task_id, owner,
+                '{"max_urls":12,"max_searches":12,"max_followup_rounds":2,'
+                '"max_queries_per_gap":2,"max_model_calls":16,"max_read_calls":36,'
+                '"max_seconds":null}',
+                '{"search":0,"read":0,"model":0}',
+                "2026-11-01T10:00:00+00:00", "2026-11-01T10:00:00+00:00",
+            ),
+        )
+    return task_id
+
+
 def _recommendation(
     repository, context_id, device_id, actions, *,
-    version_id=None, created_at="2026-11-01T11:00:00+00:00",
+    version_id=None, created_at="2026-11-01T11:00:00+00:00", creator=None,
 ) -> str:
     version_id = version_id or uid(800)
+    creator = creator or _creator_task(repository)
     store_raw(repository, "RecommendationVersion", {
         "id": version_id,
         "schema_version": SCHEMA,
         "created_at": created_at,
-        "created_by_task_id": None,
+        "created_by_task_id": creator,
         "series_id": version_id,
         "version": 1,
         "parent_id": None,
@@ -719,6 +751,31 @@ def test_a_direct_task_registration_repeats_the_ownership_checks(tmp_path):
     assert view.task.state.value == "failed"
     assert view.error.code is ErrorCode.REFERENCE_INVALID
     assert _objects(world.repository, "Diagnosis") == []
+
+
+def test_another_players_recommendation_is_never_read(tmp_path):
+    world = _world(tmp_path)
+    changed, _ = world.definitions.new("阴影质量")
+    foreign = _creator_task(world.repository, OTHER)
+    recommendation_id = _recommendation(
+        world.repository, world.context_id, world.device_id,
+        [_action(changed, 1, 2)], creator=foreign,
+    )
+    applied_id = _adopt(world, recommendation_id, [declaration(changed, value=1)])
+    feedback_id = _feedback(
+        world, {"feeling": "want_improvement"}, raw_text="shadows cost frames",
+    )
+
+    _, _, view = _plan(world, _input(world, [feedback_id], applied_id=applied_id))
+
+    diagnosis = _the_diagnosis(world, view)
+    assert diagnosis["primary_action"] != NextActionKind.adjust.value
+    assert diagnosis["change_set_id"] is None
+    assert _objects(world.repository, "ChangeSet") == []
+    assert any(
+        "recommendation" in gap for hypothesis in diagnosis["hypotheses"]
+        for gap in hypothesis["unknowns"]
+    )
 
 
 def test_another_players_session_is_indistinguishable_from_missing(tmp_path):

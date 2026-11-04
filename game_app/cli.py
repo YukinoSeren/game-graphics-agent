@@ -257,18 +257,29 @@ def _wait(application: Application, accepted: Any, user_scope_id: str) -> Any:
     wait, and its honest state is what gets printed.
     """
     for _ in range(_WAIT_LIMIT):
-        outcome = application.run_once()
+        outcome = application.run_once(user_scope_id=user_scope_id)
         if outcome is None or outcome.task_id == accepted.task_id:
             break
     return application.get_task(accepted.task_id, user_scope_id)
 
 
-def _write_command(args: argparse.Namespace) -> bool:
+def _needs_key(args: argparse.Namespace) -> bool:
     if args.command in {"recommend", "consume-impact"}:
         return True
     if args.command == "task":
         return args.action in {"cancel", "resume"}
     return getattr(args, "action", None) in {"record", "plan", "declare"}
+
+
+def _needs_scope(args: argparse.Namespace) -> bool:
+    """Every caller-facing command needs a local scope; ``task run`` rules it in.
+
+    ``task run`` advances the execution slot on the caller's behalf, so it needs
+    a resolved scope even though it carries no idempotency key.
+    """
+    if _needs_key(args):
+        return True
+    return args.command == "task" and args.action == "run"
 
 
 def _error_exit(error: ContractError, request_id: str) -> int:
@@ -280,8 +291,8 @@ def _error_exit(error: ContractError, request_id: str) -> int:
     return _EXIT_BY_CATEGORY.get(error.category.value, 6)
 
 
-def _run_one(application: Application) -> dict[str, Any]:
-    outcome = application.run_once()
+def _run_one(application: Application, user_scope_id: str | None) -> dict[str, Any]:
+    outcome = application.run_once(user_scope_id=user_scope_id)
     if outcome is None:
         return {"task_id": None, "state": None}
     return {"task_id": outcome.task_id, "state": outcome.state.value}
@@ -330,7 +341,7 @@ def dispatch(application: Application, args: argparse.Namespace) -> Any:
         if args.action == "get":
             return application.get_task(args.task_id, _user_scope(args))
         if args.action == "run":
-            return _run_one(application)
+            return _run_one(application, _user_scope(args))
         if args.action == "cancel":
             return application.cancel_task(args.task_id, _mutation_context(args))
         if args.action == "resume":
@@ -371,9 +382,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         # Resolve the scope and the key before opening the database: a missing
         # local scope or key is a pure validation failure with no write, and a
         # malformed flag is a contract error, not an internal one.
-        if _write_command(args):
+        if _needs_key(args):
             _mutation_context(args)
-        elif args.user_scope or os.environ.get("GAME_APP_USER_SCOPE_ID"):
+        elif _needs_scope(args) or args.user_scope or os.environ.get(
+            "GAME_APP_USER_SCOPE_ID"
+        ):
             _user_scope(args)
         repository = _repository(args)
         application = _application(args, repository)

@@ -46,6 +46,43 @@ SCHEMA = "product-contract/0.4"
 OTHER = "c" * 32
 
 
+def test_a_direct_feedback_registration_repeats_the_ownership_checks(tmp_path):
+    world = _world(tmp_path)
+    typed = _input(world.session_id, world.segment_id)
+    # The original words already exist (saved by the owner's registration).
+    from game_app.feedback import _original_feedback_id
+
+    store_raw(world.repository, "Feedback", {
+        "id": _original_feedback_id(typed),
+        "schema_version": SCHEMA,
+        "created_at": world.clock(),
+        "created_by_task_id": None,
+        "session_id": world.session_id,
+        "segment_id": world.segment_id,
+        "raw_text": typed.raw_text,
+        "selections": dict(typed.selections),
+        "symptoms": [],
+        "interpretation_status": "unparsed",
+    })
+    # A task then arrives through the generic entry claiming another scope: it
+    # must not read the original's words or write a derived interpretation.
+    accepted = world.application.register_task(
+        typed, MutationContext(
+            user_scope_id=OTHER, idempotency_key="foreign", request_id=uid(997),
+        ),
+    )
+    world.application.run_once()
+    view = world.application.get_task(accepted.task_id)
+
+    assert view.task.state.value == "failed"
+    assert view.error.code is ErrorCode.RESOURCE_NOT_FOUND
+    derived = [
+        item for item in _objects(world.repository, "Feedback")
+        if item["interpretation_status"] != "unparsed"
+    ]
+    assert derived == []
+
+
 # --- fixtures ---------------------------------------------------------------
 
 

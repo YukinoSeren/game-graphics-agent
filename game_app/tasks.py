@@ -710,9 +710,13 @@ class TaskService:
             return checkpoint_id
 
     # -- execution -----------------------------------------------------------
-    def run_once(self) -> RunOutcome | None:
-        """Claim at most one queued task; waiting tasks never hold the slot."""
-        claimed = self._claim_next()
+    def run_once(self, *, user_scope_id: str | None = None) -> RunOutcome | None:
+        """Claim at most one queued task; waiting tasks never hold the slot.
+
+        ``user_scope_id`` restricts the claim to that caller's tasks; the
+        internal executor passes nothing and keeps the global single slot.
+        """
+        claimed = self._claim_next(user_scope_id)
         if claimed is None:
             return None
         task_id, task_type, blocked = claimed
@@ -804,11 +808,22 @@ class TaskService:
         )
         return RunOutcome(task_id=task_id, state=state)
 
-    def _claim_next(self) -> tuple[str, TaskType, bool] | None:
+    def _claim_next(
+        self, user_scope_id: str | None = None,
+    ) -> tuple[str, TaskType, bool] | None:
         with self.repository.unit_of_work() as uow:
-            running = uow.query(
-                "SELECT * FROM tasks WHERE state='running' ORDER BY created_at, rowid"
-            )
+            if user_scope_id is None:
+                running = uow.query(
+                    "SELECT * FROM tasks WHERE state='running' ORDER BY created_at, rowid"
+                )
+            else:
+                # A caller-scoped run never looks at another scope's work, not
+                # even to decide that the slot is held.
+                running = uow.query(
+                    "SELECT * FROM tasks WHERE state='running' AND user_scope_id=?"
+                    " ORDER BY created_at, rowid",
+                    (user_scope_id,),
+                )
             if running:
                 # A capture that is already running is re-entered only to honour
                 # a recorded stop intent; anything else keeps the slot.
@@ -826,9 +841,17 @@ class TaskService:
                             bool(row["resume_blocked_unknown_call"]),
                         )
                 return None
-            rows = uow.query(
-                "SELECT * FROM tasks WHERE state='queued' ORDER BY created_at, rowid LIMIT 1"
-            )
+            if user_scope_id is None:
+                rows = uow.query(
+                    "SELECT * FROM tasks WHERE state='queued'"
+                    " ORDER BY created_at, rowid LIMIT 1"
+                )
+            else:
+                rows = uow.query(
+                    "SELECT * FROM tasks WHERE state='queued' AND user_scope_id=?"
+                    " ORDER BY created_at, rowid LIMIT 1",
+                    (user_scope_id,),
+                )
             if not rows:
                 return None
             row = rows[0]

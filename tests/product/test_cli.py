@@ -312,6 +312,81 @@ def test_a_write_refuses_a_missing_key_before_touching_the_database(tmp_path, ca
     assert not missing.exists()
 
 
+def test_task_run_never_executes_another_scopes_task(tmp_path, capsys):
+    fixture = _fixture(tmp_path)
+    path = _input_file(tmp_path, _feedback_payload(fixture, "the scene stutters"))
+    _, out, _ = _run(
+        capsys, _args(fixture, "feedback", "record", "--input", path, key="a"),
+    )
+    task_id = json.loads(out)["task_id"]
+
+    other_code, other_out, _ = _run(
+        capsys, ["task", "run", "--db", fixture.db, "--user-scope", OTHER],
+    )
+
+    assert other_code == 0
+    assert json.loads(other_out) == {"task_id": None, "state": None}
+    stored = ProductRepository(fixture.db)
+    try:
+        with stored.unit_of_work() as uow:
+            row = uow.query("SELECT state FROM tasks WHERE task_id=?", (task_id,))[0]
+    finally:
+        stored.close()
+    assert row["state"] == "queued"
+
+
+def test_wait_only_runs_tasks_belonging_to_the_caller(tmp_path, capsys):
+    fixture = _fixture(tmp_path)
+    foreign_task = _craft_queued_task(fixture, OTHER)
+    own = _input_file(tmp_path, _feedback_payload(fixture, "second"), "second.json")
+
+    code, waited, _ = _run(
+        capsys,
+        _args(fixture, "feedback", "record", "--input", own, key="b", wait=True),
+    )
+
+    assert code == 0
+    assert json.loads(waited)["task"]["state"] == "partial"
+    stored = ProductRepository(fixture.db)
+    try:
+        with stored.unit_of_work() as uow:
+            foreign_state = uow.query(
+                "SELECT state FROM tasks WHERE task_id=?", (foreign_task,),
+            )[0]["state"]
+    finally:
+        stored.close()
+    # The caller's own task ran; the other scope's task was not touched.
+    assert foreign_state == "queued"
+
+
+def _craft_queued_task(fixture, owner: str) -> str:
+    """A queued task that belongs to another local scope."""
+    task_id = "f" * 32
+    stored = ProductRepository(fixture.db)
+    try:
+        with stored.unit_of_work() as uow:
+            uow.execute(
+                "INSERT INTO tasks(task_id, type, user_scope_id, parent_id, revision,"
+                " state, current_input_revision, budget, calls, checkpoint_id,"
+                " domain_result, stop_reason, result_refs, cancel_requested,"
+                " last_error_code, active_elapsed_seconds, resume_blocked_unknown_call,"
+                " created_at, updated_at)"
+                " VALUES(?, 'feedback', ?, NULL, 1, 'queued', 1, ?, ?, NULL, NULL,"
+                " NULL, '[]', 0, NULL, 0, 0, ?, ?)",
+                (
+                    task_id, owner,
+                    '{"max_urls":12,"max_searches":12,"max_followup_rounds":2,'
+                    '"max_queries_per_gap":2,"max_model_calls":16,"max_read_calls":36,'
+                    '"max_seconds":null}',
+                    '{"search":0,"read":0,"model":0}',
+                    "2026-11-01T09:00:00+00:00", "2026-11-01T09:00:00+00:00",
+                ),
+            )
+    finally:
+        stored.close()
+    return task_id
+
+
 def test_the_same_key_and_content_replay_the_same_bytes(tmp_path, capsys):
     fixture = _fixture(tmp_path)
     path = _input_file(tmp_path, _feedback_payload(fixture, "the scene stutters"))
@@ -391,7 +466,9 @@ def test_task_run_reports_the_claimed_task(tmp_path, capsys):
     )
     accepted = json.loads(accepted_out)
 
-    code, out, _ = _run(capsys, ["task", "run", "--db", fixture.db])
+    code, out, _ = _run(
+        capsys, ["task", "run", "--db", fixture.db, "--user-scope", USER],
+    )
 
     payload = json.loads(out)
     assert code == 0

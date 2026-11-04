@@ -101,6 +101,7 @@ class Application:
             adoption=self.adoption,
             performance=self.performance,
             knowledge=self.knowledge,
+            recommendations=self.recommendations,
             clock=clock,
         )
         self.tasks.handlers["feedback"] = self.feedbacks.handle
@@ -151,8 +152,8 @@ class Application:
     def resume_task(self, resume_input: Any, context: MutationContext):
         return self.tasks.resume_task(resume_input, context)
 
-    def run_once(self):
-        return self.tasks.run_once()
+    def run_once(self, user_scope_id: str | None = None):
+        return self.tasks.run_once(user_scope_id=user_scope_id)
 
     def recover_on_startup(self) -> list[str]:
         interrupted = self.tasks.recover_on_startup()

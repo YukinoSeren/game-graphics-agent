@@ -404,6 +404,10 @@ class FeedbackService:
                 ErrorCode.INPUT_VALIDATION_FAILED,
                 "the feedback handler received another task type",
             )
+        # 07 §11 lets any registered task kind reach this handler directly, so
+        # the entry prechecks run again: a task registered without them must not
+        # read another owner's original words.
+        self.precheck(task_input, user_scope_id=context.user_scope_id)
         original_id = _original_feedback_id(task_input)
         original = _load_optional(self.repository, "Feedback", original_id, Feedback)
         if original is None:
@@ -1035,6 +1039,7 @@ class NextActionService:
         adoption: Any | None = None,
         performance: Any | None = None,
         knowledge: Any | None = None,
+        recommendations: Any | None = None,
         clock=utc_now,
     ) -> None:
         self.repository = repository
@@ -1043,6 +1048,7 @@ class NextActionService:
         self.adoption = adoption
         self.performance = performance
         self.knowledge = knowledge
+        self.recommendations = recommendations
         self.clock = clock
 
     # -- registration ------------------------------------------------------
@@ -1452,15 +1458,13 @@ class NextActionService:
             ]
         from game_app.contracts.recommendation import (
             RecommendationActionKind,
-            RecommendationVersion,
         )
 
-        stored = self.repository.find_object(
-            "RecommendationVersion", applied.recommendation_id,
-        )
-        if stored is None:
-            return None, ["the adopted configuration's recommendation is missing"]
-        version = RecommendationVersion.model_validate_json(stored.payload_bytes)
+        version = self._owned_recommendation(applied)
+        if version is None:
+            return None, [
+                "the adopted configuration's recommendation is not available"
+            ]
         executable = [
             action for action in version.actions
             if action.action is RecommendationActionKind.set_value
@@ -1656,6 +1660,42 @@ class NextActionService:
             protected_preference_ids=[item.id for item in protected],
         ), gaps
 
+    def _owned_recommendation(self, applied: AppliedConfiguration) -> Any | None:
+        """Read the applied configuration's recommendation as its owner.
+
+        A recommendation created by another scope (or built from another
+        player's package) is not merely hidden: it is unavailable, so the
+        planner never derives a direction from it.
+        """
+        if applied.recommendation_id is None:
+            return None
+        if self.recommendations is not None:
+            try:
+                return self.recommendations.get_recommendation(
+                    applied.recommendation_id,
+                    user_scope_id=applied.user_scope_id,
+                )
+            except ContractError:
+                return None
+        from game_app.contracts.recommendation import RecommendationVersion
+        from game_app.recommendation import _recommendation_owned
+
+        stored = self.repository.find_object(
+            "RecommendationVersion", applied.recommendation_id,
+        )
+        if stored is None:
+            return None
+        version = RecommendationVersion.model_validate_json(stored.payload_bytes)
+        if self.knowledge is not None and not _recommendation_owned(
+            self.repository, self.knowledge, version, applied.user_scope_id,
+        ):
+            return None
+        if self.knowledge is None:
+            owner = _task_scope(self.repository, version.created_by_task_id)
+            if owner is not None and owner != applied.user_scope_id:
+                return None
+        return version
+
     def _protected_preferences(
         self, user_scope_id: str, game_id: str,
     ) -> list[Preference]:
@@ -1796,9 +1836,8 @@ class NextActionService:
         self, applied: AppliedConfiguration, refused: Sequence[Mapping[str, Any]],
         typed: NextActionInput,
     ) -> bool:
-        from game_app.contracts.recommendation import RecommendationVersion
-
         current_recommendation = applied.recommendation_id
+        current_version = self._owned_recommendation(applied)
         for item in refused:
             base = self.repository.find_object(
                 "AppliedConfiguration", item["base_applied_id"] or "",
@@ -1818,14 +1857,8 @@ class NextActionService:
         )
         if newest is None:
             return False
-        if current_recommendation is not None:
-            stored = self.repository.find_object(
-                "RecommendationVersion", current_recommendation,
-            )
-            if stored is not None:
-                version = RecommendationVersion.model_validate_json(stored.payload_bytes)
-                if version.created_at > newest:
-                    return True
+        if current_version is not None and current_version.created_at > newest:
+            return True
         for summary_id in typed.summary_ids:
             if self.performance is None:
                 break

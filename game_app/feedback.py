@@ -104,6 +104,7 @@ _SYMPTOM_CHECK_ORDER = {
 # E-R12: a critical unknown blocks ``adjust``; the restart hint is not critical.
 _CRITICAL_CHECKS = (
     "change_set.base",
+    "change_set.direction",
     "change_set.old_value",
     "change_set.new_value_evidence",
     "change_set.dependency_group",
@@ -991,6 +992,11 @@ def _latest_by_series(payloads: Sequence[Mapping[str, Any]]) -> list[Mapping[str
     return list(heads.values())
 
 
+def _same_setting_value(left: Any, right: Any) -> bool:
+    """Strict scalar equality: ``True`` and ``1`` are not the same setting value."""
+    return type(left) is type(right) and left == right
+
+
 def _direction(old: Any, new: Any) -> str:
     if isinstance(old, bool) or isinstance(new, bool):
         if old == new:
@@ -1511,6 +1517,25 @@ class NextActionService:
                 )
                 continue
             items.append(_CandidateAction(action=action, old_value=entry.value))
+        effective = [
+            item for item in items
+            if not _same_setting_value(
+                item.old_value.value, item.action.value.value,
+            )
+        ]
+        checks.append(_plan_check(
+            "change_set.direction",
+            CheckStatus.pass_ if effective else CheckStatus.fail,
+            now=now,
+            note=(
+                "every change moves the value away from the frozen base"
+                if effective else
+                "the recommendation's value already equals the frozen base;"
+                " there is no direction to change"
+            ),
+        ))
+        if not effective:
+            gaps.append("there is no real direction to change")
         if old_ok and not old_unknown and len(items) == len(included):
             checks.append(_plan_check(
                 "change_set.old_value", CheckStatus.pass_, now=now,
@@ -1527,7 +1552,7 @@ class NextActionService:
                 note="the base does not contain every changed setting",
             ))
 
-        evidence_ok = all(bool(action.evidence_refs) for action in included)
+        evidence_ok = all(bool(item.action.evidence_refs) for item in effective)
         checks.append(_plan_check(
             "change_set.new_value_evidence",
             CheckStatus.pass_ if evidence_ok else CheckStatus.unknown,
@@ -1620,18 +1645,18 @@ class NextActionService:
             gaps.append("the rollback target is not proven recoverable")
 
         evidence: list[EvidenceRef] = []
-        for action in included:
-            for item in action.evidence_refs:
-                if item not in evidence:
-                    evidence.append(item)
+        for item in effective:
+            for evidence_ref in item.action.evidence_refs:
+                if evidence_ref not in evidence:
+                    evidence.append(evidence_ref)
         if not rollback_ok or old_unknown or len(items) != len(included):
             # The candidate exists for reporting, but it can never be adopted.
             return _Candidate(
-                actions=items, checks=checks, gaps=gaps,
+                actions=effective, checks=checks, gaps=gaps,
                 evidence_refs=evidence, protected_preference_ids=[],
             ), gaps
         return _Candidate(
-            actions=items, checks=checks, gaps=gaps, evidence_refs=evidence,
+            actions=effective, checks=checks, gaps=gaps, evidence_refs=evidence,
             protected_preference_ids=[item.id for item in protected],
         ), gaps
 

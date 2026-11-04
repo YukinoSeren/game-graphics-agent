@@ -479,6 +479,26 @@ def test_an_open_dependency_group_is_refused(tmp_path):
     assert _objects(world.repository, "ChangeSet") == []
 
 
+def test_a_value_already_in_force_is_not_a_change(tmp_path):
+    world = _world(tmp_path)
+    changed, _ = world.definitions.new("阴影质量")
+    recommendation_id = _recommendation(
+        world.repository, world.context_id, world.device_id,
+        [_action(changed, 2, 2)],
+    )
+    applied_id = _adopt(world, recommendation_id, [declaration(changed, value=2)])
+    feedback_id = _feedback(
+        world, {"feeling": "want_improvement"}, raw_text="shadows cost frames",
+    )
+
+    _, _, view = _plan(world, _input(world, [feedback_id], applied_id=applied_id))
+
+    diagnosis = _the_diagnosis(world, view)
+    assert diagnosis["primary_action"] != NextActionKind.adjust.value
+    assert diagnosis["change_set_id"] is None
+    assert _objects(world.repository, "ChangeSet") == []
+
+
 def test_a_refused_direction_is_not_repeated_without_new_evidence(tmp_path):
     world = _world(tmp_path)
     changed, _ = world.definitions.new("阴影质量")

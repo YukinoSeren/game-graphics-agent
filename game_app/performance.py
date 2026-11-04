@@ -2297,6 +2297,47 @@ class PerformanceService:
             ObjectRef(entity_type="ManagedFile", entity_id=manifest_file_id),
         ]
 
+    def summaries_for(
+        self, bindings: Sequence[Any], user_scope_id: str,
+    ) -> list[PerformanceSummary]:
+        """Read-only: the caller's closed, published summaries for a binding set.
+
+        05 uses this to collect repeated samples (E-R19).  A summary is only
+        visible when every one of its bindings is contained in the requested
+        set, belongs to the caller, and names a closed segment and binding; an
+        open revision or another player's summary is skipped, not guessed at.
+        """
+        wanted = {
+            (item.segment_id, item.segment_revision, item.binding_revision)
+            for item in bindings
+        }
+        if not wanted:
+            return []
+        with self.repository.unit_of_work() as uow:
+            rows = uow.query(
+                "SELECT payload FROM objects WHERE entity_type='PerformanceSummary'"
+                " ORDER BY created_at, rowid"
+            )
+        candidates = [
+            PerformanceSummary.model_validate_json(row["payload"]) for row in rows
+        ]
+        result: list[PerformanceSummary] = []
+        for summary in candidates:
+            keys = {
+                (item.segment_id, item.segment_revision, item.binding_revision)
+                for item in summary.bindings
+            }
+            if not keys or not keys <= wanted:
+                continue
+            try:
+                for item in summary.bindings:
+                    self.require_analyzeable(item, user_scope_id)
+            except ContractError:
+                # Invisible (another owner) or not evaluable (open revision).
+                continue
+            result.append(summary)
+        return result
+
     def get_summary(self, summary_id: str, user_scope_id: str) -> PerformanceSummary:
         with self.repository.unit_of_work() as uow:
             stored = uow.find_object("PerformanceSummary", summary_id)

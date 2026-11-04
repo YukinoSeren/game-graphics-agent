@@ -15,8 +15,11 @@ from pydantic import Field, StringConstraints, field_validator, model_validator
 from game_app.contracts.common import CheckResult, EvidenceRef, FieldValue
 from game_app.contracts.configuration import SettingRef
 from game_app.contracts.enums import (
+    EffectAssessment,
     InterpretationStatus,
+    LegacyOutcome,
     NextActionKind,
+    PlayerAcceptance,
     PreferenceExplicitness,
     PreferenceLifecycle,
     PreferenceScope,
@@ -324,6 +327,62 @@ class ChangeSet(StrictModel):
         return self
 
 
+class OutcomeInput(StrictModel):
+    """What the player measured and how they judged it (data §9).
+
+    The client states acceptance only; the effect and the legacy label are
+    derived by the program from the adopted chain and the measured summaries.
+    """
+
+    change_set_id: ID
+    base_applied_id: ID
+    tested_applied_id: ID
+    before_bindings: list[BindingRef]
+    after_bindings: list[BindingRef]
+    comparison_id: ID | None
+    player_acceptance: PlayerAcceptance
+    feedback_ids: list[ID]
+
+    @field_validator("feedback_ids")
+    @classmethod
+    def feedback_ids_are_unique(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("each feedback appears once")
+        return value
+
+
+class ExperimentOutcome(StrictModel):
+    """An immutable result fact; a later correction is a new Outcome.
+
+    ``legacy_outcome`` follows state §5.2 exactly; ``player_acceptance`` and
+    ``effect_assessment`` stay independent dimensions.  A subjective
+    acceptance never turns an unmeasured effect into ``improved``.
+    """
+
+    id: ID
+    schema_version: str
+    created_at: Timestamp
+    created_by_task_id: ID | None
+    change_set_id: ID
+    base_applied_id: ID
+    tested_applied_id: ID
+    before_bindings: list[BindingRef]
+    after_bindings: list[BindingRef]
+    comparison_id: ID | None
+    legacy_outcome: LegacyOutcome
+    player_acceptance: PlayerAcceptance
+    effect_assessment: EffectAssessment
+    feedback_ids: list[ID]
+    evidence_refs: list[EvidenceRef]
+    limitations: list[str]
+
+    @model_validator(mode="after")
+    def quotes_the_derived_dimensions(self) -> "ExperimentOutcome":
+        if not self.evidence_refs:
+            raise ValueError("an outcome names its frozen evaluation evidence")
+        return self
+
+
 __all__ = [
     "Symptom",
     "Feedback",
@@ -339,4 +398,6 @@ __all__ = [
     "Diagnosis",
     "SettingChange",
     "ChangeSet",
+    "OutcomeInput",
+    "ExperimentOutcome",
 ]

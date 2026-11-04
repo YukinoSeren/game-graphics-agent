@@ -19,6 +19,7 @@ from game_app.errors import ContractError, ErrorCode, FieldError
 from game_app.feedback import (
     FeedbackService,
     NextActionService,
+    OutcomeService,
     PreferenceService,
     TargetAcceptanceService,
 )
@@ -105,6 +106,9 @@ class Application:
         # The next-action handler writes a Diagnosis (and, only when every
         # check passes, a ChangeSet); a missing handler would silently succeed.
         self.tasks.handlers["next_action"] = self.next_actions.handle
+        self.outcomes = OutcomeService(
+            repository, self.files, performance=self.performance, clock=clock,
+        )
 
     # -- task control -------------------------------------------------------
     def register_task(
@@ -282,6 +286,12 @@ class Application:
 
     def get_diagnosis(self, diagnosis_id: str, user_scope_id: str):
         return self.next_actions.get_diagnosis(diagnosis_id, user_scope_id)
+
+    def record_outcome(self, request: Any, context: MutationContext, **kwargs: Any):
+        return self.outcomes.record_outcome(request, context, **kwargs)
+
+    def get_outcome(self, outcome_id: str, user_scope_id: str):
+        return self.outcomes.get_outcome(outcome_id, user_scope_id)
 
     # -- 04 performance entries (synchronous, thin wrappers) ----------------
     def create_session(self, request: Any, context: MutationContext, **kwargs: Any):

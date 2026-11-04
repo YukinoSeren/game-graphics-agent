@@ -19,6 +19,7 @@ import hashlib
 import json
 import uuid
 from dataclasses import dataclass
+from statistics import median
 from typing import Any, Mapping, Sequence
 
 from game_app.contracts.common import (
@@ -36,8 +37,11 @@ from game_app.contracts.enums import (
     AcquisitionMethod,
     AcquisitionStatus,
     CheckStatus,
+    EffectAssessment,
     InterpretationStatus,
+    LegacyOutcome,
     NextActionKind,
+    PlayerAcceptance,
     PreferenceExplicitness,
     PreferenceLifecycle,
     PreferenceScope,
@@ -46,11 +50,13 @@ from game_app.contracts.enums import (
 from game_app.contracts.feedback import (
     ChangeSet,
     Diagnosis,
+    ExperimentOutcome,
     Feedback,
     FeedbackInput,
     FeedbackInterpretationLink,
     Hypothesis,
     NextActionInput,
+    OutcomeInput,
     Preference,
     PreferenceDeclaration,
     PreferenceDeclarationInput,
@@ -1863,6 +1869,806 @@ class NextActionService:
                 ErrorCode.RESOURCE_NOT_FOUND, "the change set is not available"
             )
         return change_set
+
+
+OUTCOME_ROUTE = "/api/outcomes"
+EFFECT_POLICY_VERSION = "effect-policy/1"
+OUTCOME_RULE_VERSION = "outcome-checks/0.4"
+_MIN_ROUNDS = 3
+# E-R20: metric direction is fixed by the packaged rule, never re-read from a
+# client.  FPS-like rates improve as they rise; interval (ms) tails improve as
+# they fall.
+_HIGHER_IS_BETTER = frozenset({
+    "average_present_rate", "slowest_1pct_inverse_mean",
+})
+_LOWER_IS_BETTER = frozenset({
+    "interval_p95_nearest_rank", "interval_p99_nearest_rank",
+})
+_PRIMARY_ORDER = (
+    "average_present_rate",
+    "slowest_1pct_inverse_mean",
+    "interval_p99_nearest_rank",
+    "interval_p95_nearest_rank",
+)
+
+
+def _typed_outcome(request: Any) -> OutcomeInput:
+    if isinstance(request, OutcomeInput):
+        return request
+    try:
+        return OutcomeInput.model_validate_json(canonical_json(request))
+    except Exception as error:
+        raise ContractError(
+            ErrorCode.INPUT_VALIDATION_FAILED, "the outcome input is invalid",
+        ) from error
+
+
+def _change_set_owner(repository: Any, change_set: ChangeSet) -> str | None:
+    owner = _task_scope(repository, change_set.created_by_task_id)
+    if owner is not None:
+        return owner
+    # A ChangeSet registered by a synchronous host (or an offline fixture) is
+    # owned through its frozen base, which is a real same-installation record.
+    stored = repository.find_object("AppliedConfiguration", change_set.base_applied_id)
+    return None if stored is None else stored.payload.get("user_scope_id")
+
+
+def _require_change_set(
+    repository: Any, change_set_id: str, user_scope_id: str,
+) -> ChangeSet:
+    stored = repository.find_object("ChangeSet", change_set_id)
+    if stored is None:
+        raise ContractError(
+            ErrorCode.RESOURCE_NOT_FOUND, "the change set is not available"
+        )
+    change_set = ChangeSet.model_validate_json(stored.payload_bytes)
+    if _change_set_owner(repository, change_set) != user_scope_id:
+        raise ContractError(
+            ErrorCode.RESOURCE_NOT_FOUND, "the change set is not available"
+        )
+    return change_set
+
+
+def _binding_key(item: Any) -> tuple[str, int, int]:
+    return (item.segment_id, item.segment_revision, item.binding_revision)
+
+
+def _legacy_reduction(
+    acceptance: PlayerAcceptance, effect: EffectAssessment,
+) -> LegacyOutcome:
+    """state §5.2 exactly: acceptance and effect stay separate dimensions."""
+    if acceptance is PlayerAcceptance.accepted:
+        return LegacyOutcome.accepted
+    if acceptance is PlayerAcceptance.rejected and effect is EffectAssessment.improved:
+        return LegacyOutcome.improved_but_rejected
+    if effect is EffectAssessment.no_clear_change:
+        return LegacyOutcome.no_clear_change
+    if effect is EffectAssessment.worse:
+        return LegacyOutcome.worse
+    return LegacyOutcome.inconclusive
+
+
+def _outcome_check(check_id: str, status: CheckStatus, *, now: str, note: str):
+    return CheckResult(
+        check_id=check_id,
+        definition_version=OUTCOME_RULE_VERSION,
+        status=status,
+        input_refs=[],
+        evidence_refs=[],
+        checked_at=None if status is CheckStatus.not_run else now,
+        method="deterministic outcome rule",
+        note=note,
+    )
+
+
+@dataclass(frozen=True)
+class _MetricRound:
+    definition_id: str
+    metric_key: str
+    direction: str
+    before_median: float
+    after_median: float
+    before_range: float
+    after_range: float
+    delta: float
+    beyond_fluctuation: bool
+
+
+class OutcomeService:
+    """FBK-T03: verify the adopted chain, then reduce an immutable outcome."""
+
+    def __init__(
+        self, repository: Any, files: Any, *, performance: Any, clock=utc_now,
+    ) -> None:
+        self.repository = repository
+        self.files = files
+        self.performance = performance
+        self.clock = clock
+
+    # -- entry -------------------------------------------------------------
+    def record_outcome(
+        self,
+        request: Any,
+        context: MutationContext,
+        *,
+        request_schema_version: str = PRODUCT_CONTRACT_VERSION,
+    ) -> ResourceResult:
+        typed = _typed_outcome(request)
+        request_hash = _hash(OUTCOME_ROUTE, request_schema_version, typed)
+        with self.repository.unit_of_work() as uow:
+            replay = _replay_result(
+                uow, context, OUTCOME_ROUTE, request_schema_version, request_hash,
+            )
+            if replay is not None:
+                return replay
+        # Verification strictly precedes any write: a pure conflict never
+        # consumes the key and never leaves a false Outcome.
+        prepared = self.precheck(typed, context.user_scope_id)
+        outcome_id = _stable_id(
+            context.user_scope_id, OUTCOME_ROUTE, context.idempotency_key,
+            request_hash, "outcome",
+        )
+        now = self.clock()
+        evaluation = self._evaluate(typed, prepared, outcome_id=outcome_id, now=now)
+        data = canonical_json(evaluation["manifest"])
+        relative_name = f"outcomes/{outcome_id}/evaluation.json"
+        try:
+            artifact_id = self.files.store_artifact(
+                data,
+                relative_name=relative_name,
+                stable_key=f"outcome-evaluation:{outcome_id}",
+                user_scope_id=context.user_scope_id,
+            )
+        except ContractError:
+            raise
+        except OSError as error:
+            raise ContractError(
+                ErrorCode.STORAGE_COMMIT_FAILED,
+                "the evaluation manifest could not be stored",
+            ) from error
+        evidence = [EvidenceRef(
+            kind="artifact",
+            file_id=artifact_id,
+            content_hash=hashlib.sha256(data).hexdigest(),
+            locator=relative_name,
+        )]
+        evidence.extend(
+            EvidenceRef(kind="local", entity_type="Feedback", entity_id=item)
+            for item in typed.feedback_ids
+        )
+        outcome = ExperimentOutcome(
+            id=outcome_id,
+            schema_version=PRODUCT_CONTRACT_VERSION,
+            created_at=now,
+            created_by_task_id=None,
+            change_set_id=typed.change_set_id,
+            base_applied_id=typed.base_applied_id,
+            tested_applied_id=typed.tested_applied_id,
+            before_bindings=list(typed.before_bindings),
+            after_bindings=list(typed.after_bindings),
+            comparison_id=typed.comparison_id,
+            legacy_outcome=evaluation["legacy"],
+            player_acceptance=typed.player_acceptance,
+            effect_assessment=evaluation["effect"],
+            feedback_ids=list(typed.feedback_ids),
+            evidence_refs=evidence,
+            limitations=evaluation["limitations"],
+        )
+        with self.repository.unit_of_work() as uow:
+            winner = _replay_result(
+                uow, context, OUTCOME_ROUTE, request_schema_version, request_hash,
+            )
+            if winner is not None:
+                return winner
+            uow.insert_object("ExperimentOutcome", outcome)
+            uow.insert_reference(outcome.id, "change_set", ObjectRef(
+                entity_type="ChangeSet", entity_id=outcome.change_set_id,
+            ))
+            uow.insert_reference(outcome.id, "base_applied", ObjectRef(
+                entity_type="AppliedConfiguration",
+                entity_id=outcome.base_applied_id,
+            ))
+            uow.insert_reference(outcome.id, "tested_applied", ObjectRef(
+                entity_type="AppliedConfiguration",
+                entity_id=outcome.tested_applied_id,
+            ))
+            if outcome.comparison_id is not None:
+                uow.insert_reference(outcome.id, "comparison", ObjectRef(
+                    entity_type="PerformanceComparison",
+                    entity_id=outcome.comparison_id,
+                ))
+            for feedback_id in outcome.feedback_ids:
+                uow.insert_reference(outcome.id, "feedback", ObjectRef(
+                    entity_type="Feedback", entity_id=feedback_id,
+                ))
+            for summary in evaluation["summaries"]:
+                uow.insert_reference(outcome.id, "summary", ObjectRef(
+                    entity_type="PerformanceSummary", entity_id=summary.id,
+                ))
+            result = ResourceResult(refs=[
+                ObjectRef(entity_type="ExperimentOutcome", entity_id=outcome.id)
+            ])
+            _record_result(
+                uow, context, OUTCOME_ROUTE, request_schema_version,
+                request_hash, result,
+            )
+            return result
+
+    # -- reads -------------------------------------------------------------
+    def get_outcome(self, outcome_id: str, user_scope_id: str) -> ExperimentOutcome:
+        stored = self.repository.find_object("ExperimentOutcome", outcome_id)
+        if stored is None:
+            raise ContractError(
+                ErrorCode.RESOURCE_NOT_FOUND, "the outcome is not available"
+            )
+        outcome = ExperimentOutcome.model_validate_json(stored.payload_bytes)
+        change_set = self.repository.find_object("ChangeSet", outcome.change_set_id)
+        owner = (
+            None if change_set is None
+            else _change_set_owner(
+                self.repository,
+                ChangeSet.model_validate_json(change_set.payload_bytes),
+            )
+        )
+        if owner != user_scope_id:
+            raise ContractError(
+                ErrorCode.RESOURCE_NOT_FOUND, "the outcome is not available"
+            )
+        return outcome
+
+    # -- verification ------------------------------------------------------
+    def precheck(self, typed: OutcomeInput, user_scope_id: str) -> "_PreparedOutcome":
+        change_set = _require_change_set(
+            self.repository, typed.change_set_id, user_scope_id,
+        )
+        if typed.base_applied_id != change_set.base_applied_id:
+            raise ContractError(
+                ErrorCode.REFERENCE_INVALID,
+                "the base does not equal the ChangeSet base",
+                field_errors=[FieldError(
+                    path="base_applied_id", code="reference",
+                    message="differs from ChangeSet.base_applied_id",
+                )],
+            )
+        base = _require_applied(self.repository, typed.base_applied_id, user_scope_id)
+        tested = _require_applied(
+            self.repository, typed.tested_applied_id, user_scope_id,
+        )
+        if base.installation_id != change_set.installation_id:
+            raise ContractError(
+                ErrorCode.REFERENCE_INVALID,
+                "the base belongs to another installation",
+            )
+        if tested.installation_id != change_set.installation_id:
+            raise ContractError(
+                ErrorCode.REFERENCE_INVALID,
+                "the tested configuration belongs to another installation",
+            )
+        extra_change = self._require_chain(change_set, tested, base)
+
+        expected = {
+            **{_binding_key(item): "before" for item in typed.before_bindings},
+            **{_binding_key(item): "after" for item in typed.after_bindings},
+        }
+        if len(expected) != len(typed.before_bindings) + len(typed.after_bindings):
+            raise ContractError(
+                ErrorCode.REFERENCE_INVALID,
+                "a binding is declared on both sides of the experiment",
+            )
+        limitations: list[str] = []
+        for item in typed.before_bindings + typed.after_bindings:
+            self.performance.require_analyzeable(item, user_scope_id)
+            binding = self.performance.get_binding(
+                item.segment_id, item.binding_revision, user_scope_id,
+            )
+            side = expected[_binding_key(item)]
+            want = typed.base_applied_id if side == "before" else typed.tested_applied_id
+            if binding.applied_id is None:
+                limitations.append(
+                    f"the {side} binding {item.segment_id} names no adopted"
+                    " configuration"
+                )
+            elif binding.applied_id != want:
+                raise ContractError(
+                    ErrorCode.REFERENCE_INVALID,
+                    f"the {side} binding does not name the declared configuration",
+                    field_errors=[FieldError(
+                        path=f"{side}_bindings", code="reference",
+                        message="binding and declared configuration disagree",
+                    )],
+                )
+
+        comparison = None
+        protocol = None
+        summaries: list[Any] = []
+        if typed.comparison_id is not None:
+            comparison = self.performance.get_comparison(
+                typed.comparison_id, user_scope_id,
+            )
+            summaries = [
+                self.performance.get_summary(item, user_scope_id)
+                for item in comparison.summary_ids
+            ]
+            left_keys = {_binding_key(item) for item in summaries[0].bindings}
+            right_keys = {_binding_key(item) for item in summaries[1].bindings}
+            before_keys = {_binding_key(item) for item in typed.before_bindings}
+            after_keys = {_binding_key(item) for item in typed.after_bindings}
+            if not before_keys or not after_keys:
+                raise ContractError(
+                    ErrorCode.REFERENCE_INVALID,
+                    "a comparison needs bindings on both sides",
+                )
+            # 05 §7: the compared summaries' binding sets belong to the
+            # declared before/after scope.  A reversed or mixed comparison
+            # fails here; the declared inputs stay the reportable scope even
+            # when they contain several repeated rounds.
+            if not left_keys <= before_keys or not right_keys <= after_keys:
+                raise ContractError(
+                    ErrorCode.REFERENCE_INVALID,
+                    "the comparison is reversed or mixes another experiment",
+                    field_errors=[FieldError(
+                        path="comparison_id", code="reference",
+                        message="summary order and declared sides disagree",
+                    )],
+                )
+            for summary in summaries:
+                # A selected result whose frozen manifest is missing or corrupt
+                # is not silently treated as an empty measurement.
+                self.files.read_managed_file(summary.manifest_file_id)
+            protocol = self.performance.get_comparison_protocol(
+                comparison.protocol_id, user_scope_id,
+            )
+        for feedback_id in typed.feedback_ids:
+            _require_feedback(self.repository, feedback_id, user_scope_id)
+        return _PreparedOutcome(
+            change_set=change_set, base=base, tested=tested,
+            comparison=comparison, protocol=protocol, summaries=summaries,
+            extra_change=extra_change, limitations=limitations,
+        )
+
+    def _require_chain(
+        self, change_set: ChangeSet, tested: AppliedConfiguration,
+        base: AppliedConfiguration,
+    ) -> bool:
+        """Walk ``parent_applied_id``; any node beyond the ChangeSet is extra."""
+        current = tested
+        seen: set[str] = set()
+        found = False
+        extra = False
+        while current is not None:
+            if current.id in seen:
+                raise ContractError(
+                    ErrorCode.REFERENCE_INVALID,
+                    "the adopted configuration chain contains a cycle",
+                )
+            seen.add(current.id)
+            if current.change_set_id == change_set.id:
+                found = True
+                if current.parent_applied_id != base.id:
+                    # The change was applied on another baseline, or the
+                    # player edited something else first.
+                    extra = True
+                if current.restored_from_applied_id is not None:
+                    extra = True
+                break
+            if current.id == base.id:
+                break
+            if current.parent_applied_id is None:
+                break
+            if current.origin.value in {"manual_edit", "change_set", "rollback"}:
+                extra = True
+            current = _require_applied(
+                self.repository, current.parent_applied_id,
+                current.user_scope_id,
+            )
+        if not found:
+            raise ContractError(
+                ErrorCode.REFERENCE_INVALID,
+                "the tested configuration does not contain this ChangeSet",
+                field_errors=[FieldError(
+                    path="tested_applied_id", code="reference",
+                    message="the adopted chain has no such change",
+                )],
+            )
+        return extra
+
+    # -- reduction ---------------------------------------------------------
+    def _evaluate(
+        self, typed: OutcomeInput, prepared: "_PreparedOutcome", *,
+        outcome_id: str, now: str,
+    ) -> dict[str, Any]:
+        limitations = list(prepared.limitations)
+        checks = [
+            _outcome_check(
+                "outcome.chain", CheckStatus.pass_, now=now,
+                note="the tested configuration contains this ChangeSet",
+            ),
+            _outcome_check(
+                "outcome.base", CheckStatus.pass_, now=now,
+                note="the base equals the ChangeSet base and the frozen snapshot",
+            ),
+        ]
+        before_rounds: list[Any] = []
+        after_rounds: list[Any] = []
+        conflict = False
+        if typed.comparison_id is not None:
+            before_rounds = self.performance.summaries_for(
+                typed.before_bindings, prepared.base.user_scope_id,
+            )
+            after_rounds = self.performance.summaries_for(
+                typed.after_bindings, prepared.base.user_scope_id,
+            )
+            for summary in before_rounds + after_rounds:
+                self.files.read_managed_file(summary.manifest_file_id)
+            conflict = _has_numeric_conflict(before_rounds) or _has_numeric_conflict(
+                after_rounds
+            )
+            checks.append(_outcome_check(
+                "outcome.rounds", CheckStatus.pass_, now=now,
+                note=f"repeated samples: {len(before_rounds)} before,"
+                     f" {len(after_rounds)} after",
+            ))
+        rounds: list[_MetricRound] = []
+        comparison_ok = True
+        if prepared.comparison is not None:
+            comparison_ok = (
+                all(
+                    item.status in {CheckStatus.pass_, CheckStatus.not_applicable}
+                    for item in prepared.comparison.checks
+                )
+            )
+            checks.append(_outcome_check(
+                "outcome.conditions", CheckStatus.pass_ if comparison_ok else (
+                    CheckStatus.unknown
+                ),
+                now=now,
+                note="the frozen comparison reports its condition checks"
+                     if comparison_ok else
+                     "a condition check failed or is unknown in the comparison",
+            ))
+            rounds = self._metric_rounds(
+                prepared, before_rounds, after_rounds, limitations,
+            )
+        else:
+            limitations.append("no comparison was supplied; the effect is unmeasured")
+            checks.append(_outcome_check(
+                "outcome.measurement", CheckStatus.not_run, now=now,
+                note="no comparison or repeated measurement was supplied",
+            ))
+
+        effect = self._effect(
+            typed, prepared, rounds, conflict=conflict,
+            comparison_ok=comparison_ok, limitations=limitations, now=now,
+            before_count=len(before_rounds), after_count=len(after_rounds),
+        )
+        legacy = _legacy_reduction(typed.player_acceptance, effect)
+        manifest = {
+            "kind": "outcome_evaluation",
+            "rule_version": OUTCOME_RULE_VERSION,
+            "effect_policy_version": EFFECT_POLICY_VERSION,
+            "outcome_id": outcome_id,
+            "change_set_id": typed.change_set_id,
+            "base_applied_id": typed.base_applied_id,
+            "tested_applied_id": typed.tested_applied_id,
+            "comparison_id": typed.comparison_id,
+            "protocol_id": (
+                None if prepared.comparison is None
+                else prepared.comparison.protocol_id
+            ),
+            "exploratory": (
+                None if prepared.protocol is None else prepared.protocol.exploratory
+            ),
+            "before_bindings": [
+                item.model_dump(mode="json") for item in typed.before_bindings
+            ],
+            "after_bindings": [
+                item.model_dump(mode="json") for item in typed.after_bindings
+            ],
+            "selected_summary_ids": [
+                item.id for item in prepared.summaries
+            ],
+            "before_summary_ids": [item.id for item in before_rounds],
+            "after_summary_ids": [item.id for item in after_rounds],
+            "round_counts": {
+                "before": len(before_rounds), "after": len(after_rounds),
+            },
+            "extra_player_change": prepared.extra_change,
+            "metrics": [round_.__dict__ for round_ in rounds],
+            "primary_definition_id": (
+                None if not rounds else rounds[0].definition_id
+            ),
+            "condition_checks": (
+                [] if prepared.comparison is None else [
+                    item.model_dump(mode="json")
+                    for item in prepared.comparison.checks
+                ]
+            ),
+            "limitations": list(limitations),
+            "effect_assessment": effect.value,
+            "legacy_outcome": legacy.value,
+            "player_acceptance": typed.player_acceptance.value,
+            # E-R23: the rules are proven offline; no real local effect is claimed.
+            "local_effect": "not_run",
+            "evidence_level": "offline_fixture",
+        }
+        manifest["checks"] = [item.model_dump(mode="json") for item in checks]
+        return {
+            "effect": effect, "legacy": legacy, "limitations": limitations,
+            "manifest": manifest,
+            "summaries": prepared.summaries,
+        }
+
+    def _metric_rounds(
+        self, prepared: "_PreparedOutcome", before_rounds: Sequence[Any],
+        after_rounds: Sequence[Any], limitations: list[str],
+    ) -> list[_MetricRound]:
+        if prepared.comparison is None or not before_rounds or not after_rounds:
+            return []
+        selected = prepared.summaries
+        if not selected:
+            return []
+        analyzer = selected[0].analyzer_version
+        cleaning = selected[0].cleaning_protocol_version
+        before = [
+            item for item in before_rounds
+            if item.analyzer_version == analyzer
+            and item.cleaning_protocol_version == cleaning
+        ]
+        after = [
+            item for item in after_rounds
+            if item.analyzer_version == analyzer
+            and item.cleaning_protocol_version == cleaning
+        ]
+        if len(before) != len(before_rounds) or len(after) != len(after_rounds):
+            limitations.append(
+                "some repeated samples used another analyzer/cleaning rule set"
+                " and were left out"
+            )
+        usable = {
+            item.metric_definition_id
+            for item in prepared.comparison.per_metric
+            if item.status is CheckStatus.pass_
+        }
+        before_values = _values_by_definition(before)
+        after_values = _values_by_definition(after)
+        definitions = self._definitions(set(before_values) & set(after_values) & usable)
+        rounds: list[_MetricRound] = []
+        for definition_id, definition in definitions.items():
+            key = definition.get("metric_key")
+            direction = _metric_direction(key)
+            if direction is None:
+                continue
+            before_numbers = before_values[definition_id]
+            after_numbers = after_values[definition_id]
+            if len(before_numbers) != len(before) or len(after_numbers) != len(after):
+                limitations.append(
+                    f"metric {key} has no numeric value in every round"
+                )
+                continue
+            before_median = float(median(before_numbers))
+            after_median = float(median(after_numbers))
+            before_range = max(before_numbers) - min(before_numbers)
+            after_range = max(after_numbers) - min(after_numbers)
+            delta = after_median - before_median
+            tolerance = max(
+                1e-9,
+                1e-9 * max(abs(before_median), abs(after_median), 1.0),
+            )
+            rounds.append(_MetricRound(
+                definition_id=definition_id,
+                metric_key=key,
+                direction=direction,
+                before_median=before_median,
+                after_median=after_median,
+                before_range=before_range,
+                after_range=after_range,
+                delta=delta,
+                beyond_fluctuation=(
+                    abs(delta) > max(before_range, after_range) + tolerance
+                ),
+            ))
+        priority = {key: index for index, key in enumerate(_PRIMARY_ORDER)}
+        rounds.sort(key=lambda item: (
+            priority.get(item.metric_key, len(priority)), item.metric_key,
+        ))
+        return rounds
+
+    def _definitions(self, definition_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
+        result: dict[str, dict[str, Any]] = {}
+        with self.repository.unit_of_work() as uow:
+            for definition_id in definition_ids:
+                stored = uow.find_object("MetricDefinition", definition_id)
+                if stored is not None:
+                    result[definition_id] = json.loads(stored.payload_bytes)
+        return result
+
+    def _effect(
+        self, typed: OutcomeInput, prepared: "_PreparedOutcome",
+        rounds: Sequence[_MetricRound], *, conflict: bool, comparison_ok: bool,
+        limitations: list[str], now: str, before_count: int, after_count: int,
+    ) -> EffectAssessment:
+        if typed.comparison_id is None:
+            return EffectAssessment.not_measured
+        if prepared.protocol is not None and prepared.protocol.exploratory:
+            limitations.append(
+                "exploratory comparison: observed differences are not reduced"
+                " to a stable improvement or regression"
+            )
+            return EffectAssessment.inconclusive
+        if prepared.comparison is not None and prepared.comparison.level.value != "controlled":
+            limitations.append(
+                "the comparison is not controlled; its difference is descriptive"
+            )
+            return EffectAssessment.inconclusive
+        if not comparison_ok:
+            return EffectAssessment.inconclusive
+        if prepared.extra_change:
+            limitations.append(
+                "the adopted chain contains a player change outside this ChangeSet;"
+                " the result is downgraded"
+            )
+            return EffectAssessment.inconclusive
+        if conflict:
+            limitations.append(
+                "two summaries for one binding disagree; the conflict is not"
+                " resolved by picking the better number"
+            )
+            return EffectAssessment.inconclusive
+        if not rounds:
+            limitations.append("no metric was comparable across the frozen protocol")
+            return EffectAssessment.inconclusive
+        if min(before_count, after_count) < _MIN_ROUNDS:
+            limitations.append(
+                f"fewer than {_MIN_ROUNDS} valid rounds per side; direction is not"
+                " reduced from a single or double sample"
+            )
+            return EffectAssessment.inconclusive
+        primary = rounds[0]
+        def _improves(item: _MetricRound) -> bool:
+            if not item.beyond_fluctuation:
+                return False
+            return (
+                item.delta > 0
+                if item.direction == "higher_better"
+                else item.delta < 0
+            )
+
+        def _worsens(item: _MetricRound) -> bool:
+            if not item.beyond_fluctuation:
+                return False
+            return (
+                item.delta < 0
+                if item.direction == "higher_better"
+                else item.delta > 0
+            )
+
+        if not primary.beyond_fluctuation:
+            if any(item.beyond_fluctuation for item in rounds):
+                limitations.append(
+                    "the primary metric is within fluctuation while another"
+                    " relevant metric changed"
+                )
+                return EffectAssessment.inconclusive
+            return EffectAssessment.no_clear_change
+        others = rounds[1:]
+        if _improves(primary):
+            if any(_worsens(item) for item in others):
+                limitations.append(
+                    "the primary metric improves while another relevant metric"
+                    " regresses; the tradeoff is unresolved"
+                )
+                return EffectAssessment.inconclusive
+            return EffectAssessment.improved
+        if _worsens(primary):
+            if any(_improves(item) for item in others):
+                limitations.append(
+                    "the primary metric regresses while another improves; the"
+                    " tradeoff is unresolved"
+                )
+                return EffectAssessment.inconclusive
+            return EffectAssessment.worse
+        return EffectAssessment.inconclusive
+
+
+@dataclass(frozen=True)
+class _PreparedOutcome:
+    change_set: ChangeSet
+    base: AppliedConfiguration
+    tested: AppliedConfiguration
+    comparison: Any | None
+    protocol: Any | None
+    summaries: list[Any]
+    extra_change: bool
+    limitations: list[str]
+
+
+def _values_by_definition(summaries: Sequence[Any]) -> dict[str, list[float]]:
+    values: dict[str, list[float]] = {}
+    for summary in summaries:
+        for metric in summary.metrics:
+            numeric = metric.numeric
+            if numeric.number_kind in {"exact", "approximate"} and numeric.value is not None:
+                values.setdefault(metric.definition_id, []).append(float(numeric.value))
+    return values
+
+
+def _has_numeric_conflict(summaries: Sequence[Any]) -> bool:
+    groups: dict[tuple, list[dict[str, float | None]]] = {}
+    for summary in summaries:
+        key = (
+            tuple(sorted(_binding_key(item) for item in summary.bindings)),
+            summary.analyzer_version,
+            summary.cleaning_protocol_version,
+        )
+        values = {
+            metric.definition_id: (
+                metric.numeric.value
+                if metric.numeric.number_kind in {"exact", "approximate"}
+                else None
+            )
+            for metric in summary.metrics
+        }
+        groups.setdefault(key, []).append(values)
+    for values in groups.values():
+        if len(values) < 2:
+            continue
+        first = values[0]
+        for other in values[1:]:
+            if first != other:
+                return True
+    return False
+
+
+def _metric_direction(metric_key: str | None) -> str | None:
+    if metric_key in _HIGHER_IS_BETTER:
+        return "higher_better"
+    if metric_key in _LOWER_IS_BETTER:
+        return "lower_better"
+    return None
+
+
+def _replay_result(
+    uow: UnitOfWork, context: MutationContext, route: str,
+    request_schema_version: str, request_hash: str,
+) -> ResourceResult | None:
+    existing = uow.find_idempotency(
+        context.user_scope_id, "POST", route, context.idempotency_key,
+    )
+    if existing is None:
+        return None
+    if existing.lifecycle.value == "tombstoned":
+        raise ContractError(
+            ErrorCode.RESOURCE_GONE,
+            "this submission was cleaned up; start a new logical submission",
+        )
+    if existing.request_schema_version != request_schema_version:
+        raise ContractError(
+            ErrorCode.IDEMPOTENCY_CONFLICT,
+            "this key is registered under another contract version",
+        )
+    if existing.request_hash != request_hash:
+        raise ContractError(
+            ErrorCode.IDEMPOTENCY_CONFLICT,
+            "the same key was already used with different business content",
+        )
+    return ResourceResult.model_validate(json.loads(existing.response_body))
+
+
+def _record_result(
+    uow: UnitOfWork, context: MutationContext, route: str,
+    request_schema_version: str, request_hash: str, result: ResourceResult,
+) -> None:
+    uow.insert_idempotency(
+        user_scope_id=context.user_scope_id,
+        method="POST",
+        canonical_route=route,
+        key=context.idempotency_key,
+        request_schema_version=request_schema_version,
+        request_hash=request_hash,
+        response_status=201,
+        response_body=canonical_json(result.model_dump(mode="json")),
+        result_refs=[ref.model_dump(mode="json") for ref in result.refs],
+    )
 
 
 class _NextActionProtocolError(ValueError):

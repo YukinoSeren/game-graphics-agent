@@ -82,6 +82,8 @@ RunDeclaration 的实际字段白名单由本章定义，01只登记声明/来�
 
 exploratory=true明确表示探索；false只声明预先计划的用途，不能由此证明玩家尚未看过后测。执行比较时仍核对产品内后测采集/结果登记事件及可靠原始时间：后测开始早于冻结、冻结前已登记可读后测结果，或无法证明先后时，非探索性协议返回PRECONDITION_UNVERIFIED并引导新建exploratory=true协议；冻结后的正常采样及结果登记不触发此拒绝。不能倒填frozen_at或原地改标志，外部日志的上传时间不证明采样晚于冻结。新规则用于本入口创建的比较，不改写既有协议/历史比较。探索性比较可以展示差异，但05不得据此宣称预先计划实验的稳定改善。
 
+05 的重复样本读取只使用 04 的只读辅助 `summaries_for(bindings:BindingRef[], user_scope_id:ID) -> PerformanceSummary[]`：只返回绑定集合包含于请求集合、归属当前用户、且段/绑定均已闭合的已发布摘要；不创建摘要、不重算、不返回开放修订或他人摘要（E-R19）。
+
 ### 4.3 日志预览、时间声明与人工关联
 
 `inspect_log(file_id:ID,source_schema:string)->LogInspection`为有界只读解析，不发模型、不创建会话/分析。LogInspection为局部DTO，全R字段`file_id:ID,content_hash:Hash,source_schema:string,source_ranges:TimeRange[],streams:LogStreamCandidate[],limitations:string[]`；LogStreamCandidate全R字段`stream_key:string,process:ProcessIdentity?,swapchain_id:string?,frame_stream_kind:FrameStreamKind`。stream_key由后台基于原件hash和实际进程/交换链/流生成；进程未能识别时process=null，不造PID。预览仅返回已验证格式实际存在的时基、范围和流，不证明本机配置；未知格式返回UNSUPPORTED_ARTIFACT_FORMAT，原件保留。

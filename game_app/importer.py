@@ -3616,6 +3616,19 @@ class ResearchImporter:
         detected, reason = _detect_research_format(data)
         annotation = self.annotation_by_format.get(detected) if detected else None
         problems = research_annotation_problems(annotation) if annotation else []
+        if annotation is not None:
+            # The publish path must run the same probe the registry runs: an
+            # annotation only covers the exact fixture it names.  Checking the
+            # gate alone would let a differently annotated document be mapped.
+            if annotation.source_file != frozen.relative_name:
+                problems.append(
+                    "the annotation names another source file; it does not cover"
+                    " the frozen document"
+                )
+            if annotation.fixture_sha256 != hashlib.sha256(data).hexdigest():
+                problems.append(
+                    "the annotation's fixture hash does not match the frozen bytes"
+                )
         admitted = annotation is not None and not problems
 
         if detected is None:

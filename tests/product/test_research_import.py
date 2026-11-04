@@ -225,6 +225,30 @@ def test_an_annotation_for_different_bytes_never_matches():
     assert any("annotated fixture" in item for item in inspection.limitations)
 
 
+def test_an_annotation_for_another_fixture_never_maps_the_frozen_bytes(tmp_path):
+    annotated = json.dumps(_synthetic_result(), ensure_ascii=False).encode("utf-8")
+    changed = json.dumps(
+        {**_synthetic_result(), "run": {"date": "2026-11-02", "purpose": "other"}},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    annotation = _synthetic_annotation(annotated, "synthetic-research-result.json")
+    source = tmp_path / "synthetic-research-result.json"
+    source.write_bytes(changed)
+
+    repository, files = _setup(tmp_path)
+    importer = ResearchImporter(repository, files, annotations=[annotation])
+    frozen = importer.freeze_document(
+        source, user_scope_id=SCOPE, idempotency_key="freeze:changed"
+    )
+    result = importer.publish(frozen, user_scope_id=SCOPE)
+
+    assert result.code == "retained_only"
+    assert result.annotation_status == "rejected"
+    assert result.accepted_record_ids == []
+    assert _count(repository, "ImportedRecord") == 0
+    assert any("fixture hash" in item for item in result.limitations)
+
+
 # -- retained_only by default ------------------------------------------------
 
 

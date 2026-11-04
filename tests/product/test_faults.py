@@ -19,7 +19,8 @@ from game_app.contracts.performance import CaptureArtifact, CreateSessionRequest
 from game_app.contracts.tasks import KnowledgeInput, ResumeTaskInput
 from game_app.errors import ContractError, ErrorCode
 from game_app.files import PublishHooks
-from game_app.repository import canonical_json
+from game_app.importer import FreezeHooks, FrozenInputReader
+from game_app.repository import ProductRepository, canonical_json
 from game_app.tasks import HandlerOutcome, TaskService
 from tests.product.support.configuration import context_key, setup
 from tests.product.support.performance import (
@@ -33,6 +34,32 @@ from tests.product.support.performance import (
 )
 from tests.product.support.spies import CrashInjector, InjectedCrash, SpyProvider
 from tests.product.test_sessions import FakeClock
+
+
+# 08 §7's six boundaries and the case that injects each one.  The map is kept
+# explicit so a missing boundary is visible rather than implied by file length.
+FAULT_BOUNDARIES = {
+    "register before/after, before the response":
+        "test_same_key_concurrent_registration_creates_one_task",
+    "external in_flight, before the response is stored":
+        "test_a_lost_response_then_same_key_retry_does_not_resend",
+    "file renamed, before the database commit":
+        "test_an_import_freeze_crash_before_the_commit_leaves_no_half_import",
+    "current pointer / answer / binding concurrency":
+        "test_pointer_concurrency_lets_exactly_one_writer",
+    "exit before the first checkpoint":
+        "test_no_checkpoint_recovery_creates_one_child_and_does_not_resend",
+    "corruption / migration failure":
+        "test_a_failed_migration_is_rolled_back",
+}
+
+
+def test_every_fault_boundary_has_an_injected_case():
+    missing = [
+        boundary for boundary, name in FAULT_BOUNDARIES.items()
+        if not callable(globals().get(name))
+    ]
+    assert not missing
 
 
 def _ctx(key: str) -> MutationContext:
@@ -258,3 +285,83 @@ def test_the_crash_injector_refuses_a_non_temporary_repository(tmp_path):
         injector.guard(tmp_path.parent / "elsewhere.sqlite3")
     with pytest.raises(InjectedCrash):
         CrashInjector("before_commit").guard(tmp_path / "product.sqlite3")
+
+
+# 08 §7, "文件最终改名后、库发布前": the frozen copy may exist, but no import
+# identity may be readable from a crash before the transaction commits.
+def test_an_import_freeze_crash_before_the_commit_leaves_no_half_import(tmp_path):
+    from tests.product.test_import_publish import _run_files
+
+    repository, files, installation, context, device = setup(tmp_path)
+    directory = tmp_path / "run"
+    directory.mkdir()
+    for name, data in _run_files().items():
+        (directory / name).write_bytes(data)
+    reader = FrozenInputReader(files)
+
+    class Crash(Exception):
+        pass
+
+    with pytest.raises(Crash):
+        reader.freeze(
+            directory,
+            user_scope_id="a" * 32,
+            idempotency_key="freeze-crash",
+            hooks=FreezeHooks(after_copy=lambda: (_ for _ in ()).throw(Crash())),
+        )
+
+    assert count_objects(repository, "ImportedRecord") == 0
+    with repository.unit_of_work() as uow:
+        assert uow.query("SELECT COUNT(*) AS n FROM import_snapshots")[0]["n"] == 0
+        assert uow.query("SELECT COUNT(*) AS n FROM file_operations")[0]["n"] == 1
+
+    # The same key retries against the frozen operation instead of rebuilding it.
+    frozen = reader.freeze(
+        directory, user_scope_id="a" * 32, idempotency_key="freeze-crash"
+    )
+    assert frozen.format_id == "collector-run/v0.1"
+    assert count_objects(repository, "ManagedFile") == 5
+
+
+# 08 §7, "当前指针/回答/绑定并发": one writer commits, the other gets a whole
+# conflict, and no answer or revision is lost.
+def test_pointer_concurrency_lets_exactly_one_writer(tmp_path):
+    from tests.product.test_sessions import (
+        test_concurrent_end_segment_lets_exactly_one_write,
+    )
+
+    directory = tmp_path / "concurrency"
+    directory.mkdir()
+    test_concurrent_end_segment_lets_exactly_one_write(directory)
+
+
+# 08 §7, "损坏/迁移失败": a failed migration is rolled back and reports a
+# storage error rather than an empty usable database.
+def test_a_failed_migration_is_rolled_back(tmp_path, monkeypatch):
+    import game_app.repository as repository_module
+
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    (migrations / "0001_broken.sql").write_text(
+        "CREATE TABLE broken (id TEXT);\n"
+        "INSERT INTO a_table_that_does_not_exist(id) VALUES('x');\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(repository_module, "MIGRATIONS_DIR", migrations)
+
+    repository = ProductRepository(tmp_path / "product.sqlite3")
+    with pytest.raises(ContractError) as caught:
+        repository.migrate()
+    assert caught.value.code is ErrorCode.STORAGE_COMMIT_FAILED
+
+    with repository.unit_of_work() as uow:
+        applied = uow.query("SELECT version FROM schema_migrations ORDER BY version")
+    assert applied == []
+    # The half-created table was rolled back with the rest of the script.
+    with repository.unit_of_work() as uow:
+        tables = {
+            row["name"] for row in uow.query(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+    assert "broken" not in tables

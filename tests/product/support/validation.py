@@ -132,6 +132,7 @@ class ScenarioRunner:
         initial_fixture: str = "offline-log-basic@1",
         input_refs: Sequence[str] = (),
         mock_components: Sequence[str] = (),
+        observations: Sequence[str] = (),
     ) -> CaseResult:
         spec = CaseSpec(
             case_id=case_id,
@@ -157,7 +158,8 @@ class ScenarioRunner:
         )
         return result.model_copy(update={
             "observations": [
-                f"{key}={value}" for key, value in self.counts().items()
+                *(f"{key}={value}" for key, value in self.counts().items()),
+                *observations,
             ],
         })
 
@@ -168,6 +170,7 @@ class ScenarioRunner:
         requirement_ids: Sequence[str],
         reason: str,
         blocked: bool = False,
+        blocked_by: str | None = None,
         initial_fixture: str = "offline-log-basic@1",
     ) -> CaseResult:
         return CaseResult(
@@ -184,19 +187,81 @@ class ScenarioRunner:
             expected_assertions=[],
             mock_components=[],
             observations=[],
+            blocked_by=blocked_by if blocked else None,
         )
 
     def write_report(self, results: Iterable[CaseResult], out_dir: str | Path) -> Path:
         return self.loader.write_report(results, self.environment, out_dir)
 
 
+class InsufficientEvidence(Exception):
+    """A run whose every case was skipped or blocked is not a pass."""
+
+
+def summarize_results(results: Iterable[CaseResult | dict[str, Any]]) -> dict[str, Any]:
+    """Status counts plus the honest conclusion (08 §7/§10, VAL-V02/03)."""
+
+    rows: list[CaseResult] = [
+        result if isinstance(result, CaseResult) else CaseResult.model_validate(result)
+        for result in results
+    ]
+    counts = {
+        status: sum(1 for row in rows if row.status == status)
+        for status in ("passed", "failed", "not_run", "blocked")
+    }
+    executed = sum(1 for row in rows if row.executed)
+    gaps = [
+        {
+            "case_id": row.case_id,
+            "status": row.status,
+            "blocked_by": row.blocked_by,
+            "reason": "; ".join(row.failure_notes),
+        }
+        for row in rows
+        if row.status in ("not_run", "blocked")
+    ]
+    return {
+        "total": len(rows),
+        "executed": executed,
+        **counts,
+        "rows": [
+            {
+                "case_id": row.case_id,
+                "status": row.status,
+                "blocked_by": row.blocked_by,
+            }
+            for row in rows
+        ],
+        "gaps": gaps,
+        "all_skipped": executed == 0,
+        "conclusion": (
+            "incomplete" if executed == 0 or counts["failed"]
+            else "passed_with_gaps" if gaps else "passed"
+        ),
+    }
+
+
+def conclude_results(results: Iterable[CaseResult | dict[str, Any]]) -> dict[str, Any]:
+    """Refuse to call an all-skipped run a pass; otherwise return the summary."""
+
+    summary = summarize_results(results)
+    if summary["all_skipped"]:
+        raise InsufficientEvidence(
+            "no case executed in this run; skipped or blocked cases are not a pass"
+        )
+    return summary
+
+
 __all__ = [
     "CaseResult",
     "CaseSpec",
     "EVIDENCE_LEVEL",
+    "InsufficientEvidence",
     "PRODUCT_FIXTURES",
     "RunManifest",
     "ScenarioRunner",
+    "conclude_results",
     "load_results",
     "make_run_manifest",
+    "summarize_results",
 ]

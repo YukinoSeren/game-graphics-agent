@@ -81,11 +81,18 @@ class CaseResult(StrictModel):
     expected_assertions: list[str] = []
     mock_components: list[str] = []
     observations: list[str] = []
+    # A blocked result must name what it is waiting for; "not finished" is not
+    # a blocker.  ``not_run`` carries its reason in ``failure_notes``.
+    blocked_by: str | None = None
 
     @model_validator(mode="after")
     def passed_requires_execution(self) -> "CaseResult":
         if self.status == "passed" and not self.executed:
             raise ValueError("an unexecuted case cannot be recorded as passed")
+        if self.status == "blocked" and not (self.blocked_by or "").strip():
+            raise ValueError("a blocked case must name its blocker in blocked_by")
+        if self.status != "blocked" and self.blocked_by is not None:
+            raise ValueError("only a blocked case carries blocked_by")
         return self
 
 
@@ -165,6 +172,7 @@ class FixtureLoader:
         runner: Callable[[CaseSpec], tuple[str, Iterable[Any], Iterable[str]]],
         *,
         evidence_level: str = "offline_fixture",
+        blocked_by: str | None = None,
     ) -> CaseResult:
         fixture_id, _, version_text = spec.initial_fixture.partition("@")
         if not version_text.isdigit():
@@ -186,6 +194,7 @@ class FixtureLoader:
             steps=list(spec.steps),
             expected_assertions=list(spec.expected_assertions),
             mock_components=list(spec.mock_components),
+            blocked_by=blocked_by if status == "blocked" else None,
         )
 
     def write_report(

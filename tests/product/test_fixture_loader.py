@@ -157,10 +157,13 @@ def test_not_run_and_blocked_are_preserved_not_upgraded(tmp_path):
         _case("case-not-run"), _run_manifest("run-1"), lambda spec: ("not_run", [], ["needs browser"])
     )
     blocked = loader.run_case(
-        _case("case-blocked"), _run_manifest("run-1"), lambda spec: ("blocked", [], ["needs GPU"])
+        _case("case-blocked"), _run_manifest("run-1"),
+        lambda spec: ("blocked", [], ["needs GPU"]),
+        blocked_by="G-GAME",
     )
     assert not_run.status == "not_run"
     assert blocked.status == "blocked"
+    assert blocked.blocked_by == "G-GAME"
     assert not_run.failure_notes == ["needs browser"]
 
 

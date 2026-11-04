@@ -217,7 +217,7 @@ VAL-T02新增依赖是**最终串联完成所需**的显式化，未改变08基�
 
 ### 5.6 入口、页面与最终门禁
 
-- [ ] **ENG-T04 外部入口与分发基础。** 创建`http.py`、`cli.py`、`test_http.py`，更新既有pyproject的已验证可选入口/依赖；按07 §11和D-P补全路由调用所有者。先以服务桩测同源/会话、canonical route含实际ID、跨用户不可见、上传规范hash、GET无写、原key回原响应、客户端伪造provenance/controlled被拒。ENG-V01/06；服务可独立启动供后续浏览器测试，不等待ENG-T05。固定版本矩阵失败就保持未启用，不用“latest”掩盖未验兼容。
+- [ ] **ENG-T04 外部入口与分发基础。** Q1 已定纯 CLI：只创建`cli.py`与`test_cli.py`（`http.py`/`test_http.py`、UX-T01—03、VAL-T04、ENG-T05 的页面部分不实现，保留设计）；按07 §11登记的命令入口复用同一应用服务与领域契约，更新既有pyproject的已验证可选入口/依赖。先以服务桩测同源/会话、canonical route含实际ID、跨用户不可见、上传规范hash、GET无写、原key回原响应、客户端伪造provenance/controlled被拒。ENG-V01/06；服务可独立启动供后续浏览器测试，不等待ENG-T05。固定版本矩阵失败就保持未启用，不用“latest”掩盖未验兼容。
 
 - [ ] **UX-T01 六页读取与历史。** 创建`templates/`、`static/`、`test_view_models.py`；消费领域只读契约与固定fixture，不另建领域真值。先测无FPS入口、provisional/needs_review同时显示、keep_current未知、三类帧率分开、历史固定revision、图表脚本失败仍有同值文本、私有路径不泄露。UX-V01/03/07；涉及D-P首次选择/目录选择的字段须以已补全规格为准，不把内部ID输入框当成产品入口。
 

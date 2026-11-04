@@ -93,14 +93,6 @@ _SATISFIED = "satisfied"
 _PROBLEM = "problem"
 # A symptom whose first checks are public version/support facts (05 §6).
 _RESEARCH_SYMPTOMS = frozenset({"low_rate", "ghosting"})
-_SYMPTOM_CHECK_ORDER = {
-    "low_rate": "stream, limiter policy, resolution and the available timing",
-    "stutter": "the segment, loading and repeatability",
-    "blur": "input/output resolution and reconstruction",
-    "ghosting": "motion and the game/version",
-    "input_feel": "subjective feel, never displayed FPS",
-    "scene_specific": "evidence from that exact scene",
-}
 # E-R12: a critical unknown blocks ``adjust``; the restart hint is not critical.
 _CRITICAL_CHECKS = (
     "change_set.base",
@@ -1132,6 +1124,10 @@ class NextActionService:
                 ErrorCode.INPUT_VALIDATION_FAILED,
                 "the next-action handler received another task type",
             )
+        # 07 §11 lets any registered task kind reach this handler directly, so
+        # the entry prechecks run again here: a task registered without them
+        # must not write a Diagnosis that names another owner's object.
+        self.precheck(typed, user_scope_id=context.user_scope_id)
         now = self.clock()
         session = _require_session(
             self.repository, typed.session_id, context.user_scope_id,
@@ -1831,11 +1827,15 @@ class NextActionService:
                 if version.created_at > newest:
                     return True
         for summary_id in typed.summary_ids:
-            stored = self.repository.find_object("PerformanceSummary", summary_id)
-            if stored is not None:
-                payload = json.loads(stored.payload_bytes)
-                if payload.get("created_at", "") > newest:
-                    return True
+            if self.performance is None:
+                break
+            # E-R19: the summary's timestamp comes through 04's read entry,
+            # never from 05 reading the objects table directly.
+            summary = self.performance.get_summary(
+                summary_id, applied.user_scope_id,
+            )
+            if summary.created_at > newest:
+                return True
         return False
 
     # -- write -------------------------------------------------------------
@@ -2051,12 +2051,16 @@ class OutcomeService:
         now = self.clock()
         evaluation = self._evaluate(typed, prepared, outcome_id=outcome_id, now=now)
         data = canonical_json(evaluation["manifest"])
+        digest = hashlib.sha256(data).hexdigest()
         relative_name = f"outcomes/{outcome_id}/evaluation.json"
         try:
+            # The stable key includes the content hash: a retry after a failed
+            # commit whose manifest changed must not re-verify an orphan against
+            # different bytes and fail forever.
             artifact_id = self.files.store_artifact(
                 data,
                 relative_name=relative_name,
-                stable_key=f"outcome-evaluation:{outcome_id}",
+                stable_key=f"outcome-evaluation:{outcome_id}:{digest}",
                 user_scope_id=context.user_scope_id,
             )
         except ContractError:
@@ -2069,7 +2073,7 @@ class OutcomeService:
         evidence = [EvidenceRef(
             kind="artifact",
             file_id=artifact_id,
-            content_hash=hashlib.sha256(data).hexdigest(),
+            content_hash=digest,
             locator=relative_name,
         )]
         evidence.extend(
@@ -2282,21 +2286,22 @@ class OutcomeService:
                     "the adopted configuration chain contains a cycle",
                 )
             seen.add(current.id)
+            if current.id == base.id:
+                break
             if current.change_set_id == change_set.id:
                 found = True
                 if current.parent_applied_id != base.id:
-                    # The change was applied on another baseline, or the
-                    # player edited something else first.
+                    # The change was applied on another baseline.
                     extra = True
                 if current.restored_from_applied_id is not None:
                     extra = True
                 break
-            if current.id == base.id:
-                break
+            # Any adoption node between the tested configuration and the
+            # ChangeSet is a change beyond it, whatever its origin label: a
+            # manual edit, a rollback, or another adopted recommendation.
+            extra = True
             if current.parent_applied_id is None:
                 break
-            if current.origin.value in {"manual_edit", "change_set", "rollback"}:
-                extra = True
             current = _require_applied(
                 self.repository, current.parent_applied_id,
                 current.user_scope_id,
@@ -2343,12 +2348,19 @@ class OutcomeService:
             conflict = _has_numeric_conflict(before_rounds) or _has_numeric_conflict(
                 after_rounds
             )
+            # E-R18: a round is one physical sample.  Re-analysing one artifact
+            # yields several summary rows with one binding; those rows are one
+            # round, not three, and a conflict above is decided before this.
+            before_rounds = _one_round_per_artifact(before_rounds)
+            after_rounds = _one_round_per_artifact(after_rounds)
             checks.append(_outcome_check(
                 "outcome.rounds", CheckStatus.pass_, now=now,
                 note=f"repeated samples: {len(before_rounds)} before,"
                      f" {len(after_rounds)} after",
             ))
         rounds: list[_MetricRound] = []
+        valid_before = 0
+        valid_after = 0
         comparison_ok = True
         if prepared.comparison is not None:
             comparison_ok = (
@@ -2366,7 +2378,7 @@ class OutcomeService:
                      if comparison_ok else
                      "a condition check failed or is unknown in the comparison",
             ))
-            rounds = self._metric_rounds(
+            rounds, valid_before, valid_after = self._metric_rounds(
                 prepared, before_rounds, after_rounds, limitations,
             )
         else:
@@ -2379,7 +2391,7 @@ class OutcomeService:
         effect = self._effect(
             typed, prepared, rounds, conflict=conflict,
             comparison_ok=comparison_ok, limitations=limitations, now=now,
-            before_count=len(before_rounds), after_count=len(after_rounds),
+            before_count=valid_before, after_count=valid_after,
         )
         legacy = _legacy_reduction(typed.player_acceptance, effect)
         manifest = {
@@ -2441,12 +2453,12 @@ class OutcomeService:
     def _metric_rounds(
         self, prepared: "_PreparedOutcome", before_rounds: Sequence[Any],
         after_rounds: Sequence[Any], limitations: list[str],
-    ) -> list[_MetricRound]:
+    ) -> tuple[list["_MetricRound"], int, int]:
         if prepared.comparison is None or not before_rounds or not after_rounds:
-            return []
+            return [], 0, 0
         selected = prepared.summaries
         if not selected:
-            return []
+            return [], 0, 0
         analyzer = selected[0].analyzer_version
         cleaning = selected[0].cleaning_protocol_version
         before = [
@@ -2511,7 +2523,9 @@ class OutcomeService:
         rounds.sort(key=lambda item: (
             priority.get(item.metric_key, len(priority)), item.metric_key,
         ))
-        return rounds
+        # E-R18: the direction gate counts the rounds that actually survive the
+        # same-analyzer filter, not every row that happened to be stored.
+        return rounds, len(before), len(after)
 
     def _definitions(self, definition_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
         result: dict[str, dict[str, Any]] = {}
@@ -2620,6 +2634,14 @@ class _PreparedOutcome:
     summaries: list[Any]
     extra_change: bool
     limitations: list[str]
+
+
+def _one_round_per_artifact(summaries: Sequence[Any]) -> list[Any]:
+    """One physical sample is one round, even if it was analysed repeatedly."""
+    seen: dict[str, Any] = {}
+    for item in summaries:
+        seen.setdefault(item.artifact_id, item)
+    return list(seen.values())
 
 
 def _values_by_definition(summaries: Sequence[Any]) -> dict[str, list[float]]:

@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import uuid
 from pathlib import Path
@@ -25,6 +26,10 @@ from game_app.repository import ProductRepository, canonical_json
 CONTRACT_VERSION = "product-contract/0.4"
 DEFAULT_DB = "product.sqlite3"
 DEFAULT_FILES = "managed"
+_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+# A bounded wait: each run claims at most one task, so an unrelated queued task
+# ahead of ours is executed first and the view is still the requested task's.
+_WAIT_LIMIT = 64
 
 # E-R24: exit codes by error category.  A failed *task* is a successful
 # command; it is reported in the printed TaskView, not in the exit code.
@@ -147,6 +152,25 @@ def _user_scope(args: argparse.Namespace) -> str:
             "no local user scope is configured; pass --user-scope or set"
             " GAME_APP_USER_SCOPE_ID",
         )
+    if not _ID_RE.match(value):
+        # The message never echoes the value: a flag is not a secret, but it
+        # must not end up in an error envelope or a log line.
+        raise ContractError(
+            ErrorCode.SESSION_CONTEXT_INVALID,
+            "the local user scope is not a valid 32-character lowercase hex id",
+        )
+    return value
+
+
+def _request_id(args: argparse.Namespace) -> str:
+    value = args.request_id
+    if value is None:
+        return uuid.uuid4().hex
+    if not _ID_RE.match(value):
+        raise ContractError(
+            ErrorCode.INPUT_VALIDATION_FAILED,
+            "the request id must be a 32-character lowercase hex id",
+        )
     return value
 
 
@@ -160,7 +184,7 @@ def _mutation_context(args: argparse.Namespace) -> MutationContext:
     return MutationContext(
         user_scope_id=_user_scope(args),
         idempotency_key=args.key,
-        request_id=args.request_id or uuid.uuid4().hex,
+        request_id=_request_id(args),
     )
 
 
@@ -224,9 +248,27 @@ def _emit(value: Any) -> None:
     sys.stdout.flush()
 
 
-def _wait(application: Application, accepted: Any) -> Any:
-    application.run_once()
-    return application.get_task(accepted.task_id)
+def _wait(application: Application, accepted: Any, user_scope_id: str) -> Any:
+    """Run until the accepted task is terminal, then print its own view.
+
+    ``run_once`` claims the oldest queued task, which may not be the one just
+    accepted; stopping after a single run would print a still-queued view.  A
+    task that cannot be claimed (the slot is held by a capture) also ends the
+    wait, and its honest state is what gets printed.
+    """
+    for _ in range(_WAIT_LIMIT):
+        outcome = application.run_once()
+        if outcome is None or outcome.task_id == accepted.task_id:
+            break
+    return application.get_task(accepted.task_id, user_scope_id)
+
+
+def _write_command(args: argparse.Namespace) -> bool:
+    if args.command in {"recommend", "consume-impact"}:
+        return True
+    if args.command == "task":
+        return args.action in {"cancel", "resume"}
+    return getattr(args, "action", None) in {"record", "plan", "declare"}
 
 
 def _error_exit(error: ContractError, request_id: str) -> int:
@@ -252,13 +294,13 @@ def dispatch(application: Application, args: argparse.Namespace) -> Any:
             _load_json(args.input), _mutation_context(args),
             request_schema_version=args.contract_version,
         )
-        return _wait(application, accepted) if args.wait else accepted
+        return _wait(application, accepted, _user_scope(args)) if args.wait else accepted
     if args.command == "next-action" and args.action == "plan":
         accepted = application.plan_next_action(
             _load_json(args.input), _mutation_context(args),
             request_schema_version=args.contract_version,
         )
-        return _wait(application, accepted) if args.wait else accepted
+        return _wait(application, accepted, _user_scope(args)) if args.wait else accepted
     if args.command == "preference" and args.action == "declare":
         return application.declare_preference(
             _load_json(args.input), _mutation_context(args),
@@ -281,7 +323,7 @@ def dispatch(application: Application, args: argparse.Namespace) -> Any:
             _load_json(args.input), _mutation_context(args),
             request_schema_version=args.contract_version,
         )
-        return _wait(application, accepted) if args.wait else accepted
+        return _wait(application, accepted, _user_scope(args)) if args.wait else accepted
     if args.command == "consume-impact":
         return application.consume_impact(args.notice_id, _mutation_context(args))
     if args.command == "task":
@@ -320,15 +362,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command is None:
         parser.print_help(sys.stdout)
         return 0
-    request_id = args.request_id or uuid.uuid4().hex
+    # The envelope needs one valid correlation id even when the flag is bad;
+    # the raw flag value is never echoed back or placed in the envelope.
+    request_id = uuid.uuid4().hex
     repository = None
     try:
+        request_id = _request_id(args)
         # Resolve the scope and the key before opening the database: a missing
-        # local scope or key is a pure validation failure with no write.
-        if args.command in {"consume-impact"} or (
-            args.command == "task" and args.action in {"cancel", "resume"}
-        ):
+        # local scope or key is a pure validation failure with no write, and a
+        # malformed flag is a contract error, not an internal one.
+        if _write_command(args):
             _mutation_context(args)
+        elif args.user_scope or os.environ.get("GAME_APP_USER_SCOPE_ID"):
+            _user_scope(args)
         repository = _repository(args)
         application = _application(args, repository)
         _emit(dispatch(application, args))

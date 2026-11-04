@@ -2332,8 +2332,20 @@ class PerformanceService:
             try:
                 for item in summary.bindings:
                     self.require_analyzeable(item, user_scope_id)
+                    binding = self.get_binding(
+                        item.segment_id, item.binding_revision, user_scope_id,
+                    )
+                    if (
+                        binding.applied_id is None
+                        or binding.configuration_state is not ConfigurationState.bound
+                    ):
+                        raise ContractError(
+                            ErrorCode.PRECONDITION_UNVERIFIED,
+                            "an unbound binding is not a configured round",
+                        )
             except ContractError:
-                # Invisible (another owner) or not evaluable (open revision).
+                # Invisible (another owner), not evaluable (open revision), or
+                # not bound to a configuration: not a usable repeated sample.
                 continue
             result.append(summary)
         return result

@@ -687,6 +687,40 @@ def test_the_same_key_replays_the_original_acceptance(tmp_path):
     assert after == before
 
 
+def test_a_direct_task_registration_repeats_the_ownership_checks(tmp_path):
+    world = _world(tmp_path)
+    other_session, _ = _session(
+        world.application, world.installation, world.context_id, world.device_id,
+        key="session-2",
+    )
+    feedback_id = uid(730)
+    store_raw(world.repository, "Feedback", {
+        "id": feedback_id,
+        "schema_version": SCHEMA,
+        "created_at": world.clock(),
+        "created_by_task_id": None,
+        "session_id": other_session,
+        "segment_id": None,
+        "raw_text": "a report from another session",
+        "selections": {"feeling": "want_improvement"},
+        "symptoms": [],
+        "interpretation_status": "unparsed",
+    })
+    typed = _input(world, [feedback_id])
+
+    accepted = world.application.register_task(
+        typed, MutationContext(
+            user_scope_id=USER, idempotency_key="direct", request_id=uid(997),
+        ),
+    )
+    world.application.run_once()
+    view = world.application.get_task(accepted.task_id)
+
+    assert view.task.state.value == "failed"
+    assert view.error.code is ErrorCode.REFERENCE_INVALID
+    assert _objects(world.repository, "Diagnosis") == []
+
+
 def test_another_players_session_is_indistinguishable_from_missing(tmp_path):
     world = _world(tmp_path)
     feedback_id = _feedback(

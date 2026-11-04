@@ -158,15 +158,15 @@ def _change_set(stack: Stack, base_id: str, *, suffix: int = 600) -> str:
 
 
 def _run(
-    stack: Stack, applied_id: str, key: str, intervals,
-    *, context_id=None, device_id=None, user=USER,
-) -> tuple[BindingRef, object]:
+    stack: Stack, applied_id: str | None, key: str, intervals,
+    *, context_id=None, device_id=None, user=USER, state="bound",
+) -> tuple[BindingRef, object, str]:
     request = CreateSessionRequest.model_validate_json(canonical_json({
         "installation_id": stack.installation,
         "device_snapshot_id": device_id or stack.device_id,
         "game_context_id": context_id or stack.context_id,
         "applied_id": applied_id,
-        "configuration_state": "bound",
+        "configuration_state": state,
         "run_declaration": {
             "installation_id": stack.installation,
             "fields": FIELDS,
@@ -230,7 +230,17 @@ def _run(
     stack.application.run_once()
     view = stack.application.get_task(accepted.task_id)
     summary = summary_of(stack.application.performance, view)
-    return binding, summary
+    return binding, summary, artifact_id
+
+
+def _analyze_again(stack: Stack, artifact_id: str, binding: BindingRef, key: str):
+    """A second analysis of the same artifact: one physical sample, two rows."""
+    accepted = stack.application.analyze(
+        analysis_input(artifact_id, binding), context_key(f"{key}-again"),
+    )
+    stack.application.run_once()
+    return summary_of(stack.application.performance,
+                      stack.application.get_task(accepted.task_id))
 
 
 def _protocol(stack: Stack, key: str, *, exploratory: bool = False):
@@ -639,10 +649,142 @@ def test_summaries_for_excludes_open_revisions(tmp_path):
 def test_summaries_for_is_invisible_to_another_user(tmp_path):
     stack = _stack(tmp_path)
     base = _applied(stack, 101)
-    binding, _ = _run(stack, base, "owned", [20, 20, 20, 20])
-    summaries = stack.application.performance.summaries_for([binding], USER)
-    assert len(summaries) == 1
+    binding, _, _ = _run(stack, base, "owned", [20, 20, 20, 20])
+    assert len(stack.application.performance.summaries_for([binding], USER)) == 1
     assert stack.application.performance.summaries_for([binding], "c" * 32) == []
+
+
+# --- repeated samples are rounds, not summary rows --------------------------
+
+
+def test_three_analyses_of_one_artifact_are_one_round(tmp_path):
+    stack = _stack(tmp_path)
+    base = _applied(stack, 101)
+    change_set = _change_set(stack, base)
+    tested = _applied(stack, 102, parent=base, change_set=change_set,
+                      origin="change_set")
+    before_binding, before_summary, before_artifact = _run(
+        stack, base, "dup-before", [20, 20, 20, 20],
+    )
+    for index in range(2):
+        _analyze_again(stack, before_artifact, before_binding, f"dup-before-{index}")
+    protocol = _protocol(stack, "protocol-dup")
+    stack.clock.advance(60)
+    after_binding, after_summary, after_artifact = _run(
+        stack, tested, "dup-after", [10, 10, 10, 10],
+    )
+    for index in range(2):
+        _analyze_again(stack, after_artifact, after_binding, f"dup-after-{index}")
+    comparison = _comparison(
+        stack, before_summary, after_summary, protocol, "cmp-dup",
+    )
+
+    result = _outcome(stack, _outcome_payload(
+        change_set_id=change_set, base=base, tested=tested,
+        before=[before_binding], after=[after_binding],
+        comparison=comparison, acceptance="accepted",
+    ))
+
+    outcome = stack.application.get_outcome(result.refs[0].entity_id, USER)
+    assert outcome.effect_assessment.value == "inconclusive"
+    assert any("rounds" in note for note in outcome.limitations)
+
+
+def test_an_older_analyzer_round_does_not_count_towards_three(tmp_path):
+    stack = _stack(tmp_path)
+    base = _applied(stack, 101)
+    change_set = _change_set(stack, base)
+    tested = _applied(stack, 102, parent=base, change_set=change_set,
+                      origin="change_set")
+    before = [
+        _run(stack, base, f"v-before-{index}", [20, 20, 20, 20])
+        for index in range(3)
+    ]
+    protocol = _protocol(stack, "protocol-version")
+    stack.clock.advance(60)
+    after = [
+        _run(stack, tested, f"v-after-{index}", [10, 10, 10, 10])
+        for index in range(2)
+    ]
+    # A third round was analysed only under the older rule set: it is a real
+    # sample but not one of the current-version valid rounds.
+    stale = after[0][1].model_dump(mode="json")
+    stale["id"] = uid(890)
+    stale["artifact_id"] = uid(891)
+    stale["analyzer_version"] = "analyzer/0"
+    store_raw(stack.repository, "PerformanceSummary", stale)
+    comparison = _comparison(stack, before[0][1], after[0][1], protocol, "cmp-v")
+
+    result = _outcome(stack, _outcome_payload(
+        change_set_id=change_set, base=base, tested=tested,
+        before=[item[0] for item in before], after=[item[0] for item in after],
+        comparison=comparison, acceptance="accepted",
+    ))
+
+    outcome = stack.application.get_outcome(result.refs[0].entity_id, USER)
+    assert outcome.effect_assessment.value == "inconclusive"
+    assert any("rounds" in note for note in outcome.limitations)
+
+
+def test_an_unbound_binding_is_not_a_valid_round(tmp_path):
+    stack = _stack(tmp_path)
+    base = _applied(stack, 101)
+    change_set = _change_set(stack, base)
+    tested = _applied(stack, 102, parent=base, change_set=change_set,
+                      origin="change_set")
+    before = [
+        _run(stack, base, f"u-before-{index}", [20, 20, 20, 20])
+        for index in range(3)
+    ]
+    protocol = _protocol(stack, "protocol-unbound")
+    stack.clock.advance(60)
+    after = [
+        _run(stack, tested, f"u-after-{index}", [10, 10, 10, 10])
+        for index in range(2)
+    ]
+    loose = _run(stack, None, "u-loose", [10, 10, 10, 10], state="unverified")
+    comparison = _comparison(stack, before[0][1], after[0][1], protocol, "cmp-unbound")
+
+    result = _outcome(stack, _outcome_payload(
+        change_set_id=change_set, base=base, tested=tested,
+        before=[item[0] for item in before],
+        after=[item[0] for item in after] + [loose[0]],
+        comparison=comparison, acceptance="accepted",
+    ))
+
+    outcome = stack.application.get_outcome(result.refs[0].entity_id, USER)
+    assert outcome.effect_assessment.value == "inconclusive"
+    assert any("rounds" in note for note in outcome.limitations)
+
+
+def test_a_recommendation_adoption_above_the_change_set_downgrades(tmp_path):
+    stack = _stack(tmp_path)
+    base = _applied(stack, 101)
+    change_set = _change_set(stack, base)
+    changed = _applied(stack, 106, parent=base, change_set=change_set,
+                       origin="change_set")
+    tested = _applied(stack, 102, parent=changed, origin="recommendation")
+    before = [
+        _run(stack, base, f"r-before-{index}", [20, 20, 20, 20])
+        for index in range(3)
+    ]
+    protocol = _protocol(stack, "protocol-recommendation")
+    stack.clock.advance(60)
+    after = [
+        _run(stack, tested, f"r-after-{index}", [10, 10, 10, 10])
+        for index in range(3)
+    ]
+    comparison = _comparison(stack, before[0][1], after[0][1], protocol, "cmp-rec")
+
+    result = _outcome(stack, _outcome_payload(
+        change_set_id=change_set, base=base, tested=tested,
+        before=[item[0] for item in before], after=[item[0] for item in after],
+        comparison=comparison, acceptance="accepted",
+    ))
+
+    outcome = stack.application.get_outcome(result.refs[0].entity_id, USER)
+    assert outcome.effect_assessment.value == "inconclusive"
+    assert any("outside this ChangeSet" in note for note in outcome.limitations)
 
 
 # --- round fixtures ---------------------------------------------------------

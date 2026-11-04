@@ -118,7 +118,10 @@ def _task_count(fixture):
 # --- tests ------------------------------------------------------------------
 
 
-def test_help_lists_every_command_and_writes_nothing(tmp_path, capsys):
+def test_help_lists_every_command_and_writes_nothing(tmp_path, capsys, monkeypatch):
+    # The default database path is relative to the working directory, so the
+    # check only means anything when CWD is the temporary directory.
+    monkeypatch.chdir(tmp_path)
     with pytest.raises(SystemExit) as stopped:
         cli.main(["--help"])
     assert stopped.value.code == 0
@@ -130,6 +133,7 @@ def test_help_lists_every_command_and_writes_nothing(tmp_path, capsys):
     ):
         assert command in out
     assert not (tmp_path / "product.sqlite3").exists()
+    assert not (tmp_path / "managed").exists()
 
 
 def test_a_forged_field_is_refused_before_any_write(tmp_path, capsys):
@@ -230,6 +234,82 @@ def test_another_players_task_is_not_found(tmp_path, capsys):
     finally:
         stored.close()
     assert row["state"] == "queued"
+
+
+def test_an_invalid_request_id_never_escapes_as_a_traceback(tmp_path, capsys):
+    fixture = _fixture(tmp_path)
+    argv = _args(fixture, "session", "get", fixture.session_id, scope=OTHER)
+    argv += ["--request-id", "not-an-id"]
+
+    code, out, err = _run(capsys, argv)
+
+    # A malformed flag is a validation failure with a fresh correlation id,
+    # not a crash inside envelope construction.
+    assert code == 2
+    assert out == ""
+    envelope = json.loads(err)
+    assert envelope["code"] == "INPUT_VALIDATION_FAILED"
+    assert len(envelope["request_id"]) == 32
+    assert "not-an-id" not in err
+
+
+def test_a_valid_request_id_still_reaches_the_resource_error(tmp_path, capsys):
+    fixture = _fixture(tmp_path)
+    argv = _args(fixture, "session", "get", fixture.session_id, scope=OTHER)
+    argv += ["--request-id", "0123456789abcdef0123456789abcdef"]
+
+    code, _, err = _run(capsys, argv)
+
+    assert code == 4
+    envelope = json.loads(err)
+    assert envelope["code"] == "RESOURCE_NOT_FOUND"
+    assert envelope["request_id"] == "0123456789abcdef0123456789abcdef"
+
+
+def test_an_invalid_user_scope_is_a_context_error(tmp_path, capsys):
+    fixture = _fixture(tmp_path)
+
+    code, _, err = _run(
+        capsys, _args(fixture, "session", "get", fixture.session_id, scope="alice"),
+    )
+
+    assert code == 3
+    assert json.loads(err)["code"] == "SESSION_CONTEXT_INVALID"
+
+
+def test_wait_runs_the_named_task_even_when_another_is_queued_first(tmp_path, capsys):
+    fixture = _fixture(tmp_path)
+    first = _input_file(tmp_path, _feedback_payload(fixture, "first"), "first.json")
+    second = _input_file(tmp_path, _feedback_payload(fixture, "second"), "second.json")
+    _, accepted_out, _ = _run(
+        capsys, _args(fixture, "feedback", "record", "--input", first, key="a"),
+    )
+    first_task = json.loads(accepted_out)["task_id"]
+
+    code, out, _ = _run(
+        capsys,
+        _args(fixture, "feedback", "record", "--input", second, key="b", wait=True),
+    )
+
+    payload = json.loads(out)
+    assert code == 0
+    assert payload["task"]["state"] == "partial"
+    assert payload["task"]["id"] != first_task
+
+
+def test_a_write_refuses_a_missing_key_before_touching_the_database(tmp_path, capsys):
+    fixture = _fixture(tmp_path)
+    missing = tmp_path / "not-created.sqlite3"
+    path = _input_file(tmp_path, _feedback_payload(fixture, "the scene stutters"))
+
+    code, _, err = _run(capsys, [
+        "feedback", "record", "--input", path, "--db", str(missing),
+        "--user-scope", USER,
+    ])
+
+    assert code == 2
+    assert json.loads(err)["code"] == "IDEMPOTENCY_KEY_REQUIRED"
+    assert not missing.exists()
 
 
 def test_the_same_key_and_content_replay_the_same_bytes(tmp_path, capsys):

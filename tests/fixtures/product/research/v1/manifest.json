@@ -1,0 +1,37 @@
+{
+  "fixture_id": "research",
+  "version": 1,
+  "schema_version": "fixture/1",
+  "files": [
+    {
+      "relative_name": "fh6-extraction-results.json",
+      "byte_length": 11754,
+      "sha256": "81934406a2ae80cfa94e150aa2413f66267efa6299af8f20a7b26413d3c7f072",
+      "media_type": "application/json"
+    },
+    {
+      "relative_name": "fh6-new-source-extraction.json",
+      "byte_length": 8987,
+      "sha256": "e3c74e9948773d486ba608608c75f39bd1dcc74a98d42bd1711add01f0640e98",
+      "media_type": "application/json"
+    },
+    {
+      "relative_name": "fh6-extraction-checks.json",
+      "byte_length": 8483,
+      "sha256": "db5e11ab7b619f964b32e9bdb27ba3f50f23004fd848ddb561ae0746550e2c86",
+      "media_type": "application/json"
+    },
+    {
+      "relative_name": "fh6-new-source-checks.json",
+      "byte_length": 7915,
+      "sha256": "84ac8020b8878035db910ca989c322c0ff6b972071fdf089b3f7c9af634609ef",
+      "media_type": "application/json"
+    }
+  ],
+  "annotation_method": "model_recheck: same-session review of frozen copies; not an independent annotation",
+  "known_limitations": [
+    "the checks files describe a same-session model recheck, not an independent gold standard",
+    "the copies are frozen byte-for-byte from the repository originals",
+    "no images were read; image coverage stays not_run"
+  ]
+}

@@ -1,0 +1,369 @@
+{
+  "date": "2026-11-01",
+  "extraction_sha256": "E3C74E9948773D486BA608608C75F39BD1DCC74A98D42BD1711ADD01F0640E98",
+  "review_method": "保存后由同一会话逐项回查原文，再机械比对；非独立人工基准",
+  "fixed_checks": [
+    {
+      "scope": "DOT_graphics",
+      "setting": "预设",
+      "match": true
+    },
+    {
+      "scope": "DOT_graphics",
+      "setting": "车辆细节",
+      "match": true
+    },
+    {
+      "scope": "DOT_graphics",
+      "setting": "环境纹理",
+      "match": true
+    },
+    {
+      "scope": "DOT_graphics",
+      "setting": "环境几何",
+      "match": true
+    },
+    {
+      "scope": "DOT_graphics",
+      "setting": "车身反射",
+      "match": true
+    },
+    {
+      "scope": "DOT_graphics",
+      "setting": "屏幕空间反射",
+      "match": true
+    },
+    {
+      "scope": "DOT_graphics",
+      "setting": "光追反射",
+      "match": true
+    },
+    {
+      "scope": "DOT_graphics",
+      "setting": "阴影",
+      "match": true
+    },
+    {
+      "scope": "DOT_graphics",
+      "setting": "夜间阴影",
+      "match": true
+    },
+    {
+      "scope": "DOT_graphics",
+      "setting": "屏幕空间全局光照",
+      "match": true
+    },
+    {
+      "scope": "DOT_graphics",
+      "setting": "光追全局光照",
+      "match": true
+    },
+    {
+      "scope": "DOT_graphics",
+      "setting": "着色器",
+      "match": true
+    },
+    {
+      "scope": "DOT_graphics",
+      "setting": "音频",
+      "match": true
+    },
+    {
+      "scope": "DOT_graphics",
+      "setting": "可变形地形",
+      "match": true
+    },
+    {
+      "scope": "DOT_graphics",
+      "setting": "粒子效果",
+      "match": true
+    },
+    {
+      "scope": "DOT_graphics",
+      "setting": "体积雾",
+      "match": true
+    },
+    {
+      "scope": "DOT_graphics",
+      "setting": "镜头效果",
+      "match": true
+    },
+    {
+      "scope": "DOT_graphics",
+      "setting": "运动模糊质量",
+      "match": true
+    },
+    {
+      "scope": "DOT_video_selected",
+      "setting": "垂直同步",
+      "match": true
+    },
+    {
+      "scope": "DOT_video_selected",
+      "setting": "全屏",
+      "match": true
+    },
+    {
+      "scope": "DOT_video_selected",
+      "setting": "运动模糊",
+      "match": true
+    },
+    {
+      "scope": "DOT_video_selected",
+      "setting": "DLAA",
+      "match": true
+    },
+    {
+      "scope": "DOT_video_selected",
+      "setting": "DLSS",
+      "match": true
+    },
+    {
+      "scope": "DOT_video_selected",
+      "setting": "Reflex",
+      "match": true
+    }
+  ],
+  "matrix_cell_checks": [
+    {
+      "setting": "超分／抗锯齿",
+      "column": "budget",
+      "match": true
+    },
+    {
+      "setting": "超分／抗锯齿",
+      "column": "mid",
+      "match": true
+    },
+    {
+      "setting": "超分／抗锯齿",
+      "column": "high",
+      "match": true
+    },
+    {
+      "setting": "光追反射",
+      "column": "budget",
+      "match": true
+    },
+    {
+      "setting": "光追反射",
+      "column": "mid",
+      "match": true
+    },
+    {
+      "setting": "光追反射",
+      "column": "high",
+      "match": true
+    },
+    {
+      "setting": "光追全局光照",
+      "column": "budget",
+      "match": true
+    },
+    {
+      "setting": "光追全局光照",
+      "column": "mid",
+      "match": true
+    },
+    {
+      "setting": "光追全局光照",
+      "column": "high",
+      "match": true
+    },
+    {
+      "setting": "屏幕空间全局光照",
+      "column": "budget",
+      "match": true
+    },
+    {
+      "setting": "屏幕空间全局光照",
+      "column": "mid",
+      "match": true
+    },
+    {
+      "setting": "屏幕空间全局光照",
+      "column": "high",
+      "match": true
+    },
+    {
+      "setting": "屏幕空间反射",
+      "column": "budget",
+      "match": true
+    },
+    {
+      "setting": "屏幕空间反射",
+      "column": "mid",
+      "match": true
+    },
+    {
+      "setting": "屏幕空间反射",
+      "column": "high",
+      "match": true
+    },
+    {
+      "setting": "阴影",
+      "column": "budget",
+      "match": true
+    },
+    {
+      "setting": "阴影",
+      "column": "mid",
+      "match": true
+    },
+    {
+      "setting": "阴影",
+      "column": "high",
+      "match": true
+    },
+    {
+      "setting": "夜间阴影",
+      "column": "budget",
+      "match": true
+    },
+    {
+      "setting": "夜间阴影",
+      "column": "mid",
+      "match": true
+    },
+    {
+      "setting": "夜间阴影",
+      "column": "high",
+      "match": true
+    },
+    {
+      "setting": "车身反射",
+      "column": "budget",
+      "match": true
+    },
+    {
+      "setting": "车身反射",
+      "column": "mid",
+      "match": true
+    },
+    {
+      "setting": "车身反射",
+      "column": "high",
+      "match": true
+    },
+    {
+      "setting": "环境纹理",
+      "column": "budget",
+      "match": true
+    },
+    {
+      "setting": "环境纹理",
+      "column": "mid",
+      "match": true
+    },
+    {
+      "setting": "环境纹理",
+      "column": "high",
+      "match": true
+    },
+    {
+      "setting": "着色器",
+      "column": "budget",
+      "match": true
+    },
+    {
+      "setting": "着色器",
+      "column": "mid",
+      "match": true
+    },
+    {
+      "setting": "着色器",
+      "column": "high",
+      "match": true
+    },
+    {
+      "setting": "车辆细节",
+      "column": "budget",
+      "match": true
+    },
+    {
+      "setting": "车辆细节",
+      "column": "mid",
+      "match": true
+    },
+    {
+      "setting": "车辆细节",
+      "column": "high",
+      "match": true
+    }
+  ],
+  "semantic_checks": [
+    {
+      "id": "HDR 设备状态",
+      "pass": true
+    },
+    {
+      "id": "分辨率策略与作者实例分开",
+      "pass": true
+    },
+    {
+      "id": "行驶帧率保留区间",
+      "pass": true
+    },
+    {
+      "id": "2K 不补具体像素",
+      "pass": true
+    },
+    {
+      "id": "硬件分档例子不等于实际测试硬件",
+      "pass": true
+    },
+    {
+      "id": "条件单元格不选固定值",
+      "pass": true
+    },
+    {
+      "id": "帧率数值不自动当平均值",
+      "pass": true
+    },
+    {
+      "id": "日期类型保留",
+      "pass": true
+    }
+  ],
+  "source_quality_findings": [
+    {
+      "id": "Q1",
+      "type": "hardware_compatibility",
+      "source_id": "GG",
+      "profile": "budget",
+      "affected_branch": "GTX 1650 使用 DLSS 的分支",
+      "detected": true,
+      "status": "排除不支持的技术分支，保留来源与其他候选",
+      "support_url": "https://www.nvidia.com/en-gb/geforce/graphics-cards/compare/",
+      "support_locator": "Technologies 表的 GTX 16 Series 与 DLSS Super Resolution 行"
+    },
+    {
+      "id": "Q2",
+      "type": "dependency_conflict_candidate",
+      "source_id": "GG",
+      "profile": "mid",
+      "affected_branch": "光追 GI 与屏幕空间 GI 同时非 Off",
+      "detected": true,
+      "status": "整列方案需复核；原文未明确备用条件，不自动改值",
+      "support_url": "https://www.techspot.com/article/3127-forza-horizon-6-optimization/",
+      "support_locator": "Global Illumination Quality 首段"
+    },
+    {
+      "id": "Q3",
+      "type": "table_prose_semantic_issue",
+      "source_id": "DOT",
+      "detected": true,
+      "status": "表格 Off 与相邻作用描述存在语义疑点，暂缓采用该解释；保留表值",
+      "source_locator": "Graphics & Performance 表的屏幕空间反射行及紧随的反射解释段"
+    }
+  ],
+  "counts": {
+    "dot_fixed": 24,
+    "dot_fixed_mismatches": 0,
+    "gg_matrix_cells": 33,
+    "gg_matrix_mismatches": 0,
+    "semantic_checks": 8,
+    "semantic_failures": 0
+  },
+  "coverage_note": "计数仅覆盖声明范围；来源问题不计成提取错误，也不由忠实提取证明原文正确。"
+}

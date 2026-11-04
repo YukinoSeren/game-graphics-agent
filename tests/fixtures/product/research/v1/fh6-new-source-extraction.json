@@ -1,0 +1,378 @@
+{
+  "run": {
+    "date": "2026-11-01",
+    "stage": "新来源迁移验证",
+    "method": "联网正文与表格读取＋本会话模型结构化；保存后回查原文",
+    "prior_per_field_gold_for_these_pages": false,
+    "prior_search_snippets_seen": true,
+    "independent_reviewer": false,
+    "independent_blind_test": false,
+    "note": "只检验选定范围；保留来源值，不把来源建议自动升级为事实或可执行配置。"
+  },
+  "sources": [
+    {
+      "id": "DOT",
+      "url": "https://dotesports.com/forza/news/best-forza-horizon-6-pc-settings",
+      "author": "Sourav Banik",
+      "published_date": null,
+      "updated_date": "2026-05-19",
+      "retrieved_date": "2026-11-01",
+      "locators": {
+        "hardware": "Best Forza Horizon 6 PC graphics settings 开头",
+        "graphics": "Graphics & Performance 表",
+        "video": "Video 表",
+        "observation": "开头设备段落中的行驶帧率描述"
+      }
+    },
+    {
+      "id": "GG",
+      "url": "https://games.gg/forza-horizon-6/guides/forza-horizon-6-pc-settings-best-graphics/",
+      "author": "Nuwel",
+      "published_date": "2026-05-15",
+      "updated_date": "2026-05-15",
+      "retrieved_date": "2026-11-01",
+      "locators": {
+        "matrix": "Recommended settings by GPU tier",
+        "environment": "Which upscaling technology should you use? 开头",
+        "fps": "DLSS 与 FSR 小节"
+      }
+    }
+  ],
+  "dot": {
+    "configuration_id": "DOT_CUSTOM",
+    "kind": "source_recommendation_with_observed_hardware",
+    "source_id": "DOT",
+    "graphics_locator": "graphics",
+    "graphics_settings": [
+      {
+        "setting": "预设",
+        "value": "Custom"
+      },
+      {
+        "setting": "车辆细节",
+        "value": "Extreme"
+      },
+      {
+        "setting": "环境纹理",
+        "value": "High"
+      },
+      {
+        "setting": "环境几何",
+        "value": "High"
+      },
+      {
+        "setting": "车身反射",
+        "value": "Extreme"
+      },
+      {
+        "setting": "屏幕空间反射",
+        "value": "Off"
+      },
+      {
+        "setting": "光追反射",
+        "value": "Low"
+      },
+      {
+        "setting": "阴影",
+        "value": "Extreme"
+      },
+      {
+        "setting": "夜间阴影",
+        "value": "Ultra"
+      },
+      {
+        "setting": "屏幕空间全局光照",
+        "value": "Off"
+      },
+      {
+        "setting": "光追全局光照",
+        "value": "Low"
+      },
+      {
+        "setting": "着色器",
+        "value": "High"
+      },
+      {
+        "setting": "音频",
+        "value": "Ultra"
+      },
+      {
+        "setting": "可变形地形",
+        "value": "Extreme"
+      },
+      {
+        "setting": "粒子效果",
+        "value": "Ultra"
+      },
+      {
+        "setting": "体积雾",
+        "value": "High"
+      },
+      {
+        "setting": "镜头效果",
+        "value": "High"
+      },
+      {
+        "setting": "运动模糊质量",
+        "value": "Medium"
+      }
+    ],
+    "video_selected_fixed": [
+      {
+        "setting": "垂直同步",
+        "value": "Off"
+      },
+      {
+        "setting": "全屏",
+        "value": "On"
+      },
+      {
+        "setting": "运动模糊",
+        "value": "Short"
+      },
+      {
+        "setting": "DLAA",
+        "value": "On"
+      },
+      {
+        "setting": "DLSS",
+        "value": "Off"
+      },
+      {
+        "setting": "Reflex",
+        "value": "On + Boost"
+      }
+    ],
+    "video_nonfixed": [
+      {
+        "setting": "分辨率",
+        "type": "user_display_policy",
+        "policy": "显示器原生分辨率",
+        "author_observed_resolution": "1920x1080",
+        "universal_fixed_value": null
+      },
+      {
+        "setting": "HDR",
+        "type": "availability_observation",
+        "reported_state": "未检测到 HDR 显示器",
+        "recommended_switch": null
+      }
+    ],
+    "coverage": {
+      "graphics_table_complete": true,
+      "video_table_complete": false,
+      "runtime_configuration_complete": false,
+      "selection_scope": "图形表全表＋视频表中的六个固定项、分辨率与 HDR"
+    },
+    "environment": {
+      "gpu": "RTX 3060 Ti",
+      "vram_gb": null,
+      "cpu": "Ryzen 5 3600",
+      "ram_gb": 32,
+      "ram_description": "DDR4-3200",
+      "output_resolution": "1920x1080",
+      "game_build": null,
+      "driver_version": null,
+      "frame_generation": null
+    },
+    "observation": {
+      "source_id": "DOT",
+      "locator_key": "observation",
+      "configuration_id": "DOT_CUSTOM",
+      "binding": "同文上下文关联，非完整运行日志",
+      "type": "reported_gameplay_interval",
+      "value_min": 70,
+      "value_max": 85,
+      "unit": "fps",
+      "scene": "行驶",
+      "aggregation_method": null,
+      "average_fps": null,
+      "one_percent_low": null,
+      "duration_seconds": null,
+      "independently_reproduced": false
+    }
+  },
+  "gg": {
+    "source_id": "GG",
+    "configuration_kind": "tier_recommendation_templates",
+    "locator_key": "matrix",
+    "columns": [
+      {
+        "id": "budget",
+        "examples": [
+          "GTX 1650",
+          "RX 6500 XT"
+        ],
+        "examples_are_actual_benchmark_hardware": false
+      },
+      {
+        "id": "mid",
+        "examples": [
+          "RTX 3060 Ti",
+          "RX 6700 XT"
+        ],
+        "examples_are_actual_benchmark_hardware": false
+      },
+      {
+        "id": "high",
+        "examples": [
+          "RTX 4070 Ti+"
+        ],
+        "examples_are_actual_benchmark_hardware": false
+      }
+    ],
+    "matrix_rows": [
+      {
+        "setting": "超分／抗锯齿",
+        "values": [
+          "DLSS/FSR3 Performance",
+          "DLSS/FSR3 Quality",
+          "DLSS DLAA or Quality"
+        ]
+      },
+      {
+        "setting": "光追反射",
+        "values": [
+          "Off",
+          "Medium",
+          "High"
+        ]
+      },
+      {
+        "setting": "光追全局光照",
+        "values": [
+          "Off",
+          "Medium",
+          "Medium-High"
+        ]
+      },
+      {
+        "setting": "屏幕空间全局光照",
+        "values": [
+          "High",
+          "High",
+          "Off (use RTGI instead)"
+        ]
+      },
+      {
+        "setting": "屏幕空间反射",
+        "values": [
+          "High",
+          "Off (use RT instead)",
+          "Off (use RT instead)"
+        ]
+      },
+      {
+        "setting": "阴影",
+        "values": [
+          "High",
+          "Ultra",
+          "Ultra"
+        ]
+      },
+      {
+        "setting": "夜间阴影",
+        "values": [
+          "Ultra",
+          "Ultra",
+          "Extreme"
+        ]
+      },
+      {
+        "setting": "车身反射",
+        "values": [
+          "High",
+          "Ultra",
+          "Extreme"
+        ]
+      },
+      {
+        "setting": "环境纹理",
+        "values": [
+          "High",
+          "Ultra",
+          "Extreme"
+        ]
+      },
+      {
+        "setting": "着色器",
+        "values": [
+          "High",
+          "High",
+          "High"
+        ]
+      },
+      {
+        "setting": "车辆细节",
+        "values": [
+          "Extreme",
+          "Extreme",
+          "Extreme"
+        ]
+      }
+    ],
+    "conditional_cells": [
+      {
+        "setting": "超分／抗锯齿",
+        "column": "budget",
+        "selected_value": null
+      },
+      {
+        "setting": "超分／抗锯齿",
+        "column": "mid",
+        "selected_value": null
+      },
+      {
+        "setting": "超分／抗锯齿",
+        "column": "high",
+        "selected_value": null
+      },
+      {
+        "setting": "光追全局光照",
+        "column": "high",
+        "source_expression": "Medium-High",
+        "selected_value": null
+      }
+    ],
+    "coverage": {
+      "matrix_complete": true,
+      "game_menu_complete": false,
+      "runtime_configuration_complete": false
+    },
+    "benchmark_context": {
+      "gpu": "RTX 4070 Ti",
+      "cpu": "Ryzen 7 9800X3D",
+      "resolution_label": "2K",
+      "output_width": null,
+      "output_height": null,
+      "vram_gb": null,
+      "game_build": null,
+      "driver_version": null,
+      "frame_generation": null,
+      "full_graphics_configuration": null,
+      "locator_key": "environment"
+    },
+    "fps_claims": [
+      {
+        "mode": "DLAA",
+        "reported_fps": 50,
+        "metric_type": "unspecified_fps",
+        "average_fps": null
+      },
+      {
+        "mode": "DLSS Quality",
+        "reported_fps": 70,
+        "metric_type": "unspecified_fps",
+        "average_fps": null
+      },
+      {
+        "mode": "FSR3 Quality",
+        "reported_fps": 70,
+        "metric_type": "unspecified_fps",
+        "average_fps": null
+      }
+    ],
+    "fps_claims_binding": "来源将这些数字放在同一测试背景下；不关联到下方预算／中档／高档推荐列，也不认定为平均值。",
+    "other_fps_claims_extracted": false
+  }
+}

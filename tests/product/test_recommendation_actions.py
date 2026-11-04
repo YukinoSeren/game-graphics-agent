@@ -18,6 +18,7 @@ from game_app.contracts.enums import (
     ValueState,
 )
 from game_app.contracts.recommendation import TargetProposal
+from game_app.errors import ContractError, ErrorCode
 from game_app.knowledge import KnowledgeService
 from game_app.recommendation import (
     InputGate,
@@ -544,7 +545,7 @@ def test_an_accepted_record_without_checks_is_not_actionable(tmp_path):
     ) is RecommendationReadiness.blocked
 
 
-def test_explicit_preferences_stay_blocked_until_05(tmp_path):
+def test_an_unknown_preference_id_is_not_found(tmp_path):
     repository, files, context, device, package, knowledge, task_input, _ = _world(
         tmp_path, records=_applicable(dataset()),
     )
@@ -552,11 +553,12 @@ def test_explicit_preferences_stay_blocked_until_05(tmp_path):
     preference = _by_id(gate.checks)["preference.explicit"]
     assert preference.status is CheckStatus.not_applicable
     assert count_objects(repository, "Preference") == 0
-    with pytest.raises(Exception):
+    with pytest.raises(ContractError) as error:
         InputGate(repository, knowledge).check(
             task_input.model_copy(update={"preference_ids": [uid(700)]}),
             user_scope_id=SCOPE,
         )
+    assert error.value.code is ErrorCode.RESOURCE_NOT_FOUND
 
 
 def test_a_blocked_plan_downgrades_every_executable_action(tmp_path):

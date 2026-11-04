@@ -561,6 +561,21 @@ class PreferenceService:
         self.files = files
         self.clock = clock
 
+    def get_preference(self, preference_id: str, user_scope_id: str) -> Preference:
+        """One visible preference version; another player's is not found."""
+        stored = self.repository.find_object("Preference", preference_id)
+        if stored is None:
+            raise ContractError(
+                ErrorCode.RESOURCE_NOT_FOUND, "the preference is not available"
+            )
+        preference = Preference.model_validate_json(stored.payload_bytes)
+        feedback = _load_feedback(self.repository, preference.feedback_id)
+        if _feedback_owner(self.repository, feedback) != user_scope_id:
+            raise ContractError(
+                ErrorCode.RESOURCE_NOT_FOUND, "the preference is not available"
+            )
+        return preference
+
     def declare_preference(
         self,
         request: Any,

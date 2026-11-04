@@ -263,13 +263,122 @@ def test_an_applied_configuration_from_another_game_or_device_series_is_invalid(
     assert any("older device snapshot" in item for item in gate.limitations)
 
 
-def test_non_empty_preference_ids_are_rejected_and_no_preference_is_written(tmp_path):
+def _preference_fixture(
+    repository, files, context, device, *, explicitness="explicit",
+    lifecycle="active", owner=SCOPE,
+):
+    """A real session and feedback, then one Preference version read by 05."""
+    from game_app.application import Application
+    from game_app.contracts.common import MutationContext
+    from game_app.contracts.performance import CreateSessionRequest
+    from game_app.repository import canonical_json
+    from tests.product.test_sessions import FakeClock
+
+    application = Application(repository, file_root=str(files.root), clock=FakeClock())
+    request = CreateSessionRequest.model_validate_json(canonical_json({
+        "installation_id": uid(301),
+        "device_snapshot_id": device.id,
+        "game_context_id": context.id,
+        "applied_id": None,
+        "configuration_state": "unverified",
+        "run_declaration": {
+            "installation_id": uid(301), "fields": {}, "raw_text": "",
+        },
+        "test_protocol_id": None,
+        "recommendation_id": None,
+    }))
+    result = application.create_session(request, MutationContext(
+        user_scope_id=owner, idempotency_key="preference-session",
+        request_id=uid(990),
+    ))
+    session_id = next(
+        ref.entity_id for ref in result.refs if ref.entity_type == "PlaySession"
+    )
+    feedback_id = uid(720)
+    store_raw(repository, "Feedback", {
+        "id": feedback_id,
+        "schema_version": "product-contract/0.4",
+        "created_at": "2026-11-03T00:00:00+00:00",
+        "created_by_task_id": None,
+        "session_id": session_id,
+        "segment_id": None,
+        "raw_text": "keep motion blur",
+        "selections": {"feeling": "satisfied"},
+        "symptoms": [],
+        "interpretation_status": "unparsed",
+    })
+    preference_id = uid(721)
+    store_raw(repository, "Preference", {
+        "id": preference_id,
+        "schema_version": "product-contract/0.4",
+        "created_at": "2026-11-03T00:00:00+00:00",
+        "created_by_task_id": None,
+        "series_id": preference_id,
+        "version": 1,
+        "parent_id": None,
+        "scope": "global",
+        "scope_id": None,
+        "content": "keep motion blur on",
+        "explicitness": explicitness,
+        "lifecycle": lifecycle,
+        "feedback_id": feedback_id,
+    })
+    return preference_id
+
+
+def test_a_named_explicit_preference_is_resolved_but_stays_unproven(tmp_path):
+    repository, files, _, context, device, package = _world(tmp_path)
+    preference_id = _preference_fixture(repository, files, context, device)
+    task_input = _input(context, device, package, preference_ids=[preference_id])
+
+    gate = _gate(repository, files, task_input)
+
+    preference = {
+        item.check_id: item for item in gate.checks
+    }["preference.explicit"]
+    assert preference.status is CheckStatus.unknown
+    assert preference_id in preference.note
+    assert [item.id for item in gate.preferences] == [preference_id]
+    assert count_objects(repository, "Preference") == 1
+
+
+def test_a_tentative_preference_is_only_a_weak_reference(tmp_path):
+    repository, files, _, context, device, package = _world(tmp_path)
+    preference_id = _preference_fixture(
+        repository, files, context, device, explicitness="tentative",
+    )
+    task_input = _input(context, device, package, preference_ids=[preference_id])
+
+    gate = _gate(repository, files, task_input)
+
+    preference = {
+        item.check_id: item for item in gate.checks
+    }["preference.explicit"]
+    assert preference.status is not CheckStatus.unknown
+    assert any("weak reference" in note for note in gate.limitations)
+
+
+def test_an_unknown_preference_id_is_not_found(tmp_path):
     repository, files, _, context, device, package = _world(tmp_path)
     task_input = _input(context, device, package, preference_ids=[uid(700)])
+
     with pytest.raises(ContractError) as error:
-        _assess(repository, files, task_input)
-    assert error.value.code is ErrorCode.REFERENCE_INVALID
+        _gate(repository, files, task_input)
+
+    assert error.value.code is ErrorCode.RESOURCE_NOT_FOUND
     assert count_objects(repository, "Preference") == 0
+
+
+def test_another_players_preference_is_not_found(tmp_path):
+    from game_app.feedback import PreferenceService
+
+    repository, files, _, context, device, _ = _world(tmp_path)
+    preference_id = _preference_fixture(repository, files, context, device)
+
+    with pytest.raises(ContractError) as error:
+        PreferenceService(repository, files).get_preference(preference_id, OTHER)
+
+    assert error.value.code is ErrorCode.RESOURCE_NOT_FOUND
 
 
 # --- 6..9: candidate pool and match class -----------------------------------

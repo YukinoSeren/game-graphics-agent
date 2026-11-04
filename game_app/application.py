@@ -79,19 +79,20 @@ class Application:
             # Without a registry the type stays unregistered and is refused at
             # registration instead of running an empty success.
             self.tasks.handlers["capture"] = self.performance.handle_capture
+        self.preferences = PreferenceService(repository, self.files, clock=clock)
         self.recommendations = RecommendationService(
             repository,
             self.files,
             self.knowledge,
             adoption=self.adoption,
             performance=self.performance,
+            preferences=self.preferences,
             clock=clock,
         )
         self.review = ReviewService(repository, self.knowledge, clock=clock)
         # 03's consumer exists: the impact notice gets a real host.
         self.tasks.handlers["recommendation"] = self.recommendations.handle
         self.feedbacks = FeedbackService(repository, self.files, self.tasks, clock=clock)
-        self.preferences = PreferenceService(repository, self.files, clock=clock)
         self.acceptances = TargetAcceptanceService(repository, self.files, clock=clock)
         self.next_actions = NextActionService(
             repository,

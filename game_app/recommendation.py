@@ -188,6 +188,7 @@ class GateResult:
     limitations: list[str]
     checks: list[CheckResult]
     user_scope_id: str
+    preferences: list[Any] = field(default_factory=list)
 
 
 class InputGate:
@@ -199,6 +200,7 @@ class InputGate:
         knowledge: Any,
         adoption: Any | None = None,
         performance: Any | None = None,
+        preferences: Any | None = None,
         *,
         clock=utc_now,
     ) -> None:
@@ -206,21 +208,26 @@ class InputGate:
         self.knowledge = knowledge
         self.adoption = adoption
         self.performance = performance
+        self.preferences = preferences
         self.clock = clock
 
     def check(
         self, task_input: RecommendationInput, *, user_scope_id: str
     ) -> GateResult:
+        # E-4: a named preference is read through 05's owned read entry.  Only
+        # an active, explicit preference is a protection item; a tentative or
+        # withdrawn version is a weak reference and is reported, not enforced.
+        resolved: list[Any] = []
         if task_input.preference_ids:
-            # 05 has no Preference contract; a non-empty list cannot be honoured.
-            raise ContractError(
-                ErrorCode.REFERENCE_INVALID,
-                "no explicit preference is visible in this product build",
-                field_errors=[FieldError(
-                    path="preference_ids", code="reference",
-                    message="preferences are not implemented (05)",
-                )],
-            )
+            service = self.preferences
+            if service is None:
+                from game_app.feedback import PreferenceService
+
+                service = PreferenceService(self.repository, None)
+            resolved = [
+                service.get_preference(item, user_scope_id)
+                for item in task_input.preference_ids
+            ]
         package = self.knowledge.get_package(
             task_input.package_id, user_scope_id=user_scope_id, verify_artifacts=True,
         )
@@ -271,6 +278,41 @@ class InputGate:
             for summary_id in task_input.history_summary_ids
         ]
 
+        protected = [
+            item for item in resolved
+            if item.explicitness.value == "explicit"
+            and item.lifecycle.value == "active"
+        ]
+        weak = [
+            item for item in resolved
+            if item.explicitness.value != "explicit"
+            or item.lifecycle.value != "active"
+        ]
+        for item in weak:
+            limitations.append(
+                f"preference {item.id} is {item.explicitness.value}/"
+                f"{item.lifecycle.value} and is only a weak reference"
+            )
+        if not resolved:
+            preference_status = CheckStatus.not_applicable
+            preference_note = "no explicit preference is named"
+        elif protected:
+            # 03 §4: a clear preference in scope is protected.  The text is not
+            # machine-evaluable, so compatibility cannot be *proven*; the check
+            # stays unknown and the version can be at most provisional.
+            preference_status = CheckStatus.unknown
+            preference_note = (
+                "active explicit preference(s) "
+                + ", ".join(item.id for item in protected)
+                + " cannot be proven compatible with every candidate"
+            )
+        else:
+            preference_status = CheckStatus.not_applicable
+            preference_note = (
+                "only tentative or withdrawn preferences were named; they are"
+                " weak references, not protections"
+            )
+
         checks = [
             _check("identity.context", CheckStatus.pass_, clock=self.clock),
             _check(
@@ -295,9 +337,9 @@ class InputGate:
             ),
             _check(
                 "preference.explicit",
-                CheckStatus.not_applicable,
+                preference_status,
                 clock=self.clock,
-                note="no preference contract exists in this build (05)",
+                note=preference_note,
             ),
         ]
         return GateResult(
@@ -312,6 +354,7 @@ class InputGate:
             limitations=limitations,
             checks=checks,
             user_scope_id=user_scope_id,
+            preferences=resolved,
         )
 
     # -- sub-resources -----------------------------------------------------
@@ -1133,12 +1176,13 @@ def assess_candidates(
     user_scope_id: str,
     adoption: Any | None = None,
     performance: Any | None = None,
+    preferences: Any | None = None,
     clock=utc_now,
     model_candidates: Sequence[Any] | None = None,
 ) -> list[CandidateAssessment]:
     """The read-only candidate assessment (03 §5); no write, no provider call."""
     gate = InputGate(
-        repository, knowledge, adoption, performance, clock=clock,
+        repository, knowledge, adoption, performance, preferences, clock=clock,
     )
     result = gate.check(task_input, user_scope_id=user_scope_id)
     builder = CandidateBuilder(repository, knowledge, clock=clock)
@@ -2505,6 +2549,7 @@ class RecommendationService:
         *,
         adoption: Any | None = None,
         performance: Any | None = None,
+        preferences: Any | None = None,
         clock=utc_now,
     ) -> None:
         self.repository = repository
@@ -2512,13 +2557,14 @@ class RecommendationService:
         self.knowledge = knowledge
         self.adoption = adoption
         self.performance = performance
+        self.preferences = preferences
         self.clock = clock
 
     @property
     def gate(self) -> InputGate:
         return InputGate(
             self.repository, self.knowledge, self.adoption, self.performance,
-            clock=self.clock,
+            self.preferences, clock=self.clock,
         )
 
     # -- registration ------------------------------------------------------

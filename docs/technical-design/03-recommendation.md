@@ -75,6 +75,8 @@ ReviewService `consume_impact(notice_id:ID)->ResourceResult` 校验02消息/依�
 
 每次替换保存原基准引用、原值→新值、替换证据与依赖复核。来源测试只证明某场景或整套变化时，不把收益拆到单项，不累加跨作者百分比。视觉描述等级可沿原03记录作者主张，缺依据为unknown，不生成画质雷达分。偏好明确且范围匹配时保护，tentative只作弱参考，不能覆盖硬约束。
 
+E-4（05 交付后关闭 D 批次 deferred 项）：`RecommendationInput.preference_ids` 非空时经 05 的归属读取解析（他人偏好 `RESOURCE_NOT_FOUND`）；只有 `lifecycle=active` 且 `explicitness=explicit` 的版本作为保护项进入 `preference.explicit` 检查。偏好文本不可机器证明兼容，因此存在保护项时该检查为 `unknown`，版本最多 `provisional`；`tentative`/`withdrawn` 只作弱参考并记入限制，不降级为 `pass`。历史推荐始终读原 `preference_ids` 快照，不读当前有效视图。
+
 | 检查组 | pass条件 | 未通过时动作 |
 |---|---|---|
 | 身份/引用/原件 | 游戏、包、记录/修订成员、hash、可见与可用性有效 | 错引用请求422；合法来源无法形成方案则blocked，旧事实保留 |

@@ -21,6 +21,7 @@ from typing import Any, Sequence
 from game_app.application import Application
 from game_app.contracts.common import MutationContext
 from game_app.errors import ContractError, ErrorCode
+from game_app.lock import ApplicationLock
 from game_app.repository import ProductRepository, canonical_json
 
 CONTRACT_VERSION = "product-contract/0.4"
@@ -206,18 +207,35 @@ def _load_json(source: str) -> Any:
         ) from error
 
 
+def _files_root(args: argparse.Namespace) -> str:
+    return args.files or os.environ.get("GAME_APP_FILES") or DEFAULT_FILES
+
+
+def _db_path(args: argparse.Namespace) -> Path:
+    return Path(args.db or os.environ.get("GAME_APP_DB") or DEFAULT_DB)
+
+
 def _repository(args: argparse.Namespace) -> ProductRepository:
-    path = args.db or os.environ.get("GAME_APP_DB") or DEFAULT_DB
-    repository = ProductRepository(path)
+    repository = ProductRepository(_db_path(args))
     repository.migrate()
     return repository
 
 
 def _application(args: argparse.Namespace, repository: ProductRepository) -> Application:
-    root = args.files or os.environ.get("GAME_APP_FILES") or DEFAULT_FILES
     # No provider is configured from the CLI: a remote model is never called
     # implicitly, and a task needing one reports that state honestly.
-    return Application(repository, file_root=root)
+    return Application(repository, file_root=_files_root(args))
+
+
+def _is_worker(args: argparse.Namespace) -> bool:
+    """Commands that advance the execution slot need the single-writer lock.
+
+    Reads, registrations and short control requests are deliberately not
+    locked: they must complete while a long task is running (07 §3).
+    """
+    if args.command == "task" and args.action == "run":
+        return True
+    return bool(getattr(args, "wait", False))
 
 
 def _dump(value: Any) -> dict[str, Any]:
@@ -377,6 +395,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     # the raw flag value is never echoed back or placed in the envelope.
     request_id = uuid.uuid4().hex
     repository = None
+    lock: ApplicationLock | None = None
     try:
         request_id = _request_id(args)
         # Resolve the scope and the key before opening the database: a missing
@@ -388,6 +407,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             "GAME_APP_USER_SCOPE_ID"
         ):
             _user_scope(args)
+        # 07 §1: the worker slot is exclusive.  The lock sits beside the
+        # database it protects, so two workers on one database cannot both run
+        # even when they were given different managed-file roots.  A second
+        # worker gets a stable storage error; a crash releases the lock with
+        # its handle.
+        if _is_worker(args):
+            lock = ApplicationLock(_db_path(args).parent).acquire()
         repository = _repository(args)
         application = _application(args, repository)
         _emit(dispatch(application, args))
@@ -406,6 +432,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     finally:
         if repository is not None:
             repository.close()
+        if lock is not None:
+            lock.release()
 
 
 if __name__ == "__main__":  # pragma: no cover - console entry point

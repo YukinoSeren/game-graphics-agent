@@ -160,13 +160,111 @@ def test_help_and_errors_do_not_print_private_paths_or_secrets(tmp_path):
         assert ".env" not in output
 
 
-def test_the_distribution_report_marks_the_single_writer_lock_not_run(tmp_path):
-    """07 asks for one application process; no lock is implemented yet.
+LOCK_HOLDER = """
+import sys
+from game_app.lock import ApplicationLock
 
-    The honest result is ``not_run`` with its reason.  This test does not start
-    a second worker and does not invent a lock.
-    """
+lock = ApplicationLock(sys.argv[1]).acquire()
+sys.stdout.write("ready\\n")
+sys.stdout.flush()
+sys.stdin.readline()
+lock.release()
+"""
 
+
+@pytest.fixture
+def held_lock(tmp_path):
+    """A second process holding the database's worker lock."""
+
+    # The lock lives beside the database it protects (07 §1).
+    root = tmp_path
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(REPO_ROOT)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    process = subprocess.Popen(
+        [sys.executable, "-B", "-c", LOCK_HOLDER, str(root)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        env=environment,
+    )
+    try:
+        ready = process.stdout.readline().strip()
+        assert ready == "ready", process.stderr.read()
+        yield root
+    finally:
+        try:
+            process.stdin.write("stop\n")
+            process.stdin.flush()
+            process.stdin.close()
+        except (OSError, ValueError):
+            pass
+        process.wait(timeout=60)
+
+
+def _worker_command(tmp_path, root, *extra):
+    return (
+        "task", "run",
+        "--db", str(tmp_path / "product.sqlite3"),
+        "--files", str(root),
+        "--user-scope", SCOPE,
+        *extra,
+    )
+
+
+def test_a_second_worker_is_refused_while_one_holds_the_lock(tmp_path, held_lock):
+    result = _run_cli(*_worker_command(tmp_path, tmp_path / "managed"), cwd=tmp_path)
+
+    assert result.returncode == 6  # storage
+    payload = json.loads(result.stderr)
+    assert payload["code"] == "STORAGE_COMMIT_FAILED"
+    # The refusal names no private absolute path.
+    assert str(tmp_path) not in result.stderr
+
+
+def test_short_requests_still_complete_while_the_worker_holds_the_lock(
+    tmp_path, held_lock
+):
+    result = _run_cli(
+        "package", "get", "0" * 32,
+        "--db", str(tmp_path / "product.sqlite3"),
+        "--files", str(tmp_path / "managed"),
+        "--user-scope", SCOPE,
+        cwd=tmp_path,
+    )
+    # A read is not a worker: it runs and reports its own not_found.
+    assert result.returncode == 4
+    assert json.loads(result.stderr)["code"] == "RESOURCE_NOT_FOUND"
+
+
+def test_the_lock_is_released_when_its_holder_exits(tmp_path):
+    root = tmp_path
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(REPO_ROOT)
+    holder = subprocess.run(
+        [sys.executable, "-B", "-c",
+         "import sys\n"
+         "from game_app.lock import ApplicationLock\n"
+         "ApplicationLock(sys.argv[1]).acquire()\n"
+         "print('ok')\n",
+         str(root)],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=60,
+    )
+    assert holder.returncode == 0, holder.stderr
+
+    result = _run_cli(*_worker_command(tmp_path, tmp_path / "managed"), cwd=tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"task_id": None, "state": None}
+
+
+def test_the_distribution_report_records_what_ran_and_what_did_not(tmp_path):
     results = [
         CaseResult(
             case_id="ENG-T05.package-data",
@@ -183,13 +281,23 @@ def test_the_distribution_report_marks_the_single_writer_lock_not_run(tmp_path):
             case_id="ENG-T05.single-writer",
             fixture_version=1,
             run_id="distribution-1",
+            status="passed",
+            evidence_level="integration",
+            observed_files=[],
+            failure_notes=[],
+            executed=True,
+            requirement_ids=["ENG-T05", "ENG-V05"],
+        ),
+        CaseResult(
+            case_id="ENG-T05.online-install",
+            fixture_version=1,
+            run_id="distribution-1",
             status="not_run",
             evidence_level="integration",
             observed_files=[],
             failure_notes=[
-                "07 §1 asks for an exclusive application lock before a second"
-                " worker starts; game_app has no such lock yet, and this slice"
-                " does not invent one"
+                "F-R11: the install check must not download; only a local"
+                " --no-index wheel was verified"
             ],
             executed=False,
             requirement_ids=["ENG-T05"],
@@ -201,9 +309,8 @@ def test_the_distribution_report_marks_the_single_writer_lock_not_run(tmp_path):
                    ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-    payload = json.loads(report.read_text(encoding="utf-8"))
-    summary = summarize_results(payload)
-    assert summary["passed"] == 1
+    summary = summarize_results(json.loads(report.read_text(encoding="utf-8")))
+    assert summary["passed"] == 2
     assert summary["not_run"] == 1
-    assert summary["gaps"][0]["case_id"] == "ENG-T05.single-writer"
-    assert "exclusive application lock" in summary["gaps"][0]["reason"]
+    assert summary["gaps"][0]["case_id"] == "ENG-T05.online-install"
+    assert "must not download" in summary["gaps"][0]["reason"]

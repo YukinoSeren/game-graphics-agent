@@ -2248,6 +2248,44 @@ def research_format_registry(
     return registry
 
 
+def load_research_annotations(directory: str | Path) -> list[ResearchAnnotation]:
+    """Read the annotation files an operator placed for the research formats.
+
+    A missing directory, a malformed file or two annotations for one format is
+    refused.  Dropping them silently would turn "the annotation is wrong" into
+    "there is no annotation", and the second reading hides a real mistake.
+    """
+
+    directory = Path(directory)
+    if not directory.is_dir():
+        raise ContractError(
+            ErrorCode.INPUT_VALIDATION_FAILED,
+            "the research annotation directory does not exist",
+        )
+    annotations: list[ResearchAnnotation] = []
+    seen: set[str] = set()
+    for path in sorted(directory.glob("*.json")):
+        try:
+            annotation = ResearchAnnotation.model_validate_json(
+                path.read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeDecodeError, ValidationError) as error:
+            raise ContractError(
+                ErrorCode.INPUT_VALIDATION_FAILED,
+                f"the research annotation {path.name!r} does not satisfy the"
+                " annotation contract",
+            ) from error
+        if annotation.format_id in seen:
+            raise ContractError(
+                ErrorCode.INPUT_VALIDATION_FAILED,
+                f"two research annotations name {annotation.format_id!r};"
+                " exactly one annotation admits a format",
+            )
+        seen.add(annotation.format_id)
+        annotations.append(annotation)
+    return annotations
+
+
 @dataclass(frozen=True)
 class ResearchFrozenDocument:
     relative_name: str
@@ -4038,6 +4076,7 @@ __all__ = [
     "default_format_registry",
     "frozen_group_from_file_ids",
     "import_fingerprint",
+    "load_research_annotations",
     "map_research_document",
     "mapping_context_hash",
     "read_frozen_bytes",

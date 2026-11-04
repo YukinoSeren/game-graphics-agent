@@ -1,0 +1,10 @@
+{
+  "format_id": "research-result/v1",
+  "source_file": "fh6-extraction-results.json",
+  "fixture_id": "template-do-not-use",
+  "fixture_sha256": "81934406a2ae80cfa94e150aa2413f66267efa6299af8f20a7b26413d3c7f072",
+  "annotation_method": "model_recheck",
+  "reviewer_source": "template only: fill in a real independent reviewer",
+  "reviewer_is_session_model": true,
+  "field_coverage": []
+}

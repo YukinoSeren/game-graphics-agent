@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from game_app.contracts.knowledge import ImportedRecord, ImportSnapshot
+from game_app.errors import ContractError
 from game_app.files import FileService
 from game_app.importer import (
     RESEARCH_CHECKS_FORMAT_ID,
@@ -29,6 +30,7 @@ from game_app.importer import (
     ResearchAnnotation,
     ResearchImporter,
     default_format_registry,
+    load_research_annotations,
     map_research_document,
     research_format_registry,
     research_format_specs,
@@ -41,6 +43,7 @@ from tests.product.support.fixtures import FixtureLoader
 SCOPE = "a" * 32
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_ROOT = PRODUCT_FIXTURES / "research" / "v1"
+ANNOTATION_ROOT = PRODUCT_FIXTURES / "research" / "annotations"
 
 
 # -- helpers ------------------------------------------------------------------
@@ -171,6 +174,68 @@ def _synthetic_annotation(document_bytes: bytes, name: str, **overrides):
         coverage=coverage,
         **overrides,
     )
+
+
+# -- the annotation protocol --------------------------------------------------
+
+
+def test_the_annotation_template_is_refused_and_says_why():
+    annotations = load_research_annotations(ANNOTATION_ROOT)
+    assert len(annotations) == 1
+    template = annotations[0]
+    assert template.annotation_method == "model_recheck"
+    problems = research_annotation_problems(template)
+    assert any("model_recheck" in problem for problem in problems)
+    assert any("session" in problem for problem in problems)
+    assert any("does not cover" in problem for problem in problems)
+    assert research_format_specs(annotations) == []
+    assert RESEARCH_RESULT_FORMAT_ID not in research_format_registry(annotations).format_ids
+
+
+def test_a_missing_annotation_directory_is_refused(tmp_path):
+    with pytest.raises(ContractError) as caught:
+        load_research_annotations(tmp_path / "no-such-directory")
+    assert caught.value.code.value == "INPUT_VALIDATION_FAILED"
+
+
+def test_a_malformed_annotation_file_is_not_silently_ignored(tmp_path):
+    directory = tmp_path / "annotations"
+    directory.mkdir()
+    (directory / "broken.json").write_text("{not json", encoding="utf-8")
+    with pytest.raises(ContractError) as caught:
+        load_research_annotations(directory)
+    assert "broken.json" in caught.value.message
+
+
+def test_two_annotations_for_one_format_are_refused(tmp_path):
+    document = json.dumps(_synthetic_result(), ensure_ascii=False).encode("utf-8")
+    annotation = _synthetic_annotation(document, "synthetic-research-result.json")
+    directory = tmp_path / "annotations"
+    directory.mkdir()
+    for name in ("a.json", "b.json"):
+        (directory / name).write_text(
+            annotation.model_dump_json(indent=2), encoding="utf-8"
+        )
+    with pytest.raises(ContractError) as caught:
+        load_research_annotations(directory)
+    assert RESEARCH_RESULT_FORMAT_ID in caught.value.message
+
+
+def test_a_complete_independent_annotation_file_admits_its_format(tmp_path):
+    document = json.dumps(_synthetic_result(), ensure_ascii=False).encode("utf-8")
+    annotation = _synthetic_annotation(document, "synthetic-research-result.json")
+    directory = tmp_path / "annotations"
+    directory.mkdir()
+    (directory / "research-result.json").write_text(
+        annotation.model_dump_json(indent=2), encoding="utf-8"
+    )
+
+    loaded = load_research_annotations(directory)
+    assert research_annotation_problems(loaded[0]) == []
+    registry = research_format_registry(loaded)
+    assert RESEARCH_RESULT_FORMAT_ID in registry.format_ids
+    inspection = registry.inspect_files({"synthetic-research-result.json": document})
+    assert inspection.format_id == RESEARCH_RESULT_FORMAT_ID
 
 
 # -- the gate ----------------------------------------------------------------

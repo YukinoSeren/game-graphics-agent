@@ -240,8 +240,8 @@ def test_identical_gpu_names_stay_separate_and_none_is_selected(tmp_path):
     probe = StubProbe(values={
         "gpus.0.raw_name": "Generic GPU",
         "gpus.1.raw_name": "Generic GPU",
-        "gpus.0.vram_bytes": "8589934592",
-        "gpus.1.vram_bytes": "17179869184",
+        "gpus.0.vram_bytes": "3221225472",
+        "gpus.1.vram_bytes": "2147483648",
     })
     repo, files, device, tasks = _env(tmp_path, probe)
     accepted = _scan(
@@ -254,7 +254,7 @@ def test_identical_gpu_names_stay_separate_and_none_is_selected(tmp_path):
     assert len(snapshot.gpus) == 2
     assert snapshot.gpus[0].id != snapshot.gpus[1].id
     assert [gpu.raw_name.value for gpu in snapshot.gpus] == ["Generic GPU", "Generic GPU"]
-    assert [gpu.vram_bytes.value for gpu in snapshot.gpus] == [8589934592, 17179869184]
+    assert [gpu.vram_bytes.value for gpu in snapshot.gpus] == [3221225472, 2147483648]
     assert snapshot.selected_gpu_id is None
 
 
@@ -293,6 +293,42 @@ def test_adapter_receives_exactly_the_requested_whitelisted_paths(tmp_path):
     _scan(tasks, ["cpu", "os_version"])
     tasks.run_once()
     assert probe.calls == [["cpu", "os_version"]]
+
+
+def test_saturated_wmi_vram_is_unknown_not_four_gib(tmp_path):
+    # WMI's 32-bit AdapterRAM reports 4 GiB - 1 MiB for any card with >= 4 GiB.
+    # A real laptop RTX 4060 reports exactly this; reading it as "known 4 GiB"
+    # would put a wrong value into the snapshot.
+    probe = StubProbe(values={
+        "gpus.0.raw_name": "Synthetic Laptop GPU",
+        "gpus.0.vram_bytes": "4293918720",
+        "gpus.0.driver_version": "32.0.16.2101",
+    })
+    repo, files, device, tasks = _env(tmp_path, probe)
+    accepted = _scan(
+        tasks, ["gpus.0.raw_name", "gpus.0.vram_bytes", "gpus.0.driver_version"],
+    )
+    tasks.run_once()
+
+    snapshot = _snapshot(repo, accepted.task_id)
+    gpu = snapshot.gpus[0]
+    assert gpu.raw_name.value_state is ValueState.known
+    assert gpu.vram_bytes.value is None
+    assert gpu.vram_bytes.value_state is ValueState.unknown
+    assert gpu.vram_bytes.unknown_reason == "parse_failed"
+
+
+def test_a_plausible_vram_value_is_still_known(tmp_path):
+    probe = StubProbe(values={
+        "gpus.0.raw_name": "Synthetic GPU",
+        "gpus.0.vram_bytes": "3221225472",
+    })
+    repo, files, device, tasks = _env(tmp_path, probe)
+    accepted = _scan(tasks, ["gpus.0.raw_name", "gpus.0.vram_bytes"])
+    tasks.run_once()
+
+    snapshot = _snapshot(repo, accepted.task_id)
+    assert snapshot.gpus[0].vram_bytes.value == 3221225472
 
 
 def test_resolution_is_only_built_from_a_complete_positive_pair(tmp_path):

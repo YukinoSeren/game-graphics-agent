@@ -535,7 +535,7 @@ class DeviceService:
                 return _unknown_field()
 
             raw_name = gpu_attribute("raw_name", _parse_text)
-            vram = gpu_attribute("vram_bytes", _parse_positive_int)
+            vram = gpu_attribute("vram_bytes", _parse_vram_bytes)
             driver = gpu_attribute("driver_version", _parse_text)
             if raw_name.value_state is ValueState.known:
                 gpu = GpuSnapshot(
@@ -1765,6 +1765,22 @@ def _parse_int(text: str | None) -> int | None:
 def _parse_positive_int(text: str | None) -> int | None:
     value = _parse_int(text)
     return value if value is not None and value > 0 else None
+
+
+# WMI's ``AdapterRAM`` is a 32-bit field.  A card with 4 GiB or more saturates
+# it, and Windows reports ``4293918720`` (4 GiB - 1 MiB) for every such card.
+# That number is an artifact, not a measurement: reading it as "known 4 GiB"
+# would put a wrong value into a device snapshot (observed on a laptop whose
+# RTX 4060 reports exactly this value).  Anything at or above the saturation
+# point stays unknown instead.
+_VRAM_SATURATION = 4 * 1024 ** 3 - 1024 ** 2
+
+
+def _parse_vram_bytes(text: str | None) -> int | None:
+    value = _parse_positive_int(text)
+    if value is None or value >= _VRAM_SATURATION:
+        return None
+    return value
 
 
 def _parse_positive_float(text: str | None) -> float | None:

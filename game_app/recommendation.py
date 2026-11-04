@@ -9,20 +9,28 @@ model-supplied expression.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
+import uuid
 from typing import Any, Iterable, Mapping, Sequence
 
 from game_app.contracts.common import (
     CheckResult,
     EvidenceRef,
+    FieldValue,
     KnowledgeRecordRef,
     ObjectRef,
 )
+from game_app.contracts.configuration import SettingRef
 from game_app.contracts.device import DeviceSnapshot, GameContext
 from game_app.contracts.enums import (
+    AcquisitionStatus,
     CheckStatus,
+    FrameStreamKind,
     GameIdentityStatus,
     LegacyRecordState,
     PublicationStatus,
+    RecommendationActionKind,
+    RecommendationReadiness,
     ValueState,
 )
 from game_app.contracts.knowledge import (
@@ -31,10 +39,12 @@ from game_app.contracts.knowledge import (
     KnowledgePackage,
     SettingIdentityMapping,
 )
+from game_app.contracts.performance import NumericValueV01
 from game_app.contracts.primitives import utc_now
 from game_app.contracts.recommendation import (
     AssignmentV01,
     CandidateAssessment,
+    RecommendationAction,
     SettingValueV01,
 )
 from game_app.contracts.tasks import RecommendationInput
@@ -1179,7 +1189,13 @@ def validate_actions(
     package: KnowledgePackage | None = None,
     clock=utc_now,
 ) -> list[CheckResult]:
-    """Shape, evidence and dependency-group validation (03 §5, base form)."""
+    """Full action validation: shape, evidence, reference, group, branch, restart.
+
+    A self-invented menu value, an illegal output reference, an incomplete
+    dependency group or two mutually exclusive ``set_value`` actions all fail
+    the action checks; the original output is kept as a diagnostic, never
+    published as actionable.
+    """
     if package is None:
         package = knowledge.get_package(
             task_input.package_id, user_scope_id=user_scope_id,
@@ -1190,9 +1206,14 @@ def validate_actions(
             ErrorCode.REFERENCE_INVALID,
             "an unpublished package is not a recommendation input",
         )
-    members = set(package.record_snapshot_ids)
+    with repository.unit_of_work() as uow:
+        records = knowledge._package_records(uow, package)
+    record_by_id = {record.id: record for record in records}
+    members = set(record_by_id)
     checks: list[CheckResult] = []
-    groups: dict[str, int] = {}
+    groups: dict[str, list[str]] = {}
+    branches: dict[str, list[str]] = {}
+    expected_members: dict[str, set[str]] = {}
     for action in actions:
         action_id = _field(action, "action_id")
         kind = _field(action, "action")
@@ -1202,6 +1223,11 @@ def validate_actions(
         menu_path = _field(action, "menu_path") or []
         group = _field(action, "dependency_group_id")
 
+        setting = _setting_record(setting_ref, record_by_id)
+        setting_payload = _setting_payload(setting)
+        local_setting = (
+            setting.local_record_id if setting is not None else action_id
+        )
         checks.append(_action_ref_check(action_id, setting_ref, members, clock))
         if kind in ("set_value", "conditional_strategy"):
             # A value's shape and its evidence only exist for an executable action;
@@ -1210,6 +1236,12 @@ def validate_actions(
             checks.append(
                 _action_evidence_check(action_id, kind, evidence_refs, clock)
             )
+            checks.append(_action_membership_check(
+                action_id, kind, value, setting_payload, clock,
+            ))
+            checks.append(_action_evidence_refs_check(
+                action_id, evidence_refs, members, clock,
+            ))
         if kind in ("set_value", "conditional_strategy") and not menu_path:
             checks.append(_check(
                 "operation.menu", CheckStatus.unknown, clock=clock,
@@ -1226,23 +1258,101 @@ def validate_actions(
             clock=clock,
             note=f"{action_id}",
         ))
-        restart = _field(action, "restart_required")
-        checks.append(_check(
-            "restart.required", CheckStatus.unknown, clock=clock,
-            note=f"{action_id} restart requirement is unknown"
-            if restart is None else f"{action_id} restart requirement recorded",
-        ))
+        checks.append(_restart_check(action_id, action, clock))
         if isinstance(group, str) and group:
-            groups[group] = groups.get(group, 0) + 1
+            groups.setdefault(group, []).append(str(local_setting))
+            declared = setting_payload.get("dependency_group_members")
+            if isinstance(declared, list) and declared:
+                expected_members[group] = {str(item) for item in declared}
+        branch = setting_payload.get("branch_group")
+        if (
+            isinstance(branch, str) and branch
+            and kind in ("set_value", "conditional_strategy")
+        ):
+            branches.setdefault(branch, []).append(str(action_id))
 
-    for group, count in groups.items():
+    for group, actual in groups.items():
+        expected = expected_members.get(group)
+        complete = expected is None or expected == set(actual)
         checks.append(_check(
             "combination.dependency_group",
-            CheckStatus.pass_ if count > 1 else CheckStatus.fail,
+            CheckStatus.pass_ if complete and len(actual) > 0 else CheckStatus.fail,
             clock=clock,
-            note=f"{group} has {count} member(s)",
+            note=(
+                f"{group} has {len(actual)} member(s); expected"
+                f" {sorted(expected) if expected else 'the complete group'}"
+            ),
         ))
+    for branch, action_ids in branches.items():
+        if len(action_ids) > 1:
+            checks.append(_check(
+                "branch.exclusion", CheckStatus.fail, clock=clock,
+                note=f"{branch} would set {sorted(action_ids)} at once",
+            ))
+        else:
+            checks.append(_check(
+                "branch.exclusion", CheckStatus.pass_, clock=clock,
+                note=f"{branch} has one executable branch",
+            ))
     return checks
+
+
+def _setting_record(setting_ref: Any, record_by_id: Mapping[str, ImportedRecord]):
+    if _field(setting_ref, "kind") != "knowledge":
+        return None
+    record = _field(setting_ref, "record")
+    return record_by_id.get(_field(record, "record_snapshot_id"))
+
+
+def _action_membership_check(
+    action_id: Any, kind: Any, value: Any, setting: Mapping[str, Any], clock
+) -> CheckResult:
+    allowed = setting.get("allowed_values")
+    if kind != "set_value" or not isinstance(allowed, list) or not allowed:
+        return _check(
+            "value.membership", CheckStatus.not_applicable, clock=clock,
+            note=f"{action_id} has no declared value list to check",
+        )
+    actual = _value_mapping(value).get("value")
+    ok = actual in allowed
+    return _check(
+        "value.membership", CheckStatus.pass_ if ok else CheckStatus.fail,
+        clock=clock,
+        note=f"{action_id} value {actual!r} is in the sourced list" if ok
+        else f"{action_id} value {actual!r} is not a sourced menu value",
+    )
+
+
+def _action_evidence_refs_check(
+    action_id: Any, evidence_refs: Any, members: set[str], clock
+) -> CheckResult:
+    missing = []
+    for ref in evidence_refs:
+        if _field(ref, "kind") != "knowledge":
+            continue
+        record = _field(ref, "record")
+        if _field(record, "record_snapshot_id") not in members:
+            missing.append(_field(record, "record_snapshot_id"))
+    return _check(
+        "reference.evidence", CheckStatus.fail if missing else CheckStatus.pass_,
+        clock=clock,
+        note=f"{action_id} cites package evidence" if not missing
+        else f"{action_id} cites records outside the package: {missing}",
+    )
+
+
+def _restart_check(action_id: Any, action: Any, clock) -> CheckResult:
+    restart = _field(action, "restart_required")
+    state = getattr(restart, "value_state", None)
+    if restart is None or state is ValueState.unknown:
+        return _check(
+            "restart.required", CheckStatus.unknown, clock=clock,
+            note=f"{action_id} restart requirement is unknown",
+        )
+    return _check(
+        "restart.required", CheckStatus.pass_, clock=clock,
+        note=f"{action_id} restart requirement is recorded",
+    )
 
 
 def _action_value_check(
@@ -1322,6 +1432,734 @@ def _value_mapping(value: Any) -> dict[str, Any]:
     return {}
 
 
+# --- REC-T02: baseline, actions, alternatives, target, readiness -------------
+
+DECLARED_SCOPE = "recommendation.configuration"
+_CRITICAL_PREFIXES = (
+    "identity.", "reference.", "branch.", "value.", "combination.",
+    "preference.", "operation.", "restart.", "evidence.",
+)
+_NON_CRITICAL_PREFIXES = ("target.", "candidate.", "diagnostic.")
+_ACTION_NS = uuid.NAMESPACE_URL
+
+
+def _stable_id(*parts: Any) -> str:
+    return uuid.uuid5(_ACTION_NS, "recommendation:" + ":".join(map(str, parts))).hex
+
+
+def _unknown_field(reason: str = "not_provided"):
+    return FieldValue(
+        value_state=ValueState.unknown,
+        value=None,
+        unknown_reason=reason,
+        acquisition_status=AcquisitionStatus.not_attempted,
+    )
+
+
+def _known_field(value: Any):
+    return FieldValue(
+        value_state=ValueState.known,
+        value=value,
+        acquisition_status=AcquisitionStatus.succeeded,
+    )
+
+
+@dataclass(frozen=True)
+class BaselineSelection:
+    base_configuration_ref: KnowledgeRecordRef | None
+    assessment: CandidateAssessment | None
+    ranked: list[str]
+    rejected: list[tuple[str, str]]
+    checks: list[CheckResult]
+    limitations: list[str]
+    provisional: bool
+
+
+class BaselineSelector:
+    """Choose a complete author baseline with an explainable, dimensioned order.
+
+    No weighted score, no confidence percentage: the dimensions are compared in
+    the 03 order and a tie is recorded as such rather than hidden by the id.
+    """
+
+    def __init__(self, repository: Any, knowledge: Any, *, clock=utc_now) -> None:
+        self.repository = repository
+        self.knowledge = knowledge
+        self.clock = clock
+
+    def select(
+        self,
+        assessments: Sequence[CandidateAssessment],
+        *,
+        user_scope_id: str,
+    ) -> BaselineSelection:
+        if not assessments:
+            return BaselineSelection(
+                base_configuration_ref=None,
+                assessment=None,
+                ranked=[],
+                rejected=[],
+                checks=[_check("reference.base", CheckStatus.fail, clock=self.clock,
+                               note="the package yields no candidate")],
+                limitations=["no candidate configuration is available"],
+                provisional=True,
+            )
+        package = self.knowledge.get_package(
+            assessments[0].configuration_ref.package_id,
+            user_scope_id=user_scope_id,
+            verify_artifacts=False,
+        )
+        with self.repository.unit_of_work() as uow:
+            records = self.knowledge._package_records(uow, package)
+        by_local: dict[tuple[str, str], ImportedRecord] = {}
+        for record in records:
+            by_local.setdefault(
+                (record.capture_scope_id, record.local_record_id), record
+            )
+        complete: list[CandidateAssessment] = []
+        rejected: list[tuple[str, str]] = []
+        for assessment in assessments:
+            reason = self._incomplete_reason(assessment, records, by_local)
+            if reason is None:
+                complete.append(assessment)
+            else:
+                rejected.append(
+                    (assessment.configuration_ref.record_snapshot_id, reason)
+                )
+        if not complete:
+            return BaselineSelection(
+                base_configuration_ref=None,
+                assessment=None,
+                ranked=[],
+                rejected=rejected,
+                checks=[_check("reference.base", CheckStatus.fail, clock=self.clock,
+                               note="no complete baseline")],
+                limitations=[
+                    "no candidate has a complete, resolvable configuration;"
+                    " no baseline is fabricated"
+                ],
+                provisional=True,
+            )
+        ordered = sorted(complete, key=self._rank)
+        tied = len(ordered) > 1 and self._rank_key(ordered[0]) == self._rank_key(
+            ordered[1]
+        )
+        chosen = ordered[0]
+        limitations = [
+            f"rejected {record_id}: {reason}" for record_id, reason in rejected
+        ]
+        if tied:
+            limitations.append(
+                "several candidates compare equally on the verified dimensions;"
+                " the first by stable id is provisional, not proven better"
+            )
+        return BaselineSelection(
+            base_configuration_ref=chosen.configuration_ref,
+            assessment=chosen,
+            ranked=[item.configuration_ref.record_snapshot_id for item in ordered],
+            rejected=rejected,
+            checks=[_check(
+                "reference.base", CheckStatus.pass_, clock=self.clock,
+                note="a complete author baseline is selected",
+            )],
+            limitations=limitations,
+            provisional=tied,
+        )
+
+    def _incomplete_reason(
+        self,
+        assessment: CandidateAssessment,
+        records: Sequence[ImportedRecord],
+        by_local: Mapping[tuple[str, str], ImportedRecord],
+    ) -> str | None:
+        record_id = assessment.configuration_ref.record_snapshot_id
+        record = next((item for item in records if item.id == record_id), None)
+        if record is None:
+            return "the configuration record is not a package member"
+        payload = record.payload if isinstance(record.payload, Mapping) else {}
+        assignments = payload.get("assignments")
+        if not isinstance(assignments, list) or not assignments:
+            return "the configuration has no assignment"
+        scope = record.capture_scope_id
+        for item in assignments:
+            if not isinstance(item, Mapping):
+                return "an assignment is not readable"
+            setting_id = item.get("setting_id")
+            if not isinstance(setting_id, str):
+                return "an assignment names no setting"
+            setting = by_local.get((scope, setting_id))
+            if setting is None or setting.record_type != "settings":
+                return f"setting {setting_id} does not resolve inside the package"
+            evidence_ids = item.get("evidence_ids") or []
+            if not isinstance(evidence_ids, list) or not evidence_ids:
+                return f"setting {setting_id} has no evidence inside the package"
+            for evidence_id in evidence_ids:
+                evidence = by_local.get((scope, str(evidence_id)))
+                if evidence is None or evidence.record_type != "evidence":
+                    return f"evidence {evidence_id} does not resolve inside the package"
+        return None
+
+    @staticmethod
+    def _rank(assessment: CandidateAssessment) -> tuple:
+        return BaselineSelector._rank_key(assessment) + (
+            # The source's own order is a deterministic tie-break for display;
+            # it is not evidence that the first record is better.
+            assessment.configuration_ref.local_record_id,
+            assessment.configuration_ref.record_snapshot_id,
+        )
+
+    @staticmethod
+    def _rank_key(assessment: CandidateAssessment) -> tuple:
+        status = {item.check_id: item.status for item in assessment.condition_checks}
+        unknowns = sum(
+            1 for item in assessment.condition_checks
+            if item.status is CheckStatus.unknown
+        )
+        explanation = int(bool(assessment.performance_basis)) + int(
+            bool(assessment.visual_basis)
+        )
+        return (
+            -int(status.get("candidate.applicability") is CheckStatus.pass_),
+            -int(status.get("candidate.gpu") is CheckStatus.pass_),
+            -int(status.get("candidate.resolution") is CheckStatus.pass_),
+            -int(status.get("candidate.version") is CheckStatus.pass_),
+            -int(status.get("candidate.reproducibility") is CheckStatus.pass_),
+            -explanation,
+            -int(not any(
+                item.status is CheckStatus.fail
+                for item in assessment.independence_checks
+            )),
+            unknowns,
+        )
+
+
+def select_baseline(
+    assessments: Sequence[CandidateAssessment],
+    *,
+    repository: Any,
+    knowledge: Any,
+    user_scope_id: str,
+    clock=utc_now,
+) -> BaselineSelection:
+    return BaselineSelector(repository, knowledge, clock=clock).select(
+        assessments, user_scope_id=user_scope_id,
+    )
+
+
+@dataclass(frozen=True)
+class ActionBuildResult:
+    actions: list[Any]
+    checks: list[CheckResult]
+    limitations: list[str]
+
+
+class ActionValidator:
+    """Full action validation: value, evidence, reference, group, branch, restart."""
+
+    def __init__(self, repository: Any, knowledge: Any, *, clock=utc_now) -> None:
+        self.repository = repository
+        self.knowledge = knowledge
+        self.clock = clock
+
+    def validate(
+        self,
+        task_input: RecommendationInput,
+        actions: Sequence[Any],
+        *,
+        user_scope_id: str,
+    ) -> list[CheckResult]:
+        return validate_actions(
+            task_input, actions, repository=self.repository,
+            knowledge=self.knowledge, user_scope_id=user_scope_id,
+            clock=self.clock,
+        )
+
+
+def _setting_payload(record: ImportedRecord | None) -> dict[str, Any]:
+    if record is None or not isinstance(record.payload, Mapping):
+        return {}
+    return dict(record.payload)
+
+
+def _base_members(
+    repository: Any,
+    knowledge: Any,
+    selection: BaselineSelection,
+    user_scope_id: str,
+) -> tuple[KnowledgePackage, ImportedRecord, dict, dict[tuple[str, str], ImportedRecord]]:
+    ref = selection.base_configuration_ref
+    if ref is None:
+        raise ContractError(
+            ErrorCode.REFERENCE_INVALID, "there is no complete baseline to build on",
+        )
+    package = knowledge.get_package(
+        ref.package_id, user_scope_id=user_scope_id, verify_artifacts=False,
+    )
+    with repository.unit_of_work() as uow:
+        records = knowledge._package_records(uow, package)
+    by_local: dict[tuple[str, str], ImportedRecord] = {}
+    for record in records:
+        by_local.setdefault(
+            (record.capture_scope_id, record.local_record_id), record
+        )
+    config = next((item for item in records if item.id == ref.record_snapshot_id), None)
+    if config is None:
+        raise ContractError(
+            ErrorCode.REFERENCE_INVALID, "the baseline is not a package member",
+        )
+    return package, config, _setting_payload(config), by_local
+
+
+def _assignment_values(payload: Mapping[str, Any]) -> list[AssignmentV01]:
+    return [AssignmentV01.model_validate(item) for item in payload.get("assignments") or []]
+
+
+def _current_for(applied: Any, setting_ref: Any):
+    if applied is None:
+        return _unknown_field("not_provided")
+    for setting in getattr(applied, "settings", []) or []:
+        if setting.setting_ref.key == setting_ref.key:
+            return setting.value
+    return _unknown_field("not_provided")
+
+
+def build_actions(
+    task_input: RecommendationInput,
+    selection: BaselineSelection,
+    *,
+    repository: Any,
+    knowledge: Any,
+    user_scope_id: str,
+    applied: Any | None = None,
+    clock=utc_now,
+) -> ActionBuildResult:
+    """Every assignment becomes one explicit, deterministic action."""
+    package, config, payload, by_local = _base_members(
+        repository, knowledge, selection, user_scope_id,
+    )
+    scope = config.capture_scope_id
+    actions: list[Any] = []
+    checks: list[CheckResult] = []
+    limitations: list[str] = []
+    for assignment in _assignment_values(payload):
+        setting = by_local.get((scope, assignment.setting_id))
+        setting_payload = _setting_payload(setting)
+        setting_ref = SettingRef(
+            kind="knowledge",
+            record=_record_ref(package.id, setting) if setting is not None else None,
+        )
+        menu_path = [
+            str(item) for item in setting_payload.get("menu_path") or []
+            if isinstance(item, str) and item.strip()
+        ]
+        evidence_refs = [
+            _knowledge_evidence(package.id, by_local[(scope, evidence_id)])
+            for evidence_id in assignment.evidence_ids
+            if (scope, evidence_id) in by_local
+            and by_local[(scope, evidence_id)].record_type == "evidence"
+        ]
+        restart = setting_payload.get("restart_required")
+        restart_required = (
+            _known_field(bool(restart))
+            if isinstance(restart, bool) and setting_payload.get("restart_proof")
+            else _unknown_field("not_provided")
+        )
+        group = setting_payload.get("dependency_group")
+        group_id = group if isinstance(group, str) and group else None
+        current = _current_for(applied, setting_ref)
+        kind = "set_value"
+        if assignment.value.value_kind == "unknown":
+            kind = "check_in_game"
+        elif _same_value(current, assignment.value):
+            kind = "keep_current"
+        elif assignment.value.value_kind != "fixed":
+            kind = "conditional_strategy"
+        action = {
+            "action_id": _stable_id(
+                package.id, config.id, assignment.setting_id, kind,
+            ),
+            "setting_ref": setting_ref,
+            "setting_identity_ref": None,
+            "action": RecommendationActionKind(kind),
+            "value": assignment.value,
+            "current_value": current,
+            "menu_path": menu_path,
+            "reason": _action_reason(kind, assignment, setting_payload),
+            "evidence_refs": evidence_refs,
+            "dependency_group_id": group_id,
+            "restart_required": restart_required,
+            "checks": [],
+        }
+        actions.append(RecommendationAction.model_validate(action))
+        if kind == "check_in_game":
+            limitations.append(
+                f"{assignment.setting_id} has no sourced fixed value;"
+                " it is a check in game, not a value"
+            )
+        if not menu_path and kind in ("set_value", "conditional_strategy"):
+            limitations.append(
+                f"{assignment.setting_id} has no sourced menu path; execution is"
+                " provisional"
+            )
+        if restart_required.value_state is ValueState.unknown:
+            limitations.append(
+                f"{assignment.setting_id} restart requirement is unknown"
+            )
+    return ActionBuildResult(
+        actions=actions, checks=checks, limitations=limitations,
+    )
+
+
+def _same_value(current: Any, value: SettingValueV01) -> bool:
+    if getattr(current, "value_state", None) is not ValueState.known:
+        return False
+    return value.value_kind == "fixed" and current.value == value.value
+
+
+def _action_reason(kind: str, assignment: AssignmentV01, setting: Mapping[str, Any]) -> str:
+    name = setting.get("canonical_name") or setting.get("raw_name") or assignment.setting_id
+    if kind == "keep_current":
+        return f"keep {name}: the current value already matches the sourced value"
+    if kind == "check_in_game":
+        return f"check {name} in game: the sourced value is unresolved"
+    if kind == "conditional_strategy":
+        return f"apply {name} only along the sourced branches"
+    return f"set {name} to the sourced fixed value"
+
+
+def build_alternatives(
+    task_input: RecommendationInput,
+    actions: Sequence[Any],
+    overrides: Sequence[Mapping[str, Any]],
+    *,
+    recommendation_id: str,
+    repository: Any,
+    knowledge: Any,
+    user_scope_id: str,
+    clock=utc_now,
+) -> tuple[list[Any], list[CheckResult], list[str]]:
+    """Apply overrides one by one and revalidate the whole combination."""
+    from game_app.contracts.recommendation import RecommendationAlternative
+
+    existing = {_field(action, "action_id"): action for action in actions}
+    alternatives: list[Any] = []
+    checks: list[CheckResult] = []
+    limitations: list[str] = []
+    for index, override in enumerate(overrides):
+        label = str(_field(override, "label") or f"alternative-{index + 1}")
+        replacements = _field(override, "overrides") or []
+        replaced = dict(existing)
+        valid = True
+        for replacement in replacements:
+            action_id = _field(replacement, "action_id")
+            if action_id not in existing:
+                valid = False
+                limitations.append(
+                    f"{label} override {action_id!r} does not name a main action"
+                )
+                break
+            if isinstance(replacement, RecommendationAction):
+                replaced[action_id] = replacement
+                continue
+            # JSON round-trip: in JSON mode strict pydantic accepts enum strings.
+            merged = existing[action_id].model_dump(mode="json")
+            merged.update(dict(replacement))
+            merged["action"] = RecommendationActionKind(merged["action"]).value
+            try:
+                replaced[action_id] = RecommendationAction.model_validate_json(
+                    json.dumps(merged)
+                )
+            except ValueError:
+                valid = False
+                limitations.append(
+                    f"{label} override {action_id!r} is not a legal action"
+                )
+                break
+        if not valid:
+            continue
+        combined = list(replaced.values())
+        combined_checks = validate_actions(
+            task_input, combined, repository=repository, knowledge=knowledge,
+            user_scope_id=user_scope_id, clock=clock,
+        )
+        fatal = [
+            item for item in combined_checks
+            if item.status is CheckStatus.fail
+            and item.check_id.startswith(_CRITICAL_PREFIXES)
+        ]
+        if fatal:
+            limitations.append(
+                f"{label} fails full revalidation: {fatal[0].check_id}"
+            )
+            continue
+        alternative = RecommendationAlternative(
+            id=_stable_id(recommendation_id, label, *sorted(replaced)),
+            label=f"integrated configuration verified over the author baseline: {label}",
+            base_recommendation_id=recommendation_id,
+            action_overrides=[
+                replaced[_field(item, "action_id")] for item in replacements
+            ],
+            checks=combined_checks,
+        )
+        alternatives.append(alternative)
+        checks.extend(combined_checks)
+    if not alternatives and overrides:
+        limitations.append(
+            "no override survives full revalidation; alternatives stay empty"
+        )
+    return alternatives, checks, limitations
+
+
+def build_target(
+    package: KnowledgePackage,
+    records: Sequence[ImportedRecord],
+    *,
+    clock=utc_now,
+    task_id: str | None = None,
+) -> tuple[Any | None, list[CheckResult], list[str]]:
+    """A target only from a measurement that states its statistic and stream."""
+    from game_app.contracts.recommendation import TargetProposal
+
+    checks: list[CheckResult] = []
+    limitations: list[str] = []
+    candidates: list[tuple[ImportedRecord, dict]] = []
+    for record in records:
+        if record.record_type != "evidence":
+            continue
+        payload = record.payload if isinstance(record.payload, Mapping) else {}
+        numeric = payload.get("numeric")
+        if not (
+            payload.get("is_target") is True
+            and isinstance(payload.get("statistic_definition"), str)
+            and payload["statistic_definition"].strip()
+            and isinstance(numeric, Mapping)
+            and payload.get("frame_stream_kind") in (
+                "application_present", "displayed",
+            )
+        ):
+            continue
+        candidates.append((record, payload))
+    if not candidates:
+        checks.append(_check(
+            "target.present", CheckStatus.not_run, clock=clock,
+            note="no sourced target with a statistic definition and stream",
+        ))
+        limitations.append(
+            "no sourced target: no default frame rate is invented"
+        )
+        return None, checks, limitations
+    record, payload = sorted(
+        candidates, key=lambda item: item[0].local_record_id
+    )[0]
+    value = NumericValueV01.model_validate({
+        "value": None, "lower": None, "upper": None, "unknown_reason": None,
+        **dict(payload["numeric"]),
+    })
+    proposal = TargetProposal(
+        id=_stable_id(package.id, record.id, "target"),
+        schema_version="product-contract/0.4",
+        created_at=clock(),
+        created_by_task_id=task_id,
+        value=value,
+        basis_refs=[_knowledge_evidence(package.id, record)],
+        frame_stream_kind=FrameStreamKind(payload["frame_stream_kind"]),
+        note=str(payload.get("statement") or "sourced target"),
+    )
+    checks.append(_check(
+        "target.present", CheckStatus.pass_, clock=clock,
+        note="a sourced target is proposed",
+    ))
+    if value.number_kind == "interval":
+        limitations.append(
+            "the target stays an interval; no midpoint is invented"
+        )
+    return proposal, checks, limitations
+
+
+_CRITICAL = _CRITICAL_PREFIXES
+_NON_CRITICAL = _NON_CRITICAL_PREFIXES
+
+
+class ReadinessReducer:
+    def reduce(
+        self, checks: Sequence[CheckResult], declared_scope: str,
+    ) -> "RecommendationReadiness":
+        return reduce_readiness(checks, declared_scope)
+
+
+def reduce_readiness(
+    checks: Sequence[CheckResult], declared_scope: str,
+) -> "RecommendationReadiness":
+    """Reduce checks by prefix; readiness answers operability, not effect."""
+    from game_app.contracts.enums import RecommendationReadiness
+
+    if not checks or not declared_scope.strip():
+        return RecommendationReadiness.blocked
+    critical = [
+        item for item in checks
+        if item.check_id.startswith(_CRITICAL_PREFIXES)
+    ]
+    if not critical:
+        return RecommendationReadiness.blocked
+    if any(item.status is CheckStatus.fail for item in critical):
+        return RecommendationReadiness.blocked
+    if not any(item.check_id.startswith("operation.") for item in critical):
+        return RecommendationReadiness.blocked
+    unresolved = any(
+        item.status in (CheckStatus.unknown, CheckStatus.not_run)
+        for item in critical
+    )
+    if unresolved:
+        return RecommendationReadiness.provisional
+    if not any(
+        item.status is CheckStatus.pass_ and item.check_id.startswith("operation.")
+        for item in critical
+    ):
+        return RecommendationReadiness.provisional
+    return RecommendationReadiness.actionable
+
+
+@dataclass(frozen=True)
+class RecommendationContent:
+    base_configuration_ref: KnowledgeRecordRef | None
+    actions: list[Any]
+    alternatives: list[Any]
+    target_proposal: Any | None
+    reference_results: list[KnowledgeRecordRef]
+    checks: list[CheckResult]
+    readiness: Any
+    limitations: list[str]
+
+
+def build_content(
+    task_input: RecommendationInput,
+    assessments: Sequence[CandidateAssessment],
+    *,
+    repository: Any,
+    knowledge: Any,
+    user_scope_id: str,
+    applied: Any | None = None,
+    overrides: Sequence[Mapping[str, Any]] | None = None,
+    recommendation_id: str | None = None,
+    task_id: str | None = None,
+    clock=utc_now,
+) -> RecommendationContent:
+    """The whole deterministic content of one recommendation, before storage."""
+    from game_app.contracts.enums import RecommendationReadiness
+
+    selection = select_baseline(
+        assessments, repository=repository, knowledge=knowledge,
+        user_scope_id=user_scope_id, clock=clock,
+    )
+    checks: list[CheckResult] = list(selection.checks)
+    limitations: list[str] = list(selection.limitations)
+    if selection.assessment is None:
+        target, target_checks, target_limits = build_target(
+            knowledge.get_package(
+                task_input.package_id, user_scope_id=user_scope_id,
+                verify_artifacts=False,
+            ),
+            [],
+            clock=clock,
+            task_id=task_id,
+        )
+        return RecommendationContent(
+            base_configuration_ref=None,
+            actions=[],
+            alternatives=[],
+            target_proposal=target,
+            reference_results=[],
+            checks=checks + target_checks,
+            readiness=RecommendationReadiness.blocked,
+            limitations=limitations + target_limits,
+        )
+    package, config, payload, by_local = _base_members(
+        repository, knowledge, selection, user_scope_id,
+    )
+    built = build_actions(
+        task_input, selection, repository=repository, knowledge=knowledge,
+        user_scope_id=user_scope_id, applied=applied, clock=clock,
+    )
+    actions = built.actions
+    limitations.extend(built.limitations)
+    checks.extend(built.checks)
+    checks.extend(validate_actions(
+        task_input, actions, repository=repository, knowledge=knowledge,
+        user_scope_id=user_scope_id, package=package, clock=clock,
+    ))
+
+    alternatives: list[Any] = []
+    if overrides:
+        alternatives, alternative_checks, alternative_limits = build_alternatives(
+            task_input, actions, overrides,
+            recommendation_id=recommendation_id or _stable_id(
+                package.id, config.id, "recommendation",
+            ),
+            repository=repository, knowledge=knowledge,
+            user_scope_id=user_scope_id, clock=clock,
+        )
+        checks.extend(alternative_checks)
+        limitations.extend(alternative_limits)
+
+    with repository.unit_of_work() as uow:
+        records = knowledge._package_records(uow, package)
+    target, target_checks, target_limits = build_target(
+        package, records, clock=clock, task_id=task_id,
+    )
+    checks.extend(target_checks)
+    limitations.extend(target_limits)
+    reference_results = [
+        _record_ref(package.id, record)
+        for record in records
+        if record.record_type == "evidence"
+        and isinstance(record.payload, Mapping)
+        and record.payload.get("is_target") is True
+        and isinstance(record.payload.get("statistic_definition"), str)
+    ]
+
+    readiness = reduce_readiness(checks, DECLARED_SCOPE)
+    if readiness is RecommendationReadiness.blocked:
+        actions = _downgrade_actions(actions, clock)
+        limitations.append(
+            "the configuration does not form a usable main branch; executable"
+            " values are downgraded and none is published as a fixed action"
+        )
+        alternatives = []
+    return RecommendationContent(
+        base_configuration_ref=selection.base_configuration_ref,
+        actions=actions,
+        alternatives=alternatives,
+        target_proposal=target,
+        reference_results=reference_results,
+        checks=checks,
+        readiness=readiness,
+        limitations=limitations,
+    )
+
+
+def _downgrade_actions(actions: Sequence[Any], clock) -> list[Any]:
+    from game_app.contracts.recommendation import RecommendationAction
+    from game_app.contracts.enums import RecommendationActionKind
+
+    downgraded: list[Any] = []
+    for action in actions:
+        kind = _field(action, "action")
+        if kind in ("set_value", "conditional_strategy"):
+            action = action.model_copy(update={
+                "action": RecommendationActionKind.defer,
+                "action_id": _stable_id(action.action_id, "blocked-defer"),
+                "reason": (
+                    f"{action.reason} — deferred: no usable main branch"
+                ),
+            })
+        downgraded.append(action)
+    return downgraded
+
+
+def _check_critical(check_id: str) -> bool:
+    return check_id.startswith(_CRITICAL_PREFIXES)
+
+
 __all__ = [
     "GateResult",
     "InputGate",
@@ -1334,4 +2172,19 @@ __all__ = [
     "assessment_manifest",
     "resolve_setting_identities",
     "validate_actions",
+    "CandidateAssessment",
+    "BaselineSelection",
+    "BaselineSelector",
+    "select_baseline",
+    "ActionBuildResult",
+    "ActionValidator",
+    "build_actions",
+    "build_alternatives",
+    "build_target",
+    "ReadinessReducer",
+    "reduce_readiness",
+    "RecommendationContent",
+    "build_content",
+    "DECLARED_SCOPE",
 ]
+

@@ -378,6 +378,7 @@ def dataset(
     extra_evidence: list[dict] | None = None,
     extra_records: list[dict] | None = None,
     config_extra: dict | None = None,
+    setting_extra: dict | None = None,
 ) -> list[dict]:
     """A coherent accepted subset: settings, measurement, environment, configs."""
     environment: dict = {"id": "env-0001", "fields": {
@@ -393,15 +394,18 @@ def dataset(
         environment["fields"]["game_version"] = {
             "value": version, "proof": {"quote": "synthetic version"},
         }
+    setting_payload = {
+        "id": "set-0001",
+        "raw_name": "Synthetic Quality",
+        "canonical_name": "Quality",
+        "aliases": [],
+        "unit": None,
+        "proof": {"url": "https://example.invalid/src-0001"},
+    }
+    if setting_extra:
+        setting_payload.update(setting_extra)
     records = [
-        record("set-0001", "settings", {
-            "id": "set-0001",
-            "raw_name": "Synthetic Quality",
-            "canonical_name": "Quality",
-            "aliases": [],
-            "unit": None,
-            "proof": {"url": "https://example.invalid/src-0001"},
-        }),
+        record("set-0001", "settings", setting_payload),
         record("evi-0001", "evidence", {
             "id": "evi-0001",
             "kind": "measurement",
@@ -677,8 +681,7 @@ def external_calls(repository: ProductRepository) -> list[dict]:
         )]
 
 
-def stub_package(
-    repository: ProductRepository,
+def stub_package(    repository: ProductRepository,
     package,
     *,
     publication_status: str = "staging",
@@ -702,3 +705,96 @@ def stub_package(
             version=None,
         )
     return payload["id"]
+
+
+def package_records(repository: ProductRepository, package):
+    from game_app.contracts.knowledge import ImportedRecord
+
+    with repository.unit_of_work() as uow:
+        return [
+            ImportedRecord.model_validate_json(
+                uow.get_object("ImportedRecord", item).payload_bytes
+            )
+            for item in package.record_snapshot_ids
+        ]
+
+
+def member(repository: ProductRepository, package, *, local_id: str):
+    from game_app.knowledge import _record_ref
+
+    for item in package_records(repository, package):
+        if item.local_record_id == local_id:
+            return item, _record_ref(package.id, item)
+    raise AssertionError(f"the fixture package has no {local_id}")
+
+
+def knowledge_setting_ref(repository: ProductRepository, package, local_id: str) -> dict:
+    _, ref = member(repository, package, local_id=local_id)
+    return {"kind": "knowledge", "record": ref.model_dump(mode="json")}
+
+
+def confirmed_setting(
+    repository: ProductRepository,
+    files: FileService,
+    package,
+    local_id: str,
+    value,
+    *,
+    known_value: bool = True,
+    identity: str | None = None,
+) -> dict:
+    ref = knowledge_setting_ref(repository, package, local_id)
+    field_value = FieldValue(
+        value_state=ValueState.known if known_value else ValueState.unknown,
+        value=value if known_value else None,
+        unknown_reason=None if known_value else "not_provided",
+        acquisition_status=(
+            AcquisitionStatus.succeeded if known_value
+            else AcquisitionStatus.not_attempted
+        ),
+        provenance=(
+            [Provenance(
+                method=AcquisitionMethod.user_provided,
+                observed_at=None,
+                recorded_at=NOW,
+                evidence_refs=[artifact_evidence(files, f"confirmed-{local_id}")],
+            )]
+            if known_value else []
+        ),
+    )
+    return {
+        "setting_ref": ref,
+        "setting_identity_ref": identity,
+        "value": field_value.model_dump(mode="json"),
+        "unit": None,
+        "confirmation_method": "user_provided",
+        "activation_state": "unknown",
+    }
+
+
+def target_evidence(
+    local_id: str = "evi-0002",
+    *,
+    numeric: dict | None = None,
+    stream: str = "displayed",
+    statistic: str = "author 1% low over 60 s, fixed scene",
+    statement: str = "author target frame rate",
+    **extra,
+):
+    payload = {
+        "id": local_id,
+        "kind": "measurement",
+        "origin": "source_author_measurement",
+        "statement": statement,
+        "metric": "average_fps",
+        "numeric": numeric or {"number_kind": "exact", "value": 60},
+        "unit": "fps",
+        "setting_ids": ["set-0001"],
+        "input_ids": [],
+        "detected_state": None,
+        "is_target": True,
+        "statistic_definition": statistic,
+        "frame_stream_kind": stream,
+    }
+    payload.update(extra)
+    return record(local_id, "evidence", payload)

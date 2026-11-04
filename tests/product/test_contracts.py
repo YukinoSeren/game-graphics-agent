@@ -58,10 +58,15 @@ REQUIRED_CASES = {
     "PERF-V01", "PERF-V02", "PERF-V03", "PERF-V04", "PERF-V05",
     "PERF-V06", "PERF-V07", "PERF-V08", "PERF-V09",
     "DEV-V01", "DEV-V02", "DEV-V03", "DEV-V04",
+    "DEV-V05", "DEV-V06", "DEV-V07", "DEV-V08",
     "IMP-V01", "IMP-V02", "IMP-V03", "IMP-V05",
     "KNW-V01", "KNW-V02", "KNW-V03", "KNW-V04", "KNW-V05", "KNW-V06",
     "ENG-V01", "ENG-V02", "ENG-V03", "ENG-V04", "ENG-V05", "ENG-V06",
-    "UX-V01", "UX-V03",
+    "ENG-V07",
+    "UX-V01", "UX-V02", "UX-V03", "UX-V04", "UX-V05", "UX-V06",
+    "UX-V07", "UX-V08",
+    "VAL-V03", "VAL-V04", "VAL-V05", "VAL-V07", "VAL-V08",
+    "B-DAT-14", "B-STA-13", "B-ERR-12",
 }
 F1_CASES = {"IMP-V04-research-retained", "IMP-V04-research-mapping"}
 
@@ -326,6 +331,111 @@ MODULE_CASES = {
         "the recommendation contract keeps unknown branches conditional",
         ["unknown stays conditional", "no value is invented for the reader"],
     ),
+    "DEV-V05": (
+        "tests.product.test_historical_configuration",
+        "test_historical_record_is_an_independent_family_and_keeps_the_pointer",
+        ["D03", "DEV-V05"],
+        "a historical record is its own family and never moves the pointer",
+        ["the current pointer is unchanged", "the historical family is separate"],
+    ),
+    "DEV-V06": (
+        "tests.product.test_context",
+        "test_installation_records_are_honest_about_unknown_paths",
+        ["D-P01", "DEV-V06"],
+        "an installation with an unknown path stays honestly unknown",
+        ["no default path is invented", "the record is still usable"],
+    ),
+    "DEV-V07": (
+        "tests.product.test_context",
+        "test_distinct_unknown_entries_stay_independent_series",
+        ["D-P02", "DEV-V07"],
+        "two same-named entries without a located key stay separate",
+        ["neither entry is merged", "each keeps its own series"],
+    ),
+    "DEV-V08": (
+        "tests.product.test_information_answers",
+        "test_facts_only_amendment_writes_no_source_task_rows",
+        ["D-P04", "DEV-V08"],
+        "a facts_only amendment never writes the source task",
+        ["source task rows are unchanged", "the amendment is a new request"],
+    ),
+    "ENG-V07": (
+        "tests.product.test_repository",
+        "test_game_declaration_slot_encodes_unknown_platform_explicitly",
+        ["D-P01", "ENG-V07"],
+        "an unknown platform is encoded explicitly, not as a missing key",
+        ["the slot is distinct from an absent platform", "no false merge occurs"],
+    ),
+    "UX-V02": (
+        "tests.product.test_information_answers",
+        "test_stale_versions_are_rejected_without_any_write",
+        ["C11", "D04", "UX-V02"],
+        "a stale answer is rejected with no partial write",
+        ["the request is unchanged", "no revision is written"],
+    ),
+    "UX-V04": (
+        "tests.product.test_adoption",
+        "test_baseline_advances_the_pointer_and_records_the_declaration",
+        ["C07", "D03", "UX-V04"],
+        "a baseline advances the pointer and records its declaration",
+        ["the pointer advances once", "the declaration is kept"],
+    ),
+    "UX-V05": (
+        "tests.product.test_outcomes",
+        "test_three_consistent_improvements_are_improved",
+        ["D01", "D05", "UX-V05"],
+        "three consistent improvements are reported as improved",
+        ["the effect is improved", "acceptance stays a separate field"],
+    ),
+    "UX-V06": (
+        "tests.product.test_metrics",
+        "test_a_replay_returns_the_original_task_after_the_world_changed",
+        ["D02", "UX-V06"],
+        "a replay returns the original task even after the world changed",
+        ["the same task is returned", "no second provider send"],
+    ),
+    "UX-V07": (
+        "tests.product.test_adoption",
+        "test_rollback_creates_a_new_version_that_restores_the_target",
+        ["D03", "UX-V07"],
+        "a manual restore creates a new version instead of rewriting history",
+        ["a new version is created", "the older version is untouched"],
+    ),
+    "UX-V08": (
+        "tests.product.test_log_association",
+        "test_historical_association_creates_an_ended_session_and_closed_binding",
+        ["D02", "D03", "UX-V08"],
+        "a historical log association creates a closed session and binding",
+        ["the session is ended", "the binding is closed"],
+    ),
+    "VAL-V03": (
+        "tests.product.test_faults",
+        "test_no_checkpoint_recovery_creates_one_child_and_does_not_resend",
+        ["D02", "VAL-V03"],
+        "a recovery with no checkpoint never resends the unknown call",
+        ["one child task", "the send count is unchanged"],
+    ),
+    "VAL-V07": (
+        "tests.product.test_comparisons",
+        "test_frozen_before_sampling_allows_a_planned_comparison",
+        ["D02", "D05", "VAL-V07"],
+        "a protocol frozen before sampling allows a planned comparison",
+        ["the frozen threshold is used", "no post-hoc downgrade"],
+    ),
+    "B-DAT-14": (
+        "tests.product.test_repository",
+        "test_legacy_bytes_and_idempotency_response_are_re_read_verbatim",
+        ["B-DAT-14"],
+        "legacy bytes and stored responses are re-read verbatim",
+        ["the old bytes are unchanged", "the response is the original"],
+    ),
+    "B-STA-13": (
+        "tests.product.test_information_answers",
+        "test_a_resolved_request_rejects_a_direct_answer",
+        ["B-STA-13"],
+        "a resolved request cannot be answered directly again",
+        ["the request state is enforced", "no source task write"],
+    ),
 }
 
 
@@ -396,6 +506,33 @@ def _knw_v06(_application, tmp_path):
         assert uow.query(
             "SELECT COUNT(*) AS n FROM objects WHERE entity_type IN ('Game','GameSelection')"
         )[0]["n"] == 0
+
+
+def _b_err_12(_application, tmp_path):
+    """A malformed request id yields the stable envelope, not a traceback."""
+
+    import contextlib
+    import io
+
+    from game_app.cli import main as cli_main
+
+    directory = tmp_path / "b-err-12"
+    directory.mkdir()
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr):
+        code = cli_main([
+            "task", "get", "0" * 32,
+            "--user-scope", "a" * 32,
+            "--request-id", "NOT-HEX",
+            "--db", str(directory / "product.sqlite3"),
+            "--files", str(directory / "managed"),
+        ])
+    assert code == 2  # validation
+    payload = json.loads(stderr.getvalue())
+    assert payload["code"] == "INPUT_VALIDATION_FAILED"
+    # The raw flag is never echoed into the envelope.
+    assert "NOT-HEX" not in stderr.getvalue()
+    assert not (directory / "product.sqlite3").exists()
 
 
 def _research_retained(_application, tmp_path):
@@ -752,6 +889,21 @@ def test_the_matrix_runs_existing_modules_and_records_every_result(tmp_path):
             mock_components=["local identity service"],
             observations=["external_calls=0", "provider_sends=0"],
         ),
+        runner.run(
+            case_id="B-ERR-12",
+            requirement_ids=["B-ERR-12"],
+            purpose="a malformed flag yields the shared error envelope",
+            steps=["run the CLI with a malformed request id"],
+            expected_assertions=[
+                "exit code 2 (validation)",
+                "the envelope code is INPUT_VALIDATION_FAILED",
+                "the raw flag is not echoed and no database is created",
+            ],
+            execute=lambda _app: _b_err_12(_app, tmp_path),
+            input_refs=["CLI argument vector"],
+            mock_components=["CLI entry over a temporary store"],
+            observations=["external_calls=0", "provider_sends=0"],
+        ),
     ]
 
     for case_id, (module_name, function_name, requirements, purpose, assertions) in (
@@ -786,6 +938,29 @@ def test_the_matrix_runs_existing_modules_and_records_every_result(tmp_path):
             reason="the 63-case matrix cannot be closed until every owner registers its cases",
             blocked=True,
             blocked_by="module owners",
+        ),
+        runner.not_run(
+            case_id="VAL-V04",
+            requirement_ids=["C04", "C08", "VAL-V04"],
+            reason="no independent annotation exists; only a same-session model"
+                   " recheck is available (F-R3)",
+            blocked=True,
+            blocked_by="no independent annotation",
+        ),
+        runner.not_run(
+            case_id="VAL-V05",
+            requirement_ids=["C06", "D05", "VAL-V05"],
+            reason="needs a real game and player rounds; the evidence level here"
+                   " is offline_fixture (F-R12)",
+            blocked=True,
+            blocked_by="local_effect: no real game",
+        ),
+        runner.not_run(
+            case_id="VAL-V08",
+            requirement_ids=["D-P01", "D-P04", "VAL-V08"],
+            reason="the D-P journey needs a browser; Q1 fixed the product as CLI-only",
+            blocked=True,
+            blocked_by="UX-T03 / Q1 (CLI only)",
         ),
     ])
 

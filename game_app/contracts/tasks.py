@@ -13,7 +13,7 @@ from pydantic import Field, TypeAdapter, field_validator, model_validator
 
 from game_app.contracts.common import Budget, CallCounters, CheckResult
 from game_app.contracts.enums import ExecutionStopCode, TaskState, TaskType
-from game_app.contracts.feedback import FeedbackInput
+from game_app.contracts.feedback import FeedbackInput, NextActionInput
 from game_app.contracts.primitives import (
     BindingRef,
     ID,
@@ -138,6 +138,7 @@ TaskInputPayload = Annotated[
         LogImportInput,
         RecommendationInput,
         FeedbackInput,
+        NextActionInput,
     ],
     Field(discriminator="kind"),
 ]

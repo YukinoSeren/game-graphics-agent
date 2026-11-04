@@ -10,16 +10,25 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import Field, StringConstraints, model_validator
+from pydantic import Field, StringConstraints, field_validator, model_validator
 
-from game_app.contracts.common import EvidenceRef, FieldValue
+from game_app.contracts.common import CheckResult, EvidenceRef, FieldValue
+from game_app.contracts.configuration import SettingRef
 from game_app.contracts.enums import (
     InterpretationStatus,
+    NextActionKind,
     PreferenceExplicitness,
     PreferenceLifecycle,
     PreferenceScope,
 )
-from game_app.contracts.primitives import ID, Revision, Scalar, StrictModel, Timestamp
+from game_app.contracts.primitives import (
+    BindingRef,
+    ID,
+    Revision,
+    Scalar,
+    StrictModel,
+    Timestamp,
+)
 
 NonBlank = Annotated[str, StringConstraints(strict=True, min_length=1)]
 
@@ -198,6 +207,123 @@ class TargetAcceptance(StrictModel):
     supersedes_id: ID | None
 
 
+class NextActionInput(StrictModel):
+    """The fixed evidence set one diagnosis reads (data §9).
+
+    A missing baseline is expressed by ``current_applied_id=null``; it is never
+    inferred from the newest adopted configuration.
+    """
+
+    kind: Literal["next_action"]
+    session_id: ID
+    bindings: list[BindingRef]
+    summary_ids: list[ID]
+    feedback_ids: list[ID]
+    current_applied_id: ID | None
+    package_id: ID | None
+
+    @field_validator("summary_ids", "feedback_ids")
+    @classmethod
+    def ids_are_unique(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("each id appears once")
+        return value
+
+
+class Hypothesis(StrictModel):
+    """One untested explanation, with its support, counter and open questions.
+
+    A hypothesis is not a proven rule: the lists stay separate so a model's
+    confident wording cannot silently close a gap.
+    """
+
+    id: ID
+    statement: NonBlank
+    support: list[EvidenceRef]
+    counter: list[EvidenceRef]
+    unknowns: list[str]
+    test_action: str
+
+
+class Diagnosis(StrictModel):
+    """The program's decision about the next action (05 §6).
+
+    ``adjust`` is only legal with a validated ChangeSet; every other action
+    names no change set at all.
+    """
+
+    id: ID
+    schema_version: str
+    created_at: Timestamp
+    created_by_task_id: ID | None
+    input: NextActionInput
+    hypotheses: list[Hypothesis]
+    primary_action: NextActionKind
+    change_set_id: ID | None
+    checks: list[CheckResult]
+
+    @model_validator(mode="after")
+    def adjust_names_a_change_set(self) -> "Diagnosis":
+        has_change_set = self.change_set_id is not None
+        if (self.primary_action is NextActionKind.adjust) != has_change_set:
+            raise ValueError(
+                "only an adjust carries a ChangeSet, and an adjust requires one"
+            )
+        return self
+
+
+class SettingChange(StrictModel):
+    """One setting diff inside a ChangeSet (data §7).
+
+    ``old_value`` comes from the frozen base; an unknown old value cannot
+    produce a rollback step and must not be filled in with a default.
+    """
+
+    setting_ref: SettingRef
+    old_value: FieldValue[Scalar]
+    new_value: Scalar
+    unit: str | None
+    dependency_group_id: ID | None
+    restart_required: FieldValue[bool]
+
+
+class ChangeSet(StrictModel):
+    """A change that passed every validator check (05 §6).
+
+    It is written only when all critical checks pass; a failed attempt leaves a
+    Diagnosis plus its gaps and no adoptable half-ChangeSet.
+    """
+
+    id: ID
+    schema_version: str
+    created_at: Timestamp
+    created_by_task_id: ID | None
+    base_applied_id: ID
+    installation_id: ID
+    changes: list[SettingChange]
+    hypothesis_id: ID
+    evidence_refs: list[EvidenceRef]
+    protected_preference_ids: list[ID]
+    expected_direction: dict[str, str]
+    protocol_id: ID | None
+    rollback_ref: ID
+    checks: list[CheckResult]
+
+    @field_validator("changes")
+    @classmethod
+    def changes_are_not_empty(cls, value: list[SettingChange]) -> list[SettingChange]:
+        if not value:
+            raise ValueError("a change set changes at least one setting")
+        return value
+
+    @model_validator(mode="after")
+    def one_value_per_setting(self) -> "ChangeSet":
+        keys = [change.setting_ref.key for change in self.changes]
+        if len(set(keys)) != len(keys):
+            raise ValueError("the same setting cannot be overwritten twice")
+        return self
+
+
 __all__ = [
     "Symptom",
     "Feedback",
@@ -208,4 +334,9 @@ __all__ = [
     "PreferenceDeclaration",
     "TargetAcceptanceInput",
     "TargetAcceptance",
+    "NextActionInput",
+    "Hypothesis",
+    "Diagnosis",
+    "SettingChange",
+    "ChangeSet",
 ]

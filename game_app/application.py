@@ -18,6 +18,7 @@ from game_app.device import DeviceService
 from game_app.errors import ContractError, ErrorCode, FieldError
 from game_app.feedback import (
     FeedbackService,
+    NextActionService,
     PreferenceService,
     TargetAcceptanceService,
 )
@@ -91,7 +92,19 @@ class Application:
         self.feedbacks = FeedbackService(repository, self.files, self.tasks, clock=clock)
         self.preferences = PreferenceService(repository, self.files, clock=clock)
         self.acceptances = TargetAcceptanceService(repository, self.files, clock=clock)
+        self.next_actions = NextActionService(
+            repository,
+            self.files,
+            self.tasks,
+            adoption=self.adoption,
+            performance=self.performance,
+            knowledge=self.knowledge,
+            clock=clock,
+        )
         self.tasks.handlers["feedback"] = self.feedbacks.handle
+        # The next-action handler writes a Diagnosis (and, only when every
+        # check passes, a ChangeSet); a missing handler would silently succeed.
+        self.tasks.handlers["next_action"] = self.next_actions.handle
 
     # -- task control -------------------------------------------------------
     def register_task(
@@ -254,6 +267,21 @@ class Application:
         self, request: Any, context: MutationContext, **kwargs: Any,
     ):
         return self.acceptances.record_acceptance(request, context, **kwargs)
+
+    def plan_next_action(self, task_input: Any, context: MutationContext, **kwargs: Any):
+        """Register a diagnosis task; a registered key is replayed first."""
+        registered = self.repository.find_idempotency(
+            context.user_scope_id, "POST", DEFAULT_ROUTES["next_action"],
+            context.idempotency_key,
+        )
+        if registered is None:
+            self.next_actions.precheck(
+                task_input, user_scope_id=context.user_scope_id,
+            )
+        return self.next_actions.plan_next_action(task_input, context, **kwargs)
+
+    def get_diagnosis(self, diagnosis_id: str, user_scope_id: str):
+        return self.next_actions.get_diagnosis(diagnosis_id, user_scope_id)
 
     # -- 04 performance entries (synchronous, thin wrappers) ----------------
     def create_session(self, request: Any, context: MutationContext, **kwargs: Any):

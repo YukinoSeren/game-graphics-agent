@@ -49,6 +49,7 @@ DEFAULT_ROUTES = {
     "capture": "/api/captures",
     "device_scan": "/api/device-scans",
     "log_import": "/api/log-imports",
+    "recommendation": "/api/recommendations",
 }
 _COUNTER_LIMITS = {
     "model": "max_model_calls",
@@ -238,6 +239,16 @@ class TaskService:
         self.clock = clock
         self.handlers: dict[str, Callable[[TaskContext], HandlerOutcome | None]] = {}
         self._lock = threading.Lock()
+
+    @property
+    def provider_configured(self) -> bool:
+        """Read-only: whether a real provider adapter was supplied.
+
+        A handler that needs a provider asks this *before* its first audited
+        call, so a missing adapter is a refused execution rather than a
+        half-written audit row.
+        """
+        return not isinstance(self.provider, _NullProvider)
 
     # -- registration -----------------------------------------------------
     def register_task(

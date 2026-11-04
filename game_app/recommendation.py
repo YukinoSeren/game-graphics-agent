@@ -9,6 +9,7 @@ model-supplied expression.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import json
 import uuid
 from typing import Any, Iterable, Mapping, Sequence
@@ -1095,11 +1096,7 @@ class CandidateBuilder:
     ) -> None:
         members = {record.id: record for record in records}
         for item in model_candidates:
-            identifier = (
-                _field(item, "record_id")
-                or _field(item, "record_snapshot_id")
-                or _field(item, "local_record_id")
-            )
+            identifier = model_candidate_identifier(item)
             if isinstance(identifier, str) and identifier in members:
                 diagnostics.append(
                     f"the model named pool member {identifier}; the deterministic"
@@ -2042,9 +2039,16 @@ def build_content(
     overrides: Sequence[Mapping[str, Any]] | None = None,
     recommendation_id: str | None = None,
     task_id: str | None = None,
+    extra_checks: Sequence[CheckResult] = (),
+    extra_limitations: Sequence[str] = (),
     clock=utc_now,
 ) -> RecommendationContent:
-    """The whole deterministic content of one recommendation, before storage."""
+    """The whole deterministic content of one recommendation, before storage.
+
+    ``extra_checks`` carries checks the caller owns (for example the screening
+    of a model reply): they take part in the readiness reduction but change no
+    deterministic decision.
+    """
     from game_app.contracts.enums import RecommendationReadiness
 
     selection = select_baseline(
@@ -2069,9 +2073,13 @@ def build_content(
             alternatives=[],
             target_proposal=target,
             reference_results=[],
-            checks=checks + target_checks,
+            checks=checks + target_checks + list(extra_checks),
+            # Without a baseline there is no main branch to operate, whatever
+            # else passed: the version is published as blocked, never faked.
             readiness=RecommendationReadiness.blocked,
-            limitations=limitations + target_limits,
+            limitations=(
+                limitations + target_limits + list(extra_limitations)
+            ),
         )
     package, config, payload, by_local = _base_members(
         repository, knowledge, selection, user_scope_id,
@@ -2108,6 +2116,8 @@ def build_content(
     )
     checks.extend(target_checks)
     limitations.extend(target_limits)
+    checks.extend(extra_checks)
+    limitations.extend(extra_limitations)
     reference_results = [
         _record_ref(package.id, record)
         for record in records
@@ -2160,6 +2170,881 @@ def _check_critical(check_id: str) -> bool:
     return check_id.startswith(_CRITICAL_PREFIXES)
 
 
+# --- REC-T03: publication, review and impact consumption ---------------------
+#
+# Publication is atomic: one version, its target (when sourced) and the
+# supersede event for the previous version land in one transaction, or none of
+# them does.  The model's reply is screened, never trusted; impact consumption
+# only appends review events and its own de-duplication row.
+
+MODEL_PROMPT_VERSION = "recommendation-candidates/1"
+MODEL_OUTPUT_SCHEMA_VERSION = "recommendation-candidates/0.4"
+PRODUCT_VERSION = "product-contract/0.4"
+
+
+class RecommendationProtocolError(ValueError):
+    """The model reply cannot be read as ``{"candidates": [...]}``."""
+
+
+@dataclass(frozen=True)
+class PublishResult:
+    version: Any
+    target: Any | None
+    manifest_file_id: str
+    review_event: Any | None
+    created: bool
+
+
+def _typed_input(value: Any) -> RecommendationInput:
+    if isinstance(value, RecommendationInput):
+        return value
+    return RecommendationInput.model_validate(value)
+
+
+def model_candidate_identifier(row: Any) -> str | None:
+    for key in ("record_id", "record_snapshot_id", "local_record_id"):
+        value = _field(row, key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def model_candidate_is_member(
+    row: Any, records: Sequence[ImportedRecord],
+) -> bool:
+    """A reply entry is legal only when it names a record of this package."""
+    identifier = model_candidate_identifier(row)
+    if identifier is None:
+        return False
+    return any(
+        identifier in (record.id, record.local_record_id) for record in records
+    )
+
+
+def parse_candidate_reply(
+    reply: Any,
+) -> tuple[list[Mapping[str, Any]], int]:
+    """``{"candidates": [...]}`` or an unreadable reply.
+
+    Returns the readable entries and the number of entries the provider sent:
+    a non-object entry is counted as an illegal entry, never silently dropped.
+    """
+    if not isinstance(reply, Mapping):
+        raise RecommendationProtocolError("the recommendation reply is not an object")
+    rows = reply.get("candidates")
+    if not isinstance(rows, list):
+        raise RecommendationProtocolError(
+            "the recommendation reply has no candidates array"
+        )
+    readable = [row for row in rows if isinstance(row, Mapping)]
+    return readable, len(rows)
+
+
+def model_request_payload(
+    gate: GateResult, assessments: Sequence[CandidateAssessment],
+) -> dict[str, Any]:
+    """Only public candidate records and desensitised device facts.
+
+    No private summary, no applied configuration value and no preference ever
+    enters the payload (03 §5).
+    """
+    device = {
+        key: value for key, value in gate.facts.items()
+        if key in EXECUTABLE_FACTS and isinstance(value, str) and value
+    }
+    return {
+        "task": "recommend_candidates",
+        "declared_scope": DECLARED_SCOPE,
+        "device": device,
+        "game": {"canonical_name": gate.game.canonical_name},
+        "candidates": [
+            {
+                "record_snapshot_id": item.configuration_ref.record_snapshot_id,
+                "local_record_id": item.configuration_ref.local_record_id,
+                "match_class": item.match_class,
+            }
+            for item in assessments
+        ],
+    }
+
+
+def model_reply_checks(
+    readable: Sequence[Mapping[str, Any]],
+    total: int,
+    records: Sequence[ImportedRecord],
+    *,
+    clock=utc_now,
+) -> tuple[list[CheckResult], list[str]]:
+    """Screen the reply without letting it change the deterministic pool."""
+    if total == 0:
+        limitations = [
+            "the model proposed no candidate; the deterministic pool stands"
+        ]
+        return [
+            _check(
+                "diagnostic.model_candidates", CheckStatus.not_applicable,
+                clock=clock,
+                note="the reply carried an empty candidates array",
+            ),
+        ], limitations
+    legal = [row for row in readable if model_candidate_is_member(row, records)]
+    if len(legal) == total:
+        return [
+            _check(
+                "diagnostic.model_candidates", CheckStatus.pass_, clock=clock,
+                note="every proposed candidate names a record of this package",
+            ),
+        ], []
+    if not legal:
+        # Nothing the reply named exists in the package: the reply is not a
+        # usable proposal, and 03 §5 forbids publishing it as actionable.
+        return [
+            _check(
+                "reference.model_candidates", CheckStatus.fail, clock=clock,
+                note="no proposed candidate resolves to a record of this package",
+            ),
+        ], [
+            "the model named no record that exists in this package; the reply"
+            " is kept as a diagnostic and nothing it suggested is published"
+        ]
+    return [
+        _check(
+            "diagnostic.model_candidates", CheckStatus.unknown, clock=clock,
+            note=(
+                f"{len(legal)} of {total} proposed candidates are package"
+                " records; the rest are kept as diagnostics"
+            ),
+        ),
+    ], [
+        f"{total - len(legal)} of {total} proposed candidates name no record of"
+        " this package and are kept as diagnostics"
+    ]
+
+
+def _normalised_check(check: CheckResult) -> dict[str, Any]:
+    payload = check.model_dump(mode="json")
+    # ``checked_at`` records when the check ran, not what it found.
+    payload["checked_at"] = None
+    return payload
+
+
+def _normalised_action(action: Any) -> dict[str, Any]:
+    payload = action.model_dump(mode="json")
+    payload["checks"] = [_normalised_check(item) for item in action.checks]
+    return payload
+
+
+def content_hash(
+    content: RecommendationContent, declared_scope: str = DECLARED_SCOPE,
+) -> str:
+    """The content identity of a version: no id, version, parent or timestamp."""
+    alternatives = []
+    for item in content.alternatives:
+        payload = item.model_dump(mode="json")
+        # It is back-filled with the version's own id after insertion.
+        payload["base_recommendation_id"] = None
+        payload["checks"] = [_normalised_check(check) for check in item.checks]
+        payload["action_overrides"] = [
+            _normalised_action(action) for action in item.action_overrides
+        ]
+        alternatives.append(payload)
+    target = None
+    if content.target_proposal is not None:
+        proposal = content.target_proposal
+        target = {
+            "value": proposal.value.model_dump(mode="json"),
+            "basis_refs": [ref.model_dump(mode="json") for ref in proposal.basis_refs],
+            "frame_stream_kind": proposal.frame_stream_kind.value,
+            "note": proposal.note,
+        }
+    body = {
+        "declared_scope": declared_scope,
+        "base_configuration_ref": (
+            None if content.base_configuration_ref is None
+            else content.base_configuration_ref.model_dump(mode="json")
+        ),
+        "actions": [_normalised_action(action) for action in content.actions],
+        "alternatives": alternatives,
+        "target": target,
+        "reference_results": [
+            ref.model_dump(mode="json") for ref in content.reference_results
+        ],
+        "readiness": content.readiness.value,
+        "checks": [_normalised_check(check) for check in content.checks],
+    }
+    return hashlib.sha256(canonical_json(body)).hexdigest()
+
+
+def _knowledge_refs(version: Any) -> list[KnowledgeRecordRef]:
+    """Every knowledge record one version names, in a stable order."""
+    refs: dict[tuple[str, str, str, str], KnowledgeRecordRef] = {}
+
+    def add(ref: KnowledgeRecordRef | None) -> None:
+        if ref is None:
+            return
+        refs.setdefault(
+            (
+                ref.package_id, ref.capture_scope_id, ref.record_type,
+                ref.record_snapshot_id,
+            ),
+            ref,
+        )
+
+    def add_action(action: Any) -> None:
+        setting_ref = _field(action, "setting_ref")
+        if _field(setting_ref, "kind") == "knowledge":
+            add(_field(setting_ref, "record"))
+        for evidence in action.evidence_refs or []:
+            if evidence.kind == "knowledge":
+                add(evidence.record)
+
+    add(version.base_configuration_ref)
+    for action in version.actions:
+        add_action(action)
+    for alternative in version.alternatives:
+        for action in alternative.action_overrides:
+            add_action(action)
+    for ref in version.reference_results:
+        add(ref)
+    if version.target_proposal is not None:
+        for evidence in version.target_proposal.basis_refs:
+            if evidence.kind == "knowledge":
+                add(evidence.record)
+    return [refs[key] for key in sorted(refs)]
+
+
+def _recommendation_owned(
+    repository: Any, knowledge: Any, version: Any, user_scope_id: str,
+) -> bool:
+    """Ownership from the creating task's scope or the package's owner."""
+    if version.created_by_task_id:
+        with repository.unit_of_work() as uow:
+            rows = uow.query(
+                "SELECT user_scope_id FROM tasks WHERE task_id=?",
+                (version.created_by_task_id,),
+            )
+        if rows and rows[0]["user_scope_id"] == user_scope_id:
+            return True
+    try:
+        knowledge.get_package(
+            version.input.package_id, user_scope_id=user_scope_id,
+            verify_artifacts=False,
+        )
+    except ContractError:
+        return False
+    return True
+
+
+def _derived_state(uow: Any, recommendation_id: str) -> Any:
+    """The last review event wins; no event means the implicit ``current``."""
+    from game_app.contracts.enums import ReviewState
+
+    rows = uow.query(
+        "SELECT payload FROM objects WHERE entity_type='RecommendationReviewEvent'"
+        " ORDER BY created_at, rowid"
+    )
+    state = ReviewState.current
+    for row in rows:
+        event = json.loads(row["payload"])
+        if event.get("recommendation_id") == recommendation_id:
+            state = ReviewState(event["next_state"])
+    return state
+
+
+class RecommendationService:
+    """REC-T03: the recommendation task entry and atomic publication."""
+
+    def __init__(
+        self,
+        repository: Any,
+        files: Any,
+        knowledge: Any,
+        *,
+        adoption: Any | None = None,
+        performance: Any | None = None,
+        clock=utc_now,
+    ) -> None:
+        self.repository = repository
+        self.files = files
+        self.knowledge = knowledge
+        self.adoption = adoption
+        self.performance = performance
+        self.clock = clock
+
+    @property
+    def gate(self) -> InputGate:
+        return InputGate(
+            self.repository, self.knowledge, self.adoption, self.performance,
+            clock=self.clock,
+        )
+
+    # -- registration ------------------------------------------------------
+    def precheck(self, task_input: Any, *, user_scope_id: str) -> GateResult:
+        """Guards that must fail before a task key is consumed (error §4.2)."""
+        return self.gate.check(_typed_input(task_input), user_scope_id=user_scope_id)
+
+    # -- execution ---------------------------------------------------------
+    def handle(self, context: Any) -> Any:
+        from game_app.contracts.enums import TaskType
+        from game_app.contracts.tasks import DomainResult
+        from game_app.tasks import (
+            HandlerOutcome, ProviderRejected, TaskState, TaskStopReason,
+        )
+
+        task_input = context.task_input
+        if not isinstance(task_input, RecommendationInput):
+            raise ContractError(
+                ErrorCode.INPUT_VALIDATION_FAILED,
+                "the recommendation handler received another task type",
+            )
+        context.phase("decide")
+        if not context.service.provider_configured:
+            # No adapter means no audited call, and therefore no audit row.
+            return HandlerOutcome(
+                state=TaskState.failed,
+                stop_reason=TaskStopReason(
+                    kind="execution", code="provider_error",
+                ),
+                error_code=ErrorCode.PROVIDER_NOT_CONFIGURED.value,
+            )
+        gate = self.gate.check(task_input, user_scope_id=context.user_scope_id)
+        builder = CandidateBuilder(self.repository, self.knowledge, clock=self.clock)
+        pool = builder.build(gate)
+        try:
+            reply = context.invoke_provider(
+                kind="model",
+                provider_name="stub",
+                payload=model_request_payload(gate, pool.assessments),
+                prompt_version=MODEL_PROMPT_VERSION,
+                output_schema_version=MODEL_OUTPUT_SCHEMA_VERSION,
+            )
+            readable, total = parse_candidate_reply(reply)
+        except RecommendationProtocolError as error:
+            # An unreadable reply is a deliverable-less provider failure.
+            raise ProviderRejected(str(error)) from error
+
+        screened = builder.build(gate, model_candidates=readable)
+        with self.repository.unit_of_work() as uow:
+            records = self.knowledge._package_records(uow, gate.package)
+        reply_checks, reply_limits = model_reply_checks(
+            readable, total, records, clock=self.clock,
+        )
+        content = build_content(
+            task_input,
+            screened.assessments,
+            repository=self.repository,
+            knowledge=self.knowledge,
+            user_scope_id=context.user_scope_id,
+            applied=gate.applied,
+            task_id=context.task_id,
+            extra_checks=reply_checks,
+            extra_limitations=[*screened.diagnostics, *reply_limits],
+            clock=self.clock,
+        )
+        published = self.publish_recommendation(
+            task_input,
+            content,
+            assessments=screened.assessments,
+            user_scope_id=context.user_scope_id,
+            task_id=context.task_id,
+        )
+        refs = [
+            ObjectRef(
+                entity_type="RecommendationVersion", entity_id=published.version.id,
+            ),
+            ObjectRef(
+                entity_type="ManagedFile", entity_id=published.manifest_file_id,
+            ),
+        ]
+        if published.target is not None:
+            refs.append(ObjectRef(
+                entity_type="TargetProposal", entity_id=published.target.id,
+            ))
+        return HandlerOutcome(
+            state=TaskState.completed,
+            domain_result=DomainResult(
+                domain=TaskType.recommendation,
+                code=content.readiness.value,
+                input_revision=context.task_input_revision,
+                checks=content.checks,
+            ),
+            result_refs=refs,
+        )
+
+    # -- publication -------------------------------------------------------
+    def publish_recommendation(
+        self,
+        task_input: Any,
+        content: RecommendationContent,
+        *,
+        user_scope_id: str,
+        task_id: str,
+        assessments: Sequence[CandidateAssessment] = (),
+        declared_readiness: Any | None = None,
+        hooks: Any | None = None,
+    ) -> PublishResult:
+        """One transaction: version, target, supersede event and references."""
+        from game_app.contracts.enums import RecommendationReadiness, ReviewState
+        from game_app.contracts.recommendation import (
+            RecommendationReviewEvent,
+            RecommendationVersion,
+        )
+
+        typed = _typed_input(task_input)
+        declared = (
+            content.readiness if declared_readiness is None else declared_readiness
+        )
+        recomputed = reduce_readiness(content.checks, DECLARED_SCOPE)
+        if declared is not recomputed:
+            # Readiness answers operability; a caller may not assert it.
+            raise ContractError(
+                ErrorCode.INPUT_VALIDATION_FAILED,
+                "the declared readiness does not match the published checks",
+                field_errors=[FieldError(
+                    path="readiness", code="conflict",
+                    message="recomputed readiness differs",
+                )],
+            )
+        if recomputed is RecommendationReadiness.blocked and any(
+            _field(action, "action") in ("set_value", "conditional_strategy")
+            for action in content.actions
+        ):
+            raise ContractError(
+                ErrorCode.INPUT_VALIDATION_FAILED,
+                "a blocked recommendation may not carry an executable action",
+            )
+
+        game_context = self.knowledge.resolve_context(
+            typed.game_context_id, user_scope_id,
+        )
+        stored_device = self.repository.find_object(
+            "DeviceSnapshot", typed.device_snapshot_id,
+        )
+        if stored_device is None:
+            raise ContractError(
+                ErrorCode.RESOURCE_NOT_FOUND, "the device snapshot is not available"
+            )
+        device = DeviceSnapshot.model_validate_json(stored_device.payload_bytes)
+        series_id = _stable_id(
+            user_scope_id, game_context.game_id, device.device_series_id,
+            DECLARED_SCOPE,
+        )
+        input_hash = hashlib.sha256(
+            canonical_json(typed.model_dump(mode="json"))
+        ).hexdigest()
+        digest = content_hash(content)
+        version_id = _stable_id(
+            user_scope_id, series_id, task_id, input_hash, digest,
+        )
+        manifest = assessment_manifest(assessments)
+        manifest_file_id = self.files.store_artifact(
+            manifest,
+            relative_name=f"recommendations/{version_id}/candidates.json",
+            stable_key=(
+                f"recommendation-manifest:{user_scope_id}:{input_hash}:"
+                f"{hashlib.sha256(manifest).hexdigest()}"
+            ),
+            user_scope_id=user_scope_id,
+        )
+
+        with self.repository.unit_of_work() as uow:
+            existing = uow.find_object("RecommendationVersion", version_id)
+            if existing is not None:
+                # A retry inside one task returns the version it already built.
+                return self._replayed(uow, existing)
+            row = uow.query(
+                "SELECT COALESCE(MAX(version), 0) AS last FROM objects"
+                " WHERE entity_type='RecommendationVersion' AND series_id=?",
+                (series_id,),
+            )[0]
+            previous = uow.latest_for_series("RecommendationVersion", series_id)
+            parent_id = None if previous is None else previous.object_id
+            version = RecommendationVersion(
+                id=version_id,
+                schema_version=PRODUCT_VERSION,
+                created_at=self.clock(),
+                created_by_task_id=task_id,
+                series_id=series_id,
+                version=int(row["last"]) + 1,
+                parent_id=parent_id,
+                input=typed,
+                base_configuration_ref=content.base_configuration_ref,
+                actions=list(content.actions),
+                alternatives=list(content.alternatives),
+                target_proposal=content.target_proposal,
+                reference_results=list(content.reference_results),
+                declared_scope=DECLARED_SCOPE,
+                readiness=declared,
+                checks=list(content.checks),
+                candidate_manifest_file_id=manifest_file_id,
+            )
+            uow.insert_versioned("RecommendationVersion", version)
+
+            target = None
+            if content.target_proposal is not None:
+                target = content.target_proposal
+                if uow.find_object("TargetProposal", target.id) is None:
+                    uow.insert_object("TargetProposal", target)
+
+            event = None
+            if previous is not None:
+                prior_state = _derived_state(uow, previous.object_id)
+                if prior_state in (ReviewState.current, ReviewState.needs_review):
+                    event = RecommendationReviewEvent(
+                        id=_stable_id(previous.object_id, version_id, "supersede"),
+                        schema_version=PRODUCT_VERSION,
+                        created_at=self.clock(),
+                        created_by_task_id=task_id,
+                        recommendation_id=previous.object_id,
+                        previous_state=prior_state,
+                        next_state=ReviewState.superseded,
+                        affected_refs=[],
+                        reason=(
+                            f"recommendation version {version.version} supersedes"
+                            " this one"
+                        ),
+                        new_package_id=None,
+                    )
+                    uow.insert_object("RecommendationReviewEvent", event)
+
+            self._write_references(uow, version, target)
+            if hooks is not None and hooks.before_commit is not None:
+                # The crash boundary runs inside the transaction: a failure
+                # here must leave no version, no target and no event.
+                hooks.before_commit()
+            return PublishResult(
+                version=version,
+                target=target,
+                manifest_file_id=manifest_file_id,
+                review_event=event,
+                created=True,
+            )
+
+    def _replayed(self, uow: Any, stored: Any) -> PublishResult:
+        from game_app.contracts.recommendation import RecommendationVersion
+
+        version = RecommendationVersion.model_validate_json(stored.payload_bytes)
+        return PublishResult(
+            version=version,
+            target=version.target_proposal,
+            manifest_file_id=version.candidate_manifest_file_id,
+            review_event=None,
+            created=False,
+        )
+
+    @staticmethod
+    def _write_references(
+        uow: Any, version: Any, target: Any | None,
+    ) -> None:
+        seen: set[tuple[str, str]] = set()
+
+        def link(relation: str, entity_type: str, entity_id: str | None) -> None:
+            if not entity_id or (relation, entity_id) in seen:
+                return
+            if uow.find_object(entity_type, entity_id) is None:
+                return
+            seen.add((relation, entity_id))
+            uow.insert_reference(
+                version.id, relation,
+                ObjectRef(entity_type=entity_type, entity_id=entity_id),
+            )
+
+        def link_action(action: Any) -> None:
+            setting_ref = _field(action, "setting_ref")
+            if _field(setting_ref, "kind") == "knowledge":
+                record = _field(setting_ref, "record")
+                link("setting", "ImportedRecord", _field(record, "record_snapshot_id"))
+            for evidence in action.evidence_refs or []:
+                if evidence.kind == "knowledge":
+                    link("evidence", "ImportedRecord", evidence.record.record_snapshot_id)
+                elif evidence.kind == "artifact":
+                    link("evidence", "ManagedFile", evidence.file_id)
+
+        if version.base_configuration_ref is not None:
+            link(
+                "base_configuration", "ImportedRecord",
+                version.base_configuration_ref.record_snapshot_id,
+            )
+        for action in version.actions:
+            link_action(action)
+        for alternative in version.alternatives:
+            for action in alternative.action_overrides:
+                link_action(action)
+        for ref in version.reference_results:
+            link("reference_result", "ImportedRecord", ref.record_snapshot_id)
+        if target is not None:
+            for evidence in target.basis_refs:
+                if evidence.kind == "knowledge":
+                    link(
+                        "target_basis", "ImportedRecord",
+                        evidence.record.record_snapshot_id,
+                    )
+        link("candidate_manifest", "ManagedFile", version.candidate_manifest_file_id)
+
+    # -- reads -------------------------------------------------------------
+    def get_recommendation(self, recommendation_id: str, *, user_scope_id: str) -> Any:
+        from game_app.contracts.recommendation import RecommendationVersion
+
+        stored = self.repository.find_object(
+            "RecommendationVersion", recommendation_id
+        )
+        if stored is None:
+            raise ContractError(
+                ErrorCode.RESOURCE_NOT_FOUND, "the recommendation is not available"
+            )
+        version = RecommendationVersion.model_validate_json(stored.payload_bytes)
+        if not _recommendation_owned(
+            self.repository, self.knowledge, version, user_scope_id
+        ):
+            # Another player's recommendation is not merely hidden: it does
+            # not exist for this caller.
+            raise ContractError(
+                ErrorCode.RESOURCE_NOT_FOUND, "the recommendation is not available"
+            )
+        return version
+
+
+class ReviewService:
+    """REC-T03: impact consumption and the derived review state."""
+
+    _REASONS = {
+        "needs_review": (
+            "the impact notice names records a current recommendation depends on"
+        ),
+        "already_needs_review": (
+            "every affected recommendation was already waiting for review"
+        ),
+        "superseded_only": (
+            "only superseded recommendations depend on the affected records"
+        ),
+        "no_affected_dependency": (
+            "no visible recommendation depends on the affected records"
+        ),
+    }
+
+    def __init__(self, repository: Any, knowledge: Any, *, clock=utc_now) -> None:
+        self.repository = repository
+        self.knowledge = knowledge
+        self.clock = clock
+
+    # -- review state ------------------------------------------------------
+    def events_for(self, recommendation_id: str) -> list[Any]:
+        from game_app.contracts.recommendation import RecommendationReviewEvent
+
+        with self.repository.unit_of_work() as uow:
+            rows = uow.query(
+                "SELECT payload FROM objects"
+                " WHERE entity_type='RecommendationReviewEvent'"
+                " ORDER BY created_at, rowid"
+            )
+        events = [
+            RecommendationReviewEvent.model_validate_json(row["payload"])
+            for row in rows
+        ]
+        return [
+            event for event in events
+            if event.recommendation_id == recommendation_id
+        ]
+
+    def derived_state(self, recommendation_id: str) -> Any:
+        from game_app.contracts.enums import ReviewState
+
+        events = self.events_for(recommendation_id)
+        return ReviewState.current if not events else events[-1].next_state
+
+    # -- impact consumption ------------------------------------------------
+    def consume_impact(self, notice_id: str, *, user_scope_id: str) -> Any:
+        """Mark the recommendations a notice affects; never rewrite them."""
+        from game_app.contracts.common import ResourceResult
+        from game_app.contracts.enums import ReviewState
+        from game_app.contracts.knowledge import ImpactNotice
+        from game_app.contracts.recommendation import (
+            RecommendationReviewEvent,
+            RecommendationVersion,
+        )
+
+        stored = self.repository.find_object("ImpactNotice", notice_id)
+        if stored is None:
+            raise ContractError(
+                ErrorCode.RESOURCE_NOT_FOUND, "the impact notice is not available"
+            )
+        notice = ImpactNotice.model_validate_json(stored.payload_bytes)
+        # Both packages must belong to this caller.  ``verify_artifacts=False``:
+        # a damaged original does not stop a review registration (D-R11).
+        self.knowledge.get_package(
+            notice.old_package_id, user_scope_id=user_scope_id,
+            verify_artifacts=False,
+        )
+        self.knowledge.get_package(
+            notice.new_package_id, user_scope_id=user_scope_id,
+            verify_artifacts=False,
+        )
+
+        with self.repository.unit_of_work() as uow:
+            row = uow.query(
+                "SELECT * FROM impact_consumptions WHERE user_scope_id=? AND notice_id=?",
+                (user_scope_id, notice.id),
+            )
+            if row:
+                return _stored_consumption(row[0])
+
+        affected_ids, affected_triples = self._affected_keys(notice)
+        versions = self._owned_versions(user_scope_id)
+        matched = [
+            version for version in versions
+            if _references_affected(version, affected_ids, affected_triples)
+        ]
+        states = {version.id: self.derived_state(version.id) for version in matched}
+        current = [
+            version for version in matched
+            if states[version.id] is ReviewState.current
+        ]
+        events = [
+            RecommendationReviewEvent(
+                id=_stable_id(user_scope_id, notice.id, version.id, "needs_review"),
+                schema_version=PRODUCT_VERSION,
+                created_at=self.clock(),
+                created_by_task_id=None,
+                recommendation_id=version.id,
+                previous_state=ReviewState.current,
+                next_state=ReviewState.needs_review,
+                affected_refs=_matching_refs(
+                    version, affected_ids, affected_triples,
+                ),
+                reason=(
+                    f"impact notice {notice.id} changed records this"
+                    " recommendation depends on"
+                ),
+                new_package_id=notice.new_package_id,
+            )
+            for version in current
+        ]
+        if current:
+            outcome = "needs_review"
+        elif any(
+            state is ReviewState.needs_review for state in states.values()
+        ):
+            outcome = "already_needs_review"
+        elif matched:
+            outcome = "superseded_only"
+        else:
+            outcome = "no_affected_dependency"
+
+        recommendation_ids = sorted(version.id for version in matched)
+        event_ids = sorted(event.id for event in events)
+        refs = [ObjectRef(entity_type="ImpactNotice", entity_id=notice.id)]
+        if current:
+            refs.extend(
+                ObjectRef(
+                    entity_type="RecommendationReviewEvent", entity_id=event_id,
+                )
+                for event_id in event_ids
+            )
+            refs.extend(
+                ObjectRef(
+                    entity_type="RecommendationVersion", entity_id=item,
+                )
+                for item in recommendation_ids
+            )
+        result = ResourceResult(refs=refs)
+
+        with self.repository.unit_of_work() as uow:
+            # Under BEGIN IMMEDIATE a second delivery cannot interleave here;
+            # the re-check is what makes the notice a one-shot message.
+            existing = uow.query(
+                "SELECT * FROM impact_consumptions WHERE user_scope_id=? AND notice_id=?",
+                (user_scope_id, notice.id),
+            )
+            if existing:
+                return _stored_consumption(existing[0])
+            for event in events:
+                uow.insert_object("RecommendationReviewEvent", event)
+            uow.execute(
+                "INSERT INTO impact_consumptions(user_scope_id, notice_id, outcome,"
+                " recommendation_ids, review_event_ids, result_refs, reason, created_at)"
+                " VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    user_scope_id,
+                    notice.id,
+                    outcome,
+                    canonical_json(recommendation_ids).decode("utf-8"),
+                    canonical_json(event_ids).decode("utf-8"),
+                    canonical_json(
+                        [ref.model_dump(mode="json") for ref in result.refs]
+                    ).decode("utf-8"),
+                    self._REASONS[outcome],
+                    self.clock(),
+                ),
+            )
+        return result
+
+    def _affected_keys(
+        self, notice: Any,
+    ) -> tuple[set[str], set[tuple[str, str, str]]]:
+        """Resolve every affected id, then match by identity triple too."""
+        from game_app.contracts.knowledge import ImportedRecord
+
+        ids: set[str] = set()
+        triples: set[tuple[str, str, str]] = set()
+        with self.repository.unit_of_work() as uow:
+            for record_id in notice.affected_record_ids:
+                stored = uow.find_object("ImportedRecord", record_id)
+                if stored is None:
+                    continue
+                record = ImportedRecord.model_validate_json(stored.payload_bytes)
+                ids.add(record.id)
+                triples.add((
+                    record.capture_scope_id, record.record_type,
+                    record.local_record_id,
+                ))
+        return ids, triples
+
+    def _owned_versions(self, user_scope_id: str) -> list[Any]:
+        from game_app.contracts.recommendation import RecommendationVersion
+
+        with self.repository.unit_of_work() as uow:
+            rows = uow.iter_objects("RecommendationVersion")
+        versions = [
+            RecommendationVersion.model_validate_json(row.payload_bytes)
+            for row in rows
+        ]
+        return [
+            version for version in versions
+            if _recommendation_owned(
+                self.repository, self.knowledge, version, user_scope_id
+            )
+        ]
+
+    # -- projection --------------------------------------------------------
+
+
+def _references_affected(
+    version: Any, ids: set[str], triples: set[tuple[str, str, str]],
+) -> bool:
+    return bool(_matching_refs(version, ids, triples))
+
+
+def _matching_refs(
+    version: Any, ids: set[str], triples: set[tuple[str, str, str]],
+) -> list[KnowledgeRecordRef]:
+    matched: list[KnowledgeRecordRef] = []
+    for ref in _knowledge_refs(version):
+        if ref.record_snapshot_id in ids or (
+            ref.capture_scope_id, ref.record_type, ref.local_record_id
+        ) in triples:
+            matched.append(ref)
+    return matched
+
+
+def _stored_consumption(row: Any) -> Any:
+    from game_app.contracts.common import ResourceResult
+
+    refs = ResourceResult(refs=[
+        ObjectRef.model_validate(item) for item in json.loads(row["result_refs"])
+    ])
+    return refs
+
+
 __all__ = [
     "GateResult",
     "InputGate",
@@ -2186,5 +3071,15 @@ __all__ = [
     "RecommendationContent",
     "build_content",
     "DECLARED_SCOPE",
+    "RecommendationService",
+    "ReviewService",
+    "PublishResult",
+    "RecommendationProtocolError",
+    "model_request_payload",
+    "model_reply_checks",
+    "model_candidate_is_member",
+    "model_candidate_identifier",
+    "parse_candidate_reply",
+    "content_hash",
 ]
 

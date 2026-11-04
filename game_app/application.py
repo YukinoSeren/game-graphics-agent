@@ -20,6 +20,7 @@ from game_app.files import FileService
 from game_app.importer import ImportService
 from game_app.knowledge import IdentityService, KnowledgeService
 from game_app.performance import PerformanceService
+from game_app.recommendation import RecommendationService, ReviewService
 from game_app.repository import ProductRepository
 from game_app.tasks import DEFAULT_ROUTES, TaskService
 
@@ -71,6 +72,17 @@ class Application:
             # Without a registry the type stays unregistered and is refused at
             # registration instead of running an empty success.
             self.tasks.handlers["capture"] = self.performance.handle_capture
+        self.recommendations = RecommendationService(
+            repository,
+            self.files,
+            self.knowledge,
+            adoption=self.adoption,
+            performance=self.performance,
+            clock=clock,
+        )
+        self.review = ReviewService(repository, self.knowledge, clock=clock)
+        # 03's consumer exists: the impact notice gets a real host.
+        self.tasks.handlers["recommendation"] = self.recommendations.handle
 
     # -- task control -------------------------------------------------------
     def register_task(
@@ -173,7 +185,7 @@ class Application:
         self, old_package_id: str, new_package_id: str,
         context: MutationContext, **kwargs: Any,
     ):
-        """Register an impact notice; the 03 consumer interface is not built."""
+        """Register an impact notice; ``consume_impact`` is its 03 consumer."""
         return self.knowledge.notify_impacts(
             old_package_id,
             new_package_id,
@@ -181,6 +193,33 @@ class Application:
             idempotency_key=context.idempotency_key,
             request_id=context.request_id,
             **kwargs,
+        )
+
+    # -- 03 recommendation entries -----------------------------------------
+    def recommend(self, task_input: Any, context: MutationContext, **kwargs: Any):
+        """Register a recommendation task; pure conflicts keep the key.
+
+        The registered key is replayed before the prechecks, exactly as
+        ``collect_knowledge`` does (error §4.2).
+        """
+        registered = self.repository.find_idempotency(
+            context.user_scope_id, "POST", DEFAULT_ROUTES["recommendation"],
+            context.idempotency_key,
+        )
+        if registered is None:
+            self.recommendations.precheck(
+                task_input, user_scope_id=context.user_scope_id
+            )
+        return self.register_task(task_input, context, **kwargs)
+
+    def get_recommendation(self, recommendation_id: str, user_scope_id: str):
+        return self.recommendations.get_recommendation(
+            recommendation_id, user_scope_id=user_scope_id
+        )
+
+    def consume_impact(self, notice_id: str, context: MutationContext):
+        return self.review.consume_impact(
+            notice_id, user_scope_id=context.user_scope_id
         )
 
     # -- 04 performance entries (synchronous, thin wrappers) ----------------

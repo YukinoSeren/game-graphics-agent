@@ -135,6 +135,7 @@ TaskInputPayload = Annotated[
         CaptureInput,
         DeviceScanInput,
         LogImportInput,
+        RecommendationInput,
     ],
     Field(discriminator="kind"),
 ]

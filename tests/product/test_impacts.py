@@ -1,9 +1,10 @@
 """KNW-T04: impact notices, source revisions and the image enablement gate.
 
-The notice is the only thing this slice writes.  The 03 consumer
-(``consume_impact``) does not exist yet: REC-T01—T03 are not implemented, so the
-tests assert positively that no recommendation content, review event or
-current-applied pointer is created.
+The notice itself stays a pure message: registering one never writes
+recommendation content, a review event or a current-applied pointer.  Its 03
+consumer (``Application.consume_impact``) exists, so the last two tests check
+that an existing notice is really readable by it — and that a damaged original
+blocks ``get_package`` without blocking the consumption (D-R11).
 """
 
 from __future__ import annotations
@@ -542,16 +543,31 @@ def test_no_recommendation_or_pointer_is_written_by_a_notice(tmp_path):
         assert uow.query("SELECT COUNT(*) AS n FROM external_calls")[0]["n"] == 0
 
 
-def test_the_consumer_interface_is_blocked_not_faked(tmp_path):
-    _repository, _files, _context, service, _old, _new, _snapshots = _pair(tmp_path)
-
-    # REC-T01—T03 do not exist, so 03's consumer has no host; nothing pretends
-    # to consume the notice and no review event is fabricated.
-    assert not hasattr(service, "consume_impact")
-    assert not hasattr(Application, "consume_impact")
+def _consumer_context(key: str = "consume-1") -> MutationContext:
+    return MutationContext(
+        user_scope_id=SCOPE, idempotency_key=key, request_id=_uid(9100),
+    )
 
 
-def test_a_damaged_member_blocks_consumption_but_the_notice_is_registered(tmp_path):
+def test_the_notice_is_consumable_by_the_03_consumer(tmp_path):
+    repository, files, _context, service, old, new, _snapshots = _pair(tmp_path)
+    notice = _notify(service, old.id, new.id, key="notice-1")
+    assert notice is not None
+    application = Application(repository, file_root=str(tmp_path / "managed"))
+
+    result = application.consume_impact(notice.id, _consumer_context())
+
+    # The consumer reads the notice instead of rewriting it.  No recommendation
+    # cites these records yet, so nothing is marked and nothing is invented.
+    assert [ref.entity_type for ref in result.refs] == ["ImpactNotice"]
+    assert _count(repository, "RecommendationReviewEvent") == 0
+    assert _count(repository, "RecommendationVersion") == 0
+    with repository.unit_of_work() as uow:
+        rows = uow.query("SELECT outcome FROM impact_consumptions")
+    assert [row["outcome"] for row in rows] == ["no_affected_dependency"]
+
+
+def test_a_damaged_member_does_not_block_consumption_but_get_package_refuses_it(tmp_path):
     repository, files, _context, service, old, new, _snapshots = _pair(tmp_path)
     with repository.unit_of_work() as uow:
         snapshot_ids = new.import_snapshot_ids
@@ -569,6 +585,11 @@ def test_a_damaged_member_blocks_consumption_but_the_notice_is_registered(tmp_pa
 
     notice = _notify(service, old.id, new.id, key="notice-1")
     assert notice is not None
+    assert len(_notice_rows(repository)) == 1
+
+    application = Application(repository, file_root=str(tmp_path / "managed"))
+    result = application.consume_impact(notice.id, _consumer_context())
+    assert result.refs[0].entity_type == "ImpactNotice"
     assert len(_notice_rows(repository)) == 1
 
 

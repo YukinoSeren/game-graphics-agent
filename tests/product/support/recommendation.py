@@ -320,7 +320,14 @@ def source(scope_id: str = "src-0001", revision_id: str = "rev-0001",
         "lineage_status": "unknown",
     }
     if content_hash is not None:
-        row["content_hash"] = content_hash
+        # The frozen format carries the hash inside the inline document; a
+        # top-level key would be ignored and the revision would read as
+        # unchanged, which silently defeats every impact notice.
+        row["document"] = {
+            "content_hash": content_hash,
+            "truncated": False,
+            "retrieval_method": "html",
+        }
     return row
 
 

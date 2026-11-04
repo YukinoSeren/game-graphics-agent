@@ -50,6 +50,8 @@ DEFAULT_ROUTES = {
     "device_scan": "/api/device-scans",
     "log_import": "/api/log-imports",
     "recommendation": "/api/recommendations",
+    "feedback": "/api/feedback",
+    "next_action": "/api/next-actions",
 }
 _COUNTER_LIMITS = {
     "model": "max_model_calls",

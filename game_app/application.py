@@ -16,6 +16,11 @@ from game_app.contracts.common import Budget, MutationContext
 from game_app.contracts.primitives import utc_now
 from game_app.device import DeviceService
 from game_app.errors import ContractError, ErrorCode, FieldError
+from game_app.feedback import (
+    FeedbackService,
+    PreferenceService,
+    TargetAcceptanceService,
+)
 from game_app.files import FileService
 from game_app.importer import ImportService
 from game_app.knowledge import IdentityService, KnowledgeService
@@ -83,6 +88,10 @@ class Application:
         self.review = ReviewService(repository, self.knowledge, clock=clock)
         # 03's consumer exists: the impact notice gets a real host.
         self.tasks.handlers["recommendation"] = self.recommendations.handle
+        self.feedbacks = FeedbackService(repository, self.files, self.tasks, clock=clock)
+        self.preferences = PreferenceService(repository, self.files, clock=clock)
+        self.acceptances = TargetAcceptanceService(repository, self.files, clock=clock)
+        self.tasks.handlers["feedback"] = self.feedbacks.handle
 
     # -- task control -------------------------------------------------------
     def register_task(
@@ -221,6 +230,30 @@ class Application:
         return self.review.consume_impact(
             notice_id, user_scope_id=context.user_scope_id
         )
+
+    # -- 05 feedback entries -----------------------------------------------
+    def record_feedback(self, task_input: Any, context: MutationContext, **kwargs: Any):
+        """Register a feedback task; a registered key is replayed first."""
+        registered = self.repository.find_idempotency(
+            context.user_scope_id, "POST", DEFAULT_ROUTES["feedback"],
+            context.idempotency_key,
+        )
+        if registered is None:
+            self.feedbacks.precheck(
+                task_input, user_scope_id=context.user_scope_id
+            )
+        return self.feedbacks.record_feedback(task_input, context, **kwargs)
+
+    def get_feedback(self, feedback_id: str, user_scope_id: str):
+        return self.feedbacks.get_feedback(feedback_id, user_scope_id)
+
+    def declare_preference(self, request: Any, context: MutationContext, **kwargs: Any):
+        return self.preferences.declare_preference(request, context, **kwargs)
+
+    def record_target_acceptance(
+        self, request: Any, context: MutationContext, **kwargs: Any,
+    ):
+        return self.acceptances.record_acceptance(request, context, **kwargs)
 
     # -- 04 performance entries (synchronous, thin wrappers) ----------------
     def create_session(self, request: Any, context: MutationContext, **kwargs: Any):

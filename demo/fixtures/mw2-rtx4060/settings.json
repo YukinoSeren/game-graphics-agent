@@ -1,0 +1,1404 @@
+{
+  "schema": "demo-fixtures/1",
+  "demo_only": true,
+  "scenario_id": "mw2-rtx4060",
+  "settings": [
+    {
+      "id": "mw2.display_mode",
+      "display_name": "显示模式",
+      "demo_original_name": "Display Mode",
+      "group": "显示",
+      "type": "fixed",
+      "allowed_values": [
+        "fullscreen",
+        "borderless"
+      ],
+      "recommended_value": "fullscreen",
+      "quality_variant": "fullscreen",
+      "performance_variant": "fullscreen",
+      "reason": "选择全屏，让本轮日志和后续复看沿用一致的呈现条件。当前决定侧重可比较性，也保留玩家针对窗口切换习惯重新选择的空间。",
+      "evidence_source_ids": [
+        "demo://mw2-rtx4060/src/settings-guide",
+        "demo://mw2-rtx4060/src/conditional-test",
+        "demo://mw2-rtx4060/src/s05"
+      ],
+      "dependencies": [],
+      "needs_verification": false,
+      "unknown": false,
+      "evidence_decision": {
+        "setting_id": "mw2.display_mode",
+        "selected_value": "fullscreen",
+        "source_pack_version": "mw1-richness/2",
+        "source_views": [
+          {
+            "source_key": "S01",
+            "source_id": "demo://mw2-rtx4060/src/settings-guide",
+            "view": "全屏用于统一当前呈现条件，无边框更便于切换窗口。应先固定渲染尺寸再比较观感，模式本身不能证明帧率一定提高。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S03",
+            "source_id": "demo://mw2-rtx4060/src/conditional-test",
+            "view": "显示刷新、渲染速度与提交节奏需要分开讨论。全屏可以作为固定比较条件，但不能仅凭模式名称推导延迟必然减少。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S05",
+            "source_id": "demo://mw2-rtx4060/src/s05",
+            "view": "平衡预设先固定全屏、1080p 与观察路线，再逐项比较画质；避免显示方式与画质选项同时改变后无法解释差异。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          }
+        ],
+        "alternatives": [
+          {
+            "value": "borderless",
+            "benefit": "切换其他窗口更方便",
+            "cost": "需要重新比较呈现节奏与使用习惯",
+            "not_selected_reason": "当前主线先保持全屏以减少比较条件变化"
+          }
+        ],
+        "user_goal_fit": "先建立一致的观察条件，再分配材质和特效预算，符合流畅优先且保留丰富感的目标。",
+        "device_context": "当前背景为 RTX 4060 Laptop GPU、8 GB 显存、16 GB 内存，游戏渲染 1920×1080；桌面 2560×1600、165 Hz 单独记录。背景限制讨论范围，不保证具体帧率。",
+        "decision": "选择全屏，让本轮日志和后续复看沿用一致的呈现条件。当前决定侧重可比较性，也保留玩家针对窗口切换习惯重新选择的空间。",
+        "tradeoff": "接受切换到其他窗口时不如无边框方便；不把这一模式承诺为提高帧率或消除卡顿。",
+        "revisit_when": "频繁切换窗口不便，或呈现观感明显不合习惯时，保持其他项不变单独比较无边框。"
+      },
+      "source_views": [
+        {
+          "source_key": "S01",
+          "source_id": "demo://mw2-rtx4060/src/settings-guide",
+          "view": "全屏用于统一当前呈现条件，无边框更便于切换窗口。应先固定渲染尺寸再比较观感，模式本身不能证明帧率一定提高。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S03",
+          "source_id": "demo://mw2-rtx4060/src/conditional-test",
+          "view": "显示刷新、渲染速度与提交节奏需要分开讨论。全屏可以作为固定比较条件，但不能仅凭模式名称推导延迟必然减少。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S05",
+          "source_id": "demo://mw2-rtx4060/src/s05",
+          "view": "平衡预设先固定全屏、1080p 与观察路线，再逐项比较画质；避免显示方式与画质选项同时改变后无法解释差异。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        }
+      ],
+      "alternatives": [
+        {
+          "value": "borderless",
+          "benefit": "切换其他窗口更方便",
+          "cost": "需要重新比较呈现节奏与使用习惯",
+          "not_selected_reason": "当前主线先保持全屏以减少比较条件变化"
+        }
+      ],
+      "user_goal_fit": "先建立一致的观察条件，再分配材质和特效预算，符合流畅优先且保留丰富感的目标。",
+      "device_context": "当前背景为 RTX 4060 Laptop GPU、8 GB 显存、16 GB 内存，游戏渲染 1920×1080；桌面 2560×1600、165 Hz 单独记录。背景限制讨论范围，不保证具体帧率。",
+      "decision": "选择全屏，让本轮日志和后续复看沿用一致的呈现条件。当前决定侧重可比较性，也保留玩家针对窗口切换习惯重新选择的空间。",
+      "tradeoff": "接受切换到其他窗口时不如无边框方便；不把这一模式承诺为提高帧率或消除卡顿。",
+      "revisit_when": "频繁切换窗口不便，或呈现观感明显不合习惯时，保持其他项不变单独比较无边框。"
+    },
+    {
+      "id": "mw2.render_resolution",
+      "display_name": "渲染分辨率",
+      "demo_original_name": "Render Resolution",
+      "group": "显示",
+      "type": "fixed",
+      "allowed_values": [
+        "1920x1080",
+        "2560x1440",
+        "3840x2160"
+      ],
+      "recommended_value": "1920x1080",
+      "quality_variant": "1920x1080",
+      "performance_variant": "1920x1080",
+      "reason": "游戏渲染保留 1920×1080，与本次固定背景一致；桌面仍可使用 2560×1600。后续局部反馈优先从相关效果入手，保护当前清晰度基线。",
+      "evidence_source_ids": [
+        "demo://mw2-rtx4060/src/settings-guide",
+        "demo://mw2-rtx4060/src/s05",
+        "demo://mw2-rtx4060/src/s10",
+        "demo://mw2-rtx4060/src/s15"
+      ],
+      "dependencies": [],
+      "needs_verification": false,
+      "unknown": false,
+      "evidence_decision": {
+        "setting_id": "mw2.render_resolution",
+        "selected_value": "1920x1080",
+        "source_pack_version": "mw1-richness/2",
+        "source_views": [
+          {
+            "source_key": "S01",
+            "source_id": "demo://mw2-rtx4060/src/settings-guide",
+            "view": "桌面 2560×1600 与游戏渲染 1920×1080 描述不同环节。固定游戏尺寸可统一比较，桌面尺寸无需随之改成相同数值。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S05",
+            "source_id": "demo://mw2-rtx4060/src/s05",
+            "view": "平衡预设从 1080p 开始分配纹理和特效预算，先保留基础清晰度，不因单一交战反馈立即改变整个画面的采样条件。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S10",
+            "source_id": "demo://mw2-rtx4060/src/s10",
+            "view": "分辨率决定基础采样尺寸，不能用纹理或抗锯齿完全替代。改变它以后，应重新观察几何边缘、细线与整体负载。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S15",
+            "source_id": "demo://mw2-rtx4060/src/s15",
+            "view": "1080p 是这份平衡方案的条件而非测量结果。出现爆炸卡顿时先比较局部粒子，不把整体分辨率作为第一调整项。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          }
+        ],
+        "alternatives": [
+          {
+            "value": "2560x1440",
+            "benefit": "更多几何与细线采样细节",
+            "cost": "整体渲染负担增加，需重新比较",
+            "not_selected_reason": "当前背景和目标优先固定1080p，为材质与特效保留空间"
+          }
+        ],
+        "user_goal_fit": "把分辨率作为保护项，避免为一次爆炸停顿牺牲整个画面的清晰度。",
+        "device_context": "当前背景为 RTX 4060 Laptop GPU、8 GB 显存、16 GB 内存，游戏渲染 1920×1080；桌面 2560×1600、165 Hz 单独记录。背景限制讨论范围，不保证具体帧率。",
+        "decision": "游戏渲染保留 1920×1080，与本次固定背景一致；桌面仍可使用 2560×1600。后续局部反馈优先从相关效果入手，保护当前清晰度基线。",
+        "tradeoff": "相对更高渲染尺寸，细小轮廓的采样精度较少；换来的是控制整体工作量的选择空间，而非已保证的帧率。",
+        "revisit_when": "主动改为其他渲染尺寸或持续认为整体细节不足时，重新整理方案并比较相同路线。"
+      },
+      "source_views": [
+        {
+          "source_key": "S01",
+          "source_id": "demo://mw2-rtx4060/src/settings-guide",
+          "view": "桌面 2560×1600 与游戏渲染 1920×1080 描述不同环节。固定游戏尺寸可统一比较，桌面尺寸无需随之改成相同数值。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S05",
+          "source_id": "demo://mw2-rtx4060/src/s05",
+          "view": "平衡预设从 1080p 开始分配纹理和特效预算，先保留基础清晰度，不因单一交战反馈立即改变整个画面的采样条件。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S10",
+          "source_id": "demo://mw2-rtx4060/src/s10",
+          "view": "分辨率决定基础采样尺寸，不能用纹理或抗锯齿完全替代。改变它以后，应重新观察几何边缘、细线与整体负载。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S15",
+          "source_id": "demo://mw2-rtx4060/src/s15",
+          "view": "1080p 是这份平衡方案的条件而非测量结果。出现爆炸卡顿时先比较局部粒子，不把整体分辨率作为第一调整项。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        }
+      ],
+      "alternatives": [
+        {
+          "value": "2560x1440",
+          "benefit": "更多几何与细线采样细节",
+          "cost": "整体渲染负担增加，需重新比较",
+          "not_selected_reason": "当前背景和目标优先固定1080p，为材质与特效保留空间"
+        }
+      ],
+      "user_goal_fit": "把分辨率作为保护项，避免为一次爆炸停顿牺牲整个画面的清晰度。",
+      "device_context": "当前背景为 RTX 4060 Laptop GPU、8 GB 显存、16 GB 内存，游戏渲染 1920×1080；桌面 2560×1600、165 Hz 单独记录。背景限制讨论范围，不保证具体帧率。",
+      "decision": "游戏渲染保留 1920×1080，与本次固定背景一致；桌面仍可使用 2560×1600。后续局部反馈优先从相关效果入手，保护当前清晰度基线。",
+      "tradeoff": "相对更高渲染尺寸，细小轮廓的采样精度较少；换来的是控制整体工作量的选择空间，而非已保证的帧率。",
+      "revisit_when": "主动改为其他渲染尺寸或持续认为整体细节不足时，重新整理方案并比较相同路线。"
+    },
+    {
+      "id": "mw2.texture_detail",
+      "display_name": "纹理细节",
+      "demo_original_name": "Texture Detail",
+      "group": "纹理",
+      "type": "quality",
+      "allowed_values": [
+        "high",
+        "medium",
+        "low"
+      ],
+      "recommended_value": "high",
+      "quality_variant": "high",
+      "performance_variant": "medium",
+      "reason": "纹理细节选择高，将材质作为本轮主要保留项。其他次级效果适度收敛，爆炸反馈先比较粒子，不因一次局部停顿降低所有表面细节。",
+      "evidence_source_ids": [
+        "demo://mw2-rtx4060/src/community-config",
+        "demo://mw2-rtx4060/src/version-notes",
+        "demo://mw2-rtx4060/src/s06",
+        "demo://mw2-rtx4060/src/s13"
+      ],
+      "dependencies": [],
+      "needs_verification": false,
+      "unknown": false,
+      "evidence_decision": {
+        "setting_id": "mw2.texture_detail",
+        "selected_value": "high",
+        "source_pack_version": "mw1-richness/2",
+        "source_views": [
+          {
+            "source_key": "S02",
+            "source_id": "demo://mw2-rtx4060/src/community-config",
+            "view": "纹理提供墙面、装备和地面的表面内容，是画面丰富感的一部分；它与阴影、反射承担不同作用，不宜随总预设一起降低。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S04",
+            "source_id": "demo://mw2-rtx4060/src/version-notes",
+            "view": "8 GB 仅是容量条件，不能保证所有场景资源永远充足。高纹理先保留，但需要在连续移动和切换区域后观察加载表现。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S06",
+            "source_id": "demo://mw2-rtx4060/src/s06",
+            "view": "先看近处材质纹路，再看相同视角的装备表面；纹理与过滤同时降低会叠加清晰度损失，应分别判断取舍。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S13",
+            "source_id": "demo://mw2-rtx4060/src/s13",
+            "view": "固定视角比较墙面和装备表面才能看清纹理变化。静态收益不能替代交战表现，仍需要配合连续场景观察。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          }
+        ],
+        "alternatives": [
+          {
+            "value": "medium",
+            "benefit": "降低材质资源需求",
+            "cost": "墙面、地面和装备表面细节减少",
+            "not_selected_reason": "尚无持续资源加载问题，不把局部爆炸描述等同于纹理不足"
+          }
+        ],
+        "user_goal_fit": "材质在移动与静止时持续可见，保留它更直接回应尽可能维持画面丰富感的诉求。",
+        "device_context": "当前背景为 RTX 4060 Laptop GPU、8 GB 显存、16 GB 内存，游戏渲染 1920×1080；桌面 2560×1600、165 Hz 单独记录。背景限制讨论范围，不保证具体帧率。",
+        "decision": "纹理细节选择高，将材质作为本轮主要保留项。其他次级效果适度收敛，爆炸反馈先比较粒子，不因一次局部停顿降低所有表面细节。",
+        "tradeoff": "接受较高材质资源需求；8 GB 显存并非永久充足的保证，持续加载问题仍需另行判断。",
+        "revisit_when": "连续游玩反复出现资源加载异常时，保留同路线记录，再评估高到中的视觉损失。"
+      },
+      "source_views": [
+        {
+          "source_key": "S02",
+          "source_id": "demo://mw2-rtx4060/src/community-config",
+          "view": "纹理提供墙面、装备和地面的表面内容，是画面丰富感的一部分；它与阴影、反射承担不同作用，不宜随总预设一起降低。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S04",
+          "source_id": "demo://mw2-rtx4060/src/version-notes",
+          "view": "8 GB 仅是容量条件，不能保证所有场景资源永远充足。高纹理先保留，但需要在连续移动和切换区域后观察加载表现。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S06",
+          "source_id": "demo://mw2-rtx4060/src/s06",
+          "view": "先看近处材质纹路，再看相同视角的装备表面；纹理与过滤同时降低会叠加清晰度损失，应分别判断取舍。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S13",
+          "source_id": "demo://mw2-rtx4060/src/s13",
+          "view": "固定视角比较墙面和装备表面才能看清纹理变化。静态收益不能替代交战表现，仍需要配合连续场景观察。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        }
+      ],
+      "alternatives": [
+        {
+          "value": "medium",
+          "benefit": "降低材质资源需求",
+          "cost": "墙面、地面和装备表面细节减少",
+          "not_selected_reason": "尚无持续资源加载问题，不把局部爆炸描述等同于纹理不足"
+        }
+      ],
+      "user_goal_fit": "材质在移动与静止时持续可见，保留它更直接回应尽可能维持画面丰富感的诉求。",
+      "device_context": "当前背景为 RTX 4060 Laptop GPU、8 GB 显存、16 GB 内存，游戏渲染 1920×1080；桌面 2560×1600、165 Hz 单独记录。背景限制讨论范围，不保证具体帧率。",
+      "decision": "纹理细节选择高，将材质作为本轮主要保留项。其他次级效果适度收敛，爆炸反馈先比较粒子，不因一次局部停顿降低所有表面细节。",
+      "tradeoff": "接受较高材质资源需求；8 GB 显存并非永久充足的保证，持续加载问题仍需另行判断。",
+      "revisit_when": "连续游玩反复出现资源加载异常时，保留同路线记录，再评估高到中的视觉损失。"
+    },
+    {
+      "id": "mw2.texture_filtering",
+      "display_name": "纹理过滤",
+      "demo_original_name": "Texture Filtering",
+      "group": "纹理",
+      "type": "quality",
+      "allowed_values": [
+        "high",
+        "medium",
+        "low"
+      ],
+      "recommended_value": "high",
+      "quality_variant": "high",
+      "performance_variant": "medium",
+      "reason": "纹理过滤选择高，保留斜视地面和远景材质的连续细节。它与高纹理一起构成清晰度保护项，局部特效反馈先从粒子比较。",
+      "evidence_source_ids": [
+        "demo://mw2-rtx4060/src/version-notes",
+        "demo://mw2-rtx4060/src/s06",
+        "demo://mw2-rtx4060/src/s13"
+      ],
+      "dependencies": [],
+      "needs_verification": false,
+      "unknown": false,
+      "evidence_decision": {
+        "setting_id": "mw2.texture_filtering",
+        "selected_value": "high",
+        "source_pack_version": "mw1-richness/2",
+        "source_views": [
+          {
+            "source_key": "S04",
+            "source_id": "demo://mw2-rtx4060/src/version-notes",
+            "view": "过滤关系到倾斜和远处表面的呈现，不能完全等同于纹理分辨率。应分别比较，避免把不同清晰度损失混在一起。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S06",
+            "source_id": "demo://mw2-rtx4060/src/s06",
+            "view": "斜视道路与地面的细节延伸是过滤的观察重点。保留高档可守住远处材质层次，不应把它当作爆炸卡顿的首要调整项。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S13",
+            "source_id": "demo://mw2-rtx4060/src/s13",
+            "view": "在固定视角观察斜视地面，并保持分辨率和纹理不变，才能识别过滤变化；总预设名称不能代替逐项观察。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          }
+        ],
+        "alternatives": [
+          {
+            "value": "medium",
+            "benefit": "减少部分纹理采样需求",
+            "cost": "斜视与远处表面细节可能减弱",
+            "not_selected_reason": "本轮先保护材质清晰度，尚无单独降低过滤的依据"
+          }
+        ],
+        "user_goal_fit": "地面和远景层次在游玩中持续可见，优先保留比一次性削弱所有次级效果更贴近丰富感目标。",
+        "device_context": "当前背景为 RTX 4060 Laptop GPU、8 GB 显存、16 GB 内存，游戏渲染 1920×1080；桌面 2560×1600、165 Hz 单独记录。背景限制讨论范围，不保证具体帧率。",
+        "decision": "纹理过滤选择高，保留斜视地面和远景材质的连续细节。它与高纹理一起构成清晰度保护项，局部特效反馈先从粒子比较。",
+        "tradeoff": "保留过滤的处理需求，接受它仍有资源代价；不把高档简单解释为完全没有开销。",
+        "revisit_when": "在相同路线发现持续负担并准备重新平衡保护项时，单独比较高与中的远处细节。"
+      },
+      "source_views": [
+        {
+          "source_key": "S04",
+          "source_id": "demo://mw2-rtx4060/src/version-notes",
+          "view": "过滤关系到倾斜和远处表面的呈现，不能完全等同于纹理分辨率。应分别比较，避免把不同清晰度损失混在一起。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S06",
+          "source_id": "demo://mw2-rtx4060/src/s06",
+          "view": "斜视道路与地面的细节延伸是过滤的观察重点。保留高档可守住远处材质层次，不应把它当作爆炸卡顿的首要调整项。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S13",
+          "source_id": "demo://mw2-rtx4060/src/s13",
+          "view": "在固定视角观察斜视地面，并保持分辨率和纹理不变，才能识别过滤变化；总预设名称不能代替逐项观察。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        }
+      ],
+      "alternatives": [
+        {
+          "value": "medium",
+          "benefit": "减少部分纹理采样需求",
+          "cost": "斜视与远处表面细节可能减弱",
+          "not_selected_reason": "本轮先保护材质清晰度，尚无单独降低过滤的依据"
+        }
+      ],
+      "user_goal_fit": "地面和远景层次在游玩中持续可见，优先保留比一次性削弱所有次级效果更贴近丰富感目标。",
+      "device_context": "当前背景为 RTX 4060 Laptop GPU、8 GB 显存、16 GB 内存，游戏渲染 1920×1080；桌面 2560×1600、165 Hz 单独记录。背景限制讨论范围，不保证具体帧率。",
+      "decision": "纹理过滤选择高，保留斜视地面和远景材质的连续细节。它与高纹理一起构成清晰度保护项，局部特效反馈先从粒子比较。",
+      "tradeoff": "保留过滤的处理需求，接受它仍有资源代价；不把高档简单解释为完全没有开销。",
+      "revisit_when": "在相同路线发现持续负担并准备重新平衡保护项时，单独比较高与中的远处细节。"
+    },
+    {
+      "id": "mw2.shadow_quality",
+      "display_name": "阴影质量",
+      "demo_original_name": "Shadow Quality",
+      "group": "阴影",
+      "type": "quality",
+      "allowed_values": [
+        "high",
+        "medium",
+        "low",
+        "off"
+      ],
+      "recommended_value": "high",
+      "quality_variant": "high",
+      "performance_variant": "medium",
+      "reason": "阴影质量初始选择高，保留清楚的遮挡和光照层次；级联不同时设高。爆炸卡顿先试粒子一档，若粒子已降低或受到保护，再考虑阴影高到中。",
+      "evidence_source_ids": [
+        "demo://mw2-rtx4060/src/community-config",
+        "demo://mw2-rtx4060/src/s05",
+        "demo://mw2-rtx4060/src/s13",
+        "demo://mw2-rtx4060/src/s15"
+      ],
+      "dependencies": [],
+      "needs_verification": false,
+      "unknown": false,
+      "evidence_decision": {
+        "setting_id": "mw2.shadow_quality",
+        "selected_value": "high",
+        "source_pack_version": "mw1-richness/2",
+        "source_views": [
+          {
+            "source_key": "S02",
+            "source_id": "demo://mw2-rtx4060/src/community-config",
+            "view": "阴影表达光照方向和遮挡关系，与纹理承担不同视觉任务。初始保留高质量，以中档级联和其他次级项留出空间。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S05",
+            "source_id": "demo://mw2-rtx4060/src/s05",
+            "view": "平衡预设保留高阴影以维持层次，但不把所有阴影相关项一起设为高；若反馈更普遍，再讨论阴影备选。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S13",
+            "source_id": "demo://mw2-rtx4060/src/s13",
+            "view": "同视角观察人物投影与阴影边缘，再到复杂场景复看。静态画面的细节收益不能直接证明交战开销的排名。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S15",
+            "source_id": "demo://mw2-rtx4060/src/s15",
+            "view": "主方案选择高阴影，偏性能方案可降一档；针对爆炸的反馈先试粒子，阴影是局部特效无法调整时的备选。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          }
+        ],
+        "alternatives": [
+          {
+            "value": "medium",
+            "benefit": "减少部分阴影绘制负担",
+            "cost": "阴影边缘与细节精度减少",
+            "not_selected_reason": "初始仍优先保留场景层次，把它作为后续合法备选"
+          }
+        ],
+        "user_goal_fit": "保留场景的立体关系，同时让反馈后的调整保持单项、小步，不直接把丰富感全部取消。",
+        "device_context": "当前背景为 RTX 4060 Laptop GPU、8 GB 显存、16 GB 内存，游戏渲染 1920×1080；桌面 2560×1600、165 Hz 单独记录。背景限制讨论范围，不保证具体帧率。",
+        "decision": "阴影质量初始选择高，保留清楚的遮挡和光照层次；级联不同时设高。爆炸卡顿先试粒子一档，若粒子已降低或受到保护，再考虑阴影高到中。",
+        "tradeoff": "接受高阴影的处理需求；备选中档会损失部分边缘和局部精度，需要与实际观感一起比较。",
+        "revisit_when": "粒子已无法合法调整，或普通移动与复杂光照场景也持续波动时，再单独比较中档。"
+      },
+      "source_views": [
+        {
+          "source_key": "S02",
+          "source_id": "demo://mw2-rtx4060/src/community-config",
+          "view": "阴影表达光照方向和遮挡关系，与纹理承担不同视觉任务。初始保留高质量，以中档级联和其他次级项留出空间。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S05",
+          "source_id": "demo://mw2-rtx4060/src/s05",
+          "view": "平衡预设保留高阴影以维持层次，但不把所有阴影相关项一起设为高；若反馈更普遍，再讨论阴影备选。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S13",
+          "source_id": "demo://mw2-rtx4060/src/s13",
+          "view": "同视角观察人物投影与阴影边缘，再到复杂场景复看。静态画面的细节收益不能直接证明交战开销的排名。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S15",
+          "source_id": "demo://mw2-rtx4060/src/s15",
+          "view": "主方案选择高阴影，偏性能方案可降一档；针对爆炸的反馈先试粒子，阴影是局部特效无法调整时的备选。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        }
+      ],
+      "alternatives": [
+        {
+          "value": "medium",
+          "benefit": "减少部分阴影绘制负担",
+          "cost": "阴影边缘与细节精度减少",
+          "not_selected_reason": "初始仍优先保留场景层次，把它作为后续合法备选"
+        }
+      ],
+      "user_goal_fit": "保留场景的立体关系，同时让反馈后的调整保持单项、小步，不直接把丰富感全部取消。",
+      "device_context": "当前背景为 RTX 4060 Laptop GPU、8 GB 显存、16 GB 内存，游戏渲染 1920×1080；桌面 2560×1600、165 Hz 单独记录。背景限制讨论范围，不保证具体帧率。",
+      "decision": "阴影质量初始选择高，保留清楚的遮挡和光照层次；级联不同时设高。爆炸卡顿先试粒子一档，若粒子已降低或受到保护，再考虑阴影高到中。",
+      "tradeoff": "接受高阴影的处理需求；备选中档会损失部分边缘和局部精度，需要与实际观感一起比较。",
+      "revisit_when": "粒子已无法合法调整，或普通移动与复杂光照场景也持续波动时，再单独比较中档。"
+    },
+    {
+      "id": "mw2.shadow_cascades",
+      "display_name": "阴影级联",
+      "demo_original_name": "Shadow Cascades",
+      "group": "阴影",
+      "type": "quality",
+      "allowed_values": [
+        "high",
+        "medium",
+        "low"
+      ],
+      "recommended_value": "medium",
+      "quality_variant": "high",
+      "performance_variant": "low",
+      "reason": "阴影级联选择中，搭配高阴影质量。初始减少远距离阴影预算，保留近处主要层次，让丰富感分配有侧重，而不把阴影相关项同时拉满。",
+      "evidence_source_ids": [
+        "demo://mw2-rtx4060/src/community-config",
+        "demo://mw2-rtx4060/src/s05",
+        "demo://mw2-rtx4060/src/s13"
+      ],
+      "dependencies": [],
+      "needs_verification": false,
+      "unknown": false,
+      "evidence_decision": {
+        "setting_id": "mw2.shadow_cascades",
+        "selected_value": "medium",
+        "source_pack_version": "mw1-richness/2",
+        "source_views": [
+          {
+            "source_key": "S02",
+            "source_id": "demo://mw2-rtx4060/src/community-config",
+            "view": "级联涉及不同距离的阴影分配，与阴影质量本身不同。中档可接受远处细节收敛，同时保留近处主要光照关系。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S05",
+            "source_id": "demo://mw2-rtx4060/src/s05",
+            "view": "主方案保留高阴影但级联用中，让各项不同时堆到最高；比较时保持视野和路线一致，观察远近层次。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S13",
+            "source_id": "demo://mw2-rtx4060/src/s13",
+            "view": "级联变化需要看远处阴影精度而非只看近处投影。固定视角逐项比较，才能分清质量与级联造成的损失。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          }
+        ],
+        "alternatives": [
+          {
+            "value": "high",
+            "benefit": "提高远处阴影的细节与分配精度",
+            "cost": "与高阴影叠加后增加次级负担",
+            "not_selected_reason": "本轮流畅优先，不同时堆高所有阴影选项"
+          }
+        ],
+        "user_goal_fit": "把玩家更容易持续注意到的近处层次留下，同时给密集交战预留调整空间。",
+        "device_context": "当前背景为 RTX 4060 Laptop GPU、8 GB 显存、16 GB 内存，游戏渲染 1920×1080；桌面 2560×1600、165 Hz 单独记录。背景限制讨论范围，不保证具体帧率。",
+        "decision": "阴影级联选择中，搭配高阴影质量。初始减少远距离阴影预算，保留近处主要层次，让丰富感分配有侧重，而不把阴影相关项同时拉满。",
+        "tradeoff": "接受远处阴影精度和过渡细节减少；近景仍可保留较清楚的投影，但不能认为完全等同于全高。",
+        "revisit_when": "远处阴影变化明显影响观察，且相似场景节奏可接受时，单独比较高级联。"
+      },
+      "source_views": [
+        {
+          "source_key": "S02",
+          "source_id": "demo://mw2-rtx4060/src/community-config",
+          "view": "级联涉及不同距离的阴影分配，与阴影质量本身不同。中档可接受远处细节收敛，同时保留近处主要光照关系。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S05",
+          "source_id": "demo://mw2-rtx4060/src/s05",
+          "view": "主方案保留高阴影但级联用中，让各项不同时堆到最高；比较时保持视野和路线一致，观察远近层次。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S13",
+          "source_id": "demo://mw2-rtx4060/src/s13",
+          "view": "级联变化需要看远处阴影精度而非只看近处投影。固定视角逐项比较，才能分清质量与级联造成的损失。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        }
+      ],
+      "alternatives": [
+        {
+          "value": "high",
+          "benefit": "提高远处阴影的细节与分配精度",
+          "cost": "与高阴影叠加后增加次级负担",
+          "not_selected_reason": "本轮流畅优先，不同时堆高所有阴影选项"
+        }
+      ],
+      "user_goal_fit": "把玩家更容易持续注意到的近处层次留下，同时给密集交战预留调整空间。",
+      "device_context": "当前背景为 RTX 4060 Laptop GPU、8 GB 显存、16 GB 内存，游戏渲染 1920×1080；桌面 2560×1600、165 Hz 单独记录。背景限制讨论范围，不保证具体帧率。",
+      "decision": "阴影级联选择中，搭配高阴影质量。初始减少远距离阴影预算，保留近处主要层次，让丰富感分配有侧重，而不把阴影相关项同时拉满。",
+      "tradeoff": "接受远处阴影精度和过渡细节减少；近景仍可保留较清楚的投影，但不能认为完全等同于全高。",
+      "revisit_when": "远处阴影变化明显影响观察，且相似场景节奏可接受时，单独比较高级联。"
+    },
+    {
+      "id": "mw2.ambient_occlusion",
+      "display_name": "环境光遮蔽",
+      "demo_original_name": "Ambient Occlusion",
+      "group": "后处理",
+      "type": "quality",
+      "allowed_values": [
+        "high",
+        "medium",
+        "low",
+        "off"
+      ],
+      "recommended_value": "medium",
+      "quality_variant": "high",
+      "performance_variant": "low",
+      "reason": "环境光遮蔽选择中，保留接触阴影和深度线索。当前高纹理和高粒子已经优先占用画面预算，因此不同时提高所有次级效果。",
+      "evidence_source_ids": [
+        "demo://mw2-rtx4060/src/community-config",
+        "demo://mw2-rtx4060/src/s09",
+        "demo://mw2-rtx4060/src/s13",
+        "demo://mw2-rtx4060/src/s15"
+      ],
+      "dependencies": [],
+      "needs_verification": false,
+      "unknown": false,
+      "evidence_decision": {
+        "setting_id": "mw2.ambient_occlusion",
+        "selected_value": "medium",
+        "source_pack_version": "mw1-richness/2",
+        "source_views": [
+          {
+            "source_key": "S02",
+            "source_id": "demo://mw2-rtx4060/src/community-config",
+            "view": "遮蔽提供墙角、物体底部与接触处的深度线索，完全关闭会弱化空间层次；它与高纹理的表面内容相互补充。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S09",
+            "source_id": "demo://mw2-rtx4060/src/s09",
+            "view": "中档相对关闭保留主要接触关系，相对高档减少细微精度；收益随场景光照变化，不能用一个总画质档判断。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S13",
+            "source_id": "demo://mw2-rtx4060/src/s13",
+            "view": "固定视角看墙角和接触位置，再到复杂场景复看。静态对照可说明损失，但无法单独给出性能收益的结论。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S15",
+            "source_id": "demo://mw2-rtx4060/src/s15",
+            "view": "主方案以中档遮蔽保留层次，把更多丰富度预算分配给纹理和粒子；偏画质方向才提高次级精度。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          }
+        ],
+        "alternatives": [
+          {
+            "value": "high",
+            "benefit": "更细致的接触深度和局部结构",
+            "cost": "增加次级效果负担",
+            "not_selected_reason": "主方案已保留高材质与粒子，先为复杂场景留下空间"
+          }
+        ],
+        "user_goal_fit": "场景不能只剩清楚的表面而缺少深度，中档更贴近流畅优先同时保持丰富度的要求。",
+        "device_context": "当前背景为 RTX 4060 Laptop GPU、8 GB 显存、16 GB 内存，游戏渲染 1920×1080；桌面 2560×1600、165 Hz 单独记录。背景限制讨论范围，不保证具体帧率。",
+        "decision": "环境光遮蔽选择中，保留接触阴影和深度线索。当前高纹理和高粒子已经优先占用画面预算，因此不同时提高所有次级效果。",
+        "tradeoff": "接受细小接触处的精度下降；相对关闭仍保留空间线索，但并不等同于高档的局部细节。",
+        "revisit_when": "若主要反馈是爆炸卡顿先试粒子；若接触层次不足且节奏稳定，再单独比较高档。"
+      },
+      "source_views": [
+        {
+          "source_key": "S02",
+          "source_id": "demo://mw2-rtx4060/src/community-config",
+          "view": "遮蔽提供墙角、物体底部与接触处的深度线索，完全关闭会弱化空间层次；它与高纹理的表面内容相互补充。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S09",
+          "source_id": "demo://mw2-rtx4060/src/s09",
+          "view": "中档相对关闭保留主要接触关系，相对高档减少细微精度；收益随场景光照变化，不能用一个总画质档判断。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S13",
+          "source_id": "demo://mw2-rtx4060/src/s13",
+          "view": "固定视角看墙角和接触位置，再到复杂场景复看。静态对照可说明损失，但无法单独给出性能收益的结论。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S15",
+          "source_id": "demo://mw2-rtx4060/src/s15",
+          "view": "主方案以中档遮蔽保留层次，把更多丰富度预算分配给纹理和粒子；偏画质方向才提高次级精度。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        }
+      ],
+      "alternatives": [
+        {
+          "value": "high",
+          "benefit": "更细致的接触深度和局部结构",
+          "cost": "增加次级效果负担",
+          "not_selected_reason": "主方案已保留高材质与粒子，先为复杂场景留下空间"
+        }
+      ],
+      "user_goal_fit": "场景不能只剩清楚的表面而缺少深度，中档更贴近流畅优先同时保持丰富度的要求。",
+      "device_context": "当前背景为 RTX 4060 Laptop GPU、8 GB 显存、16 GB 内存，游戏渲染 1920×1080；桌面 2560×1600、165 Hz 单独记录。背景限制讨论范围，不保证具体帧率。",
+      "decision": "环境光遮蔽选择中，保留接触阴影和深度线索。当前高纹理和高粒子已经优先占用画面预算，因此不同时提高所有次级效果。",
+      "tradeoff": "接受细小接触处的精度下降；相对关闭仍保留空间线索，但并不等同于高档的局部细节。",
+      "revisit_when": "若主要反馈是爆炸卡顿先试粒子；若接触层次不足且节奏稳定，再单独比较高档。"
+    },
+    {
+      "id": "mw2.reflection_quality",
+      "display_name": "反射质量",
+      "demo_original_name": "Reflection Quality",
+      "group": "反射",
+      "type": "quality",
+      "allowed_values": [
+        "high",
+        "medium",
+        "low",
+        "off"
+      ],
+      "recommended_value": "medium",
+      "quality_variant": "high",
+      "performance_variant": "low",
+      "reason": "反射质量选择中，保留光滑与湿润表面的变化。暂不使用关闭，以免削弱整体材质层次；也不提高到高，避免与其他保留项一起增加次级负担。",
+      "evidence_source_ids": [
+        "demo://mw2-rtx4060/src/community-config",
+        "demo://mw2-rtx4060/src/s09",
+        "demo://mw2-rtx4060/src/s13",
+        "demo://mw2-rtx4060/src/s15"
+      ],
+      "dependencies": [],
+      "needs_verification": false,
+      "unknown": false,
+      "evidence_decision": {
+        "setting_id": "mw2.reflection_quality",
+        "selected_value": "medium",
+        "source_pack_version": "mw1-richness/2",
+        "source_views": [
+          {
+            "source_key": "S02",
+            "source_id": "demo://mw2-rtx4060/src/community-config",
+            "view": "反射补充湿润和光滑表面的信息，与纹理、遮蔽不重复。应按作用分配预算，而不是为了流畅同时关闭所有次级效果。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S09",
+            "source_id": "demo://mw2-rtx4060/src/s09",
+            "view": "中档反射保留主要表面变化，高档增加细微精度；关闭的损失无法完全通过提高遮蔽补回，应在同材质位置比较。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S13",
+            "source_id": "demo://mw2-rtx4060/src/s13",
+            "view": "固定视角看地面与金属表面，再移动观察变化；静态收益不能直接外推复杂交战中的表现或具体开销排名。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S15",
+            "source_id": "demo://mw2-rtx4060/src/s15",
+            "view": "主方案反射用中，偏画质再提高精度。爆炸反馈先比较局部粒子，避免一次修改多个不相关的效果。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          }
+        ],
+        "alternatives": [
+          {
+            "value": "off",
+            "benefit": "去掉这部分反射处理需求",
+            "cost": "湿润或光滑表面的变化减少",
+            "not_selected_reason": "当前诉求仍强调丰富感，中档保留更多主要线索"
+          }
+        ],
+        "user_goal_fit": "保留环境的表面丰富感，让流畅优先体现在分配预算，而不是把画面层次一并去掉。",
+        "device_context": "当前背景为 RTX 4060 Laptop GPU、8 GB 显存、16 GB 内存，游戏渲染 1920×1080；桌面 2560×1600、165 Hz 单独记录。背景限制讨论范围，不保证具体帧率。",
+        "decision": "反射质量选择中，保留光滑与湿润表面的变化。暂不使用关闭，以免削弱整体材质层次；也不提高到高，避免与其他保留项一起增加次级负担。",
+        "tradeoff": "接受反射细节和局部精度减少；部分场景差异明显，另一些场景收益较小，需要按具体材质观察。",
+        "revisit_when": "持续在反射较多场景出现波动时，保持其他项不变比较；爆炸反馈优先试粒子。"
+      },
+      "source_views": [
+        {
+          "source_key": "S02",
+          "source_id": "demo://mw2-rtx4060/src/community-config",
+          "view": "反射补充湿润和光滑表面的信息，与纹理、遮蔽不重复。应按作用分配预算，而不是为了流畅同时关闭所有次级效果。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S09",
+          "source_id": "demo://mw2-rtx4060/src/s09",
+          "view": "中档反射保留主要表面变化，高档增加细微精度；关闭的损失无法完全通过提高遮蔽补回，应在同材质位置比较。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S13",
+          "source_id": "demo://mw2-rtx4060/src/s13",
+          "view": "固定视角看地面与金属表面，再移动观察变化；静态收益不能直接外推复杂交战中的表现或具体开销排名。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S15",
+          "source_id": "demo://mw2-rtx4060/src/s15",
+          "view": "主方案反射用中，偏画质再提高精度。爆炸反馈先比较局部粒子，避免一次修改多个不相关的效果。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        }
+      ],
+      "alternatives": [
+        {
+          "value": "off",
+          "benefit": "去掉这部分反射处理需求",
+          "cost": "湿润或光滑表面的变化减少",
+          "not_selected_reason": "当前诉求仍强调丰富感，中档保留更多主要线索"
+        }
+      ],
+      "user_goal_fit": "保留环境的表面丰富感，让流畅优先体现在分配预算，而不是把画面层次一并去掉。",
+      "device_context": "当前背景为 RTX 4060 Laptop GPU、8 GB 显存、16 GB 内存，游戏渲染 1920×1080；桌面 2560×1600、165 Hz 单独记录。背景限制讨论范围，不保证具体帧率。",
+      "decision": "反射质量选择中，保留光滑与湿润表面的变化。暂不使用关闭，以免削弱整体材质层次；也不提高到高，避免与其他保留项一起增加次级负担。",
+      "tradeoff": "接受反射细节和局部精度减少；部分场景差异明显，另一些场景收益较小，需要按具体材质观察。",
+      "revisit_when": "持续在反射较多场景出现波动时，保持其他项不变比较；爆炸反馈优先试粒子。"
+    },
+    {
+      "id": "mw2.particle_quality",
+      "display_name": "粒子质量",
+      "demo_original_name": "Particle Quality",
+      "group": "后处理",
+      "type": "quality",
+      "allowed_values": [
+        "high",
+        "medium",
+        "low"
+      ],
+      "recommended_value": "high",
+      "quality_variant": "high",
+      "performance_variant": "medium",
+      "reason": "粒子质量初始选择高，先保留战斗层次。收到爆炸或烟雾场景卡顿反馈后，优先只降到中；不联动降低纹理、过滤和渲染分辨率。",
+      "evidence_source_ids": [
+        "demo://mw2-rtx4060/src/community-config",
+        "demo://mw2-rtx4060/src/s07",
+        "demo://mw2-rtx4060/src/s11",
+        "demo://mw2-rtx4060/src/s14"
+      ],
+      "dependencies": [],
+      "needs_verification": false,
+      "unknown": false,
+      "evidence_decision": {
+        "setting_id": "mw2.particle_quality",
+        "selected_value": "high",
+        "source_pack_version": "mw1-richness/2",
+        "source_views": [
+          {
+            "source_key": "S02",
+            "source_id": "demo://mw2-rtx4060/src/community-config",
+            "view": "粒子呈现火花、烟雾和爆炸的层次，与动态模糊是不同效果。初始保留高档，回应玩家对战斗氛围的要求。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S07",
+            "source_id": "demo://mw2-rtx4060/src/s07",
+            "view": "密集特效使局部复杂度变化，明确爆炸卡顿后先试粒子高到中；若粒子已降低或受保护，才看阴影备选。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S11",
+            "source_id": "demo://mw2-rtx4060/src/s11",
+            "view": "爆炸描述只是场景线索，不足以断言唯一原因。只改粒子一项并保留材质，才能更清楚地判断这次取舍是否值得。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S14",
+            "source_id": "demo://mw2-rtx4060/src/s14",
+            "view": "比较烟雾轮廓、火花密度和消散过渡；高到中接受这些局部细节减少，日志没有事件标记，不能承诺固定提帧。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          }
+        ],
+        "alternatives": [
+          {
+            "value": "medium",
+            "benefit": "减少部分密集粒子的负担",
+            "cost": "烟雾火花和爆炸过渡细节减少",
+            "not_selected_reason": "初始没有局部反馈，先保留高档作为丰富感起点"
+          }
+        ],
+        "user_goal_fit": "先呈现丰富的战斗画面，再根据明确体验小步调整，避免一开始就取消玩家希望保留的内容。",
+        "device_context": "当前背景为 RTX 4060 Laptop GPU、8 GB 显存、16 GB 内存，游戏渲染 1920×1080；桌面 2560×1600、165 Hz 单独记录。背景限制讨论范围，不保证具体帧率。",
+        "decision": "粒子质量初始选择高，先保留战斗层次。收到爆炸或烟雾场景卡顿反馈后，优先只降到中；不联动降低纹理、过滤和渲染分辨率。",
+        "tradeoff": "保留高档时接受密集特效的潜在负担；后续降低到中则接受烟雾、火花和爆炸局部细节减少。",
+        "revisit_when": "反馈爆炸时卡顿后单独比较高到中；粒子受保护或已为中时，选择合法阴影备选或补充复看。"
+      },
+      "source_views": [
+        {
+          "source_key": "S02",
+          "source_id": "demo://mw2-rtx4060/src/community-config",
+          "view": "粒子呈现火花、烟雾和爆炸的层次，与动态模糊是不同效果。初始保留高档，回应玩家对战斗氛围的要求。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S07",
+          "source_id": "demo://mw2-rtx4060/src/s07",
+          "view": "密集特效使局部复杂度变化，明确爆炸卡顿后先试粒子高到中；若粒子已降低或受保护，才看阴影备选。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S11",
+          "source_id": "demo://mw2-rtx4060/src/s11",
+          "view": "爆炸描述只是场景线索，不足以断言唯一原因。只改粒子一项并保留材质，才能更清楚地判断这次取舍是否值得。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S14",
+          "source_id": "demo://mw2-rtx4060/src/s14",
+          "view": "比较烟雾轮廓、火花密度和消散过渡；高到中接受这些局部细节减少，日志没有事件标记，不能承诺固定提帧。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        }
+      ],
+      "alternatives": [
+        {
+          "value": "medium",
+          "benefit": "减少部分密集粒子的负担",
+          "cost": "烟雾火花和爆炸过渡细节减少",
+          "not_selected_reason": "初始没有局部反馈，先保留高档作为丰富感起点"
+        }
+      ],
+      "user_goal_fit": "先呈现丰富的战斗画面，再根据明确体验小步调整，避免一开始就取消玩家希望保留的内容。",
+      "device_context": "当前背景为 RTX 4060 Laptop GPU、8 GB 显存、16 GB 内存，游戏渲染 1920×1080；桌面 2560×1600、165 Hz 单独记录。背景限制讨论范围，不保证具体帧率。",
+      "decision": "粒子质量初始选择高，先保留战斗层次。收到爆炸或烟雾场景卡顿反馈后，优先只降到中；不联动降低纹理、过滤和渲染分辨率。",
+      "tradeoff": "保留高档时接受密集特效的潜在负担；后续降低到中则接受烟雾、火花和爆炸局部细节减少。",
+      "revisit_when": "反馈爆炸时卡顿后单独比较高到中；粒子受保护或已为中时，选择合法阴影备选或补充复看。"
+    },
+    {
+      "id": "mw2.anti_aliasing",
+      "display_name": "抗锯齿",
+      "demo_original_name": "Anti-Aliasing",
+      "group": "显示",
+      "type": "fixed",
+      "allowed_values": [
+        "smaa_t2x",
+        "taa",
+        "off"
+      ],
+      "recommended_value": "smaa_t2x",
+      "quality_variant": "smaa_t2x",
+      "performance_variant": "taa",
+      "reason": "抗锯齿选择 SMAA T2X，与固定 1080p 一起建立边缘稳定性的基线。纹理和过滤继续保留，避免把表面细节与几何边缘的不同问题混为一谈。",
+      "evidence_source_ids": [
+        "demo://mw2-rtx4060/src/s05",
+        "demo://mw2-rtx4060/src/s10",
+        "demo://mw2-rtx4060/src/s13"
+      ],
+      "dependencies": [],
+      "needs_verification": false,
+      "unknown": false,
+      "evidence_decision": {
+        "setting_id": "mw2.anti_aliasing",
+        "selected_value": "smaa_t2x",
+        "source_pack_version": "mw1-richness/2",
+        "source_views": [
+          {
+            "source_key": "S05",
+            "source_id": "demo://mw2-rtx4060/src/s05",
+            "view": "平衡方案固定 SMAA T2X 与 1080p，再分配其他画质预算；先保持基础条件一致，避免多项变化后无法解释清晰度差异。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S10",
+            "source_id": "demo://mw2-rtx4060/src/s10",
+            "view": "抗锯齿关系几何边缘稳定，与分辨率和纹理内容不同。静止斜边和缓慢移动的细线需要分别观察，锐利与稳定有取舍。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S13",
+            "source_id": "demo://mw2-rtx4060/src/s13",
+            "view": "在固定视角同时看静止斜边和移动时细线稳定，保留纹理和分辨率；不能只根据总预设名称判断边缘质量。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          }
+        ],
+        "alternatives": [
+          {
+            "value": "off",
+            "benefit": "保留未经抗锯齿处理的锐利边缘",
+            "cost": "细线闪烁和锯齿可能更明显",
+            "not_selected_reason": "当前优先建立稳定的移动边缘基线"
+          }
+        ],
+        "user_goal_fit": "交战时保留可辨认的轮廓，同时兼顾画面层次，不以单纯锐化感代替整体清晰度。",
+        "device_context": "当前背景为 RTX 4060 Laptop GPU、8 GB 显存、16 GB 内存，游戏渲染 1920×1080；桌面 2560×1600、165 Hz 单独记录。背景限制讨论范围，不保证具体帧率。",
+        "decision": "抗锯齿选择 SMAA T2X，与固定 1080p 一起建立边缘稳定性的基线。纹理和过滤继续保留，避免把表面细节与几何边缘的不同问题混为一谈。",
+        "tradeoff": "接受边缘稳定与锐利观感之间的取舍；没有一种抗锯齿选择能在所有运动和细线场景都没有代价。",
+        "revisit_when": "若细线闪烁或运动画面偏软明显影响体验，固定分辨率并单独比较允许的抗锯齿选项。"
+      },
+      "source_views": [
+        {
+          "source_key": "S05",
+          "source_id": "demo://mw2-rtx4060/src/s05",
+          "view": "平衡方案固定 SMAA T2X 与 1080p，再分配其他画质预算；先保持基础条件一致，避免多项变化后无法解释清晰度差异。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S10",
+          "source_id": "demo://mw2-rtx4060/src/s10",
+          "view": "抗锯齿关系几何边缘稳定，与分辨率和纹理内容不同。静止斜边和缓慢移动的细线需要分别观察，锐利与稳定有取舍。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S13",
+          "source_id": "demo://mw2-rtx4060/src/s13",
+          "view": "在固定视角同时看静止斜边和移动时细线稳定，保留纹理和分辨率；不能只根据总预设名称判断边缘质量。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        }
+      ],
+      "alternatives": [
+        {
+          "value": "off",
+          "benefit": "保留未经抗锯齿处理的锐利边缘",
+          "cost": "细线闪烁和锯齿可能更明显",
+          "not_selected_reason": "当前优先建立稳定的移动边缘基线"
+        }
+      ],
+      "user_goal_fit": "交战时保留可辨认的轮廓，同时兼顾画面层次，不以单纯锐化感代替整体清晰度。",
+      "device_context": "当前背景为 RTX 4060 Laptop GPU、8 GB 显存、16 GB 内存，游戏渲染 1920×1080；桌面 2560×1600、165 Hz 单独记录。背景限制讨论范围，不保证具体帧率。",
+      "decision": "抗锯齿选择 SMAA T2X，与固定 1080p 一起建立边缘稳定性的基线。纹理和过滤继续保留，避免把表面细节与几何边缘的不同问题混为一谈。",
+      "tradeoff": "接受边缘稳定与锐利观感之间的取舍；没有一种抗锯齿选择能在所有运动和细线场景都没有代价。",
+      "revisit_when": "若细线闪烁或运动画面偏软明显影响体验，固定分辨率并单独比较允许的抗锯齿选项。"
+    },
+    {
+      "id": "mw2.upscaling",
+      "display_name": "超分辨率",
+      "demo_original_name": "Upscaling",
+      "group": "缩放",
+      "type": "fixed",
+      "allowed_values": [
+        "off"
+      ],
+      "recommended_value": "off",
+      "quality_variant": "off",
+      "performance_variant": "off",
+      "reason": "超分辨率明确设为不启用，使用 off 记录这个合法选择。当前方案按既有渲染分辨率与抗锯齿比较清晰度，不假设任何额外缩放或帧生成技术。",
+      "evidence_source_ids": [
+        "demo://mw2-rtx4060/src/settings-guide",
+        "demo://mw2-rtx4060/src/s10",
+        "demo://mw2-rtx4060/src/s15"
+      ],
+      "dependencies": [],
+      "needs_verification": false,
+      "unknown": false,
+      "evidence_decision": {
+        "setting_id": "mw2.upscaling",
+        "selected_value": "off",
+        "source_pack_version": "mw1-richness/2",
+        "source_views": [
+          {
+            "source_key": "S01",
+            "source_id": "demo://mw2-rtx4060/src/settings-guide",
+            "view": "本方案不启用超分辨率，只表达当前选择；不能由显卡型号推导某项缩放或生成技术在具体菜单中得到支持。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S10",
+            "source_id": "demo://mw2-rtx4060/src/s10",
+            "view": "以1080p和既有抗锯齿建立清晰度基线，把分辨率、边缘与材质分开观察；未使用额外缩放不等于认证功能兼容。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S15",
+            "source_id": "demo://mw2-rtx4060/src/s15",
+            "view": "超分辨率不启用是固定比较条件之一，不保证流畅，也不提供任何额外功能的支持承诺；改变条件后需重新整理。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          }
+        ],
+        "alternatives": [],
+        "user_goal_fit": "守住清晰度比较基线，让后续爆炸反馈集中在局部特效，避免改变整幅画面的生成方式。",
+        "device_context": "当前背景为 RTX 4060 Laptop GPU、8 GB 显存、16 GB 内存，游戏渲染 1920×1080；桌面 2560×1600、165 Hz 单独记录。背景限制讨论范围，不保证具体帧率。",
+        "decision": "超分辨率明确设为不启用，使用 off 记录这个合法选择。当前方案按既有渲染分辨率与抗锯齿比较清晰度，不假设任何额外缩放或帧生成技术。",
+        "tradeoff": "不取得额外缩放可能带来的负载变化；同时避免在当前资料条件之外预设功能支持和画质表现。",
+        "revisit_when": "只有在明确改变方案条件且补充对应资料后，再单独讨论其他缩放方式；当前允许值仅为不启用。",
+        "alternatives_note": "当前允许值仅为不启用，不预设其他技术选项；补充对应资料后再讨论其他方案。"
+      },
+      "source_views": [
+        {
+          "source_key": "S01",
+          "source_id": "demo://mw2-rtx4060/src/settings-guide",
+          "view": "本方案不启用超分辨率，只表达当前选择；不能由显卡型号推导某项缩放或生成技术在具体菜单中得到支持。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S10",
+          "source_id": "demo://mw2-rtx4060/src/s10",
+          "view": "以1080p和既有抗锯齿建立清晰度基线，把分辨率、边缘与材质分开观察；未使用额外缩放不等于认证功能兼容。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S15",
+          "source_id": "demo://mw2-rtx4060/src/s15",
+          "view": "超分辨率不启用是固定比较条件之一，不保证流畅，也不提供任何额外功能的支持承诺；改变条件后需重新整理。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        }
+      ],
+      "alternatives": [],
+      "user_goal_fit": "守住清晰度比较基线，让后续爆炸反馈集中在局部特效，避免改变整幅画面的生成方式。",
+      "device_context": "当前背景为 RTX 4060 Laptop GPU、8 GB 显存、16 GB 内存，游戏渲染 1920×1080；桌面 2560×1600、165 Hz 单独记录。背景限制讨论范围，不保证具体帧率。",
+      "decision": "超分辨率明确设为不启用，使用 off 记录这个合法选择。当前方案按既有渲染分辨率与抗锯齿比较清晰度，不假设任何额外缩放或帧生成技术。",
+      "tradeoff": "不取得额外缩放可能带来的负载变化；同时避免在当前资料条件之外预设功能支持和画质表现。",
+      "revisit_when": "只有在明确改变方案条件且补充对应资料后，再单独讨论其他缩放方式；当前允许值仅为不启用。",
+      "alternatives_note": "当前允许值仅为不启用，不预设其他技术选项；补充对应资料后再讨论其他方案。"
+    },
+    {
+      "id": "mw2.vsync",
+      "display_name": "垂直同步",
+      "demo_original_name": "V-Sync",
+      "group": "显示",
+      "type": "fixed",
+      "allowed_values": [
+        "on",
+        "off"
+      ],
+      "recommended_value": "off",
+      "quality_variant": "off",
+      "performance_variant": "off",
+      "reason": "垂直同步选择关闭，侧重当前响应习惯与统一的比较条件。帧时间波动仍以日志和体验分别观察，不把同步开关当作解决所有停顿的手段。",
+      "evidence_source_ids": [
+        "demo://mw2-rtx4060/src/conditional-test",
+        "demo://mw2-rtx4060/src/s12",
+        "demo://mw2-rtx4060/src/s15"
+      ],
+      "dependencies": [],
+      "needs_verification": false,
+      "unknown": false,
+      "evidence_decision": {
+        "setting_id": "mw2.vsync",
+        "selected_value": "off",
+        "source_pack_version": "mw1-richness/2",
+        "source_views": [
+          {
+            "source_key": "S03",
+            "source_id": "demo://mw2-rtx4060/src/conditional-test",
+            "view": "关闭同步便于按当前方式观察呈现节奏，但可能出现撕裂；刷新能力不等于生成速度，不能承诺关闭就一定更平滑。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S12",
+            "source_id": "demo://mw2-rtx4060/src/s12",
+            "view": "横向撕裂明显时应保持其他设置不变单独比较同步；爆炸短暂停顿则先按局部特效方向复看，不混为一种问题。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S15",
+            "source_id": "demo://mw2-rtx4060/src/s15",
+            "view": "同步关闭是主方案比较条件，接受撕裂并侧重响应；不把它当作消除长帧的保证，也不与其他选项一起任意改变。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          }
+        ],
+        "alternatives": [
+          {
+            "value": "on",
+            "benefit": "可能减少画面撕裂",
+            "cost": "可能改变提交排队与操作响应感受",
+            "not_selected_reason": "当前先沿用关闭作为固定流程条件"
+          }
+        ],
+        "user_goal_fit": "保持交战响应的偏好，同时让玩家知道画面完整性与呈现节奏之间存在可重新选择的取舍。",
+        "device_context": "当前背景为 RTX 4060 Laptop GPU、8 GB 显存、16 GB 内存，游戏渲染 1920×1080；桌面 2560×1600、165 Hz 单独记录。背景限制讨论范围，不保证具体帧率。",
+        "decision": "垂直同步选择关闭，侧重当前响应习惯与统一的比较条件。帧时间波动仍以日志和体验分别观察，不把同步开关当作解决所有停顿的手段。",
+        "tradeoff": "明确接受可能出现横向撕裂；关闭同步不是绝对更平滑的承诺，显示扫描与游戏节奏仍可能不一致。",
+        "revisit_when": "撕裂比当前响应习惯更困扰时，保持其余项不变比较开启同步；不要同时降低纹理。"
+      },
+      "source_views": [
+        {
+          "source_key": "S03",
+          "source_id": "demo://mw2-rtx4060/src/conditional-test",
+          "view": "关闭同步便于按当前方式观察呈现节奏，但可能出现撕裂；刷新能力不等于生成速度，不能承诺关闭就一定更平滑。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S12",
+          "source_id": "demo://mw2-rtx4060/src/s12",
+          "view": "横向撕裂明显时应保持其他设置不变单独比较同步；爆炸短暂停顿则先按局部特效方向复看，不混为一种问题。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S15",
+          "source_id": "demo://mw2-rtx4060/src/s15",
+          "view": "同步关闭是主方案比较条件，接受撕裂并侧重响应；不把它当作消除长帧的保证，也不与其他选项一起任意改变。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        }
+      ],
+      "alternatives": [
+        {
+          "value": "on",
+          "benefit": "可能减少画面撕裂",
+          "cost": "可能改变提交排队与操作响应感受",
+          "not_selected_reason": "当前先沿用关闭作为固定流程条件"
+        }
+      ],
+      "user_goal_fit": "保持交战响应的偏好，同时让玩家知道画面完整性与呈现节奏之间存在可重新选择的取舍。",
+      "device_context": "当前背景为 RTX 4060 Laptop GPU、8 GB 显存、16 GB 内存，游戏渲染 1920×1080；桌面 2560×1600、165 Hz 单独记录。背景限制讨论范围，不保证具体帧率。",
+      "decision": "垂直同步选择关闭，侧重当前响应习惯与统一的比较条件。帧时间波动仍以日志和体验分别观察，不把同步开关当作解决所有停顿的手段。",
+      "tradeoff": "明确接受可能出现横向撕裂；关闭同步不是绝对更平滑的承诺，显示扫描与游戏节奏仍可能不一致。",
+      "revisit_when": "撕裂比当前响应习惯更困扰时，保持其余项不变比较开启同步；不要同时降低纹理。"
+    },
+    {
+      "id": "mw2.motion_blur",
+      "display_name": "动态模糊",
+      "demo_original_name": "Motion Blur",
+      "group": "后处理",
+      "type": "fixed",
+      "allowed_values": [
+        "on",
+        "off"
+      ],
+      "recommended_value": "off",
+      "quality_variant": "off",
+      "performance_variant": "off",
+      "reason": "动态模糊选择关闭，让快速转动和交战时的轮廓更容易辨认。保留粒子质量来维持战斗氛围，区分运动观感与特效细节的不同作用。",
+      "evidence_source_ids": [
+        "demo://mw2-rtx4060/src/community-config",
+        "demo://mw2-rtx4060/src/s12",
+        "demo://mw2-rtx4060/src/s13"
+      ],
+      "dependencies": [],
+      "needs_verification": false,
+      "unknown": false,
+      "evidence_decision": {
+        "setting_id": "mw2.motion_blur",
+        "selected_value": "off",
+        "source_pack_version": "mw1-richness/2",
+        "source_views": [
+          {
+            "source_key": "S02",
+            "source_id": "demo://mw2-rtx4060/src/community-config",
+            "view": "动态模糊与粒子承担不同视觉作用，关闭模糊侧重辨识；不能因为转动更清楚，就声称爆炸特效的负担已经消失。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S12",
+            "source_id": "demo://mw2-rtx4060/src/s12",
+            "view": "关闭模糊接受电影式运动过渡减少，换取快速转动时边缘可辨识；这是一项观感选择，不是必然提高帧率的结论。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S13",
+            "source_id": "demo://mw2-rtx4060/src/s13",
+            "view": "固定路线看快速转动时的目标辨识，同时保持抗锯齿与分辨率一致；静止画面不足以说明运动模糊的实际取舍。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          }
+        ],
+        "alternatives": [
+          {
+            "value": "on",
+            "benefit": "运动过程更柔和，电影感更强",
+            "cost": "快速转动时部分边缘可能更难辨认",
+            "not_selected_reason": "当前诉求首先保持流畅与交战可读性"
+          }
+        ],
+        "user_goal_fit": "丰富感仍由材质、光照和粒子承载，在快速运动时优先保持辨识与操作观察的一致性。",
+        "device_context": "当前背景为 RTX 4060 Laptop GPU、8 GB 显存、16 GB 内存，游戏渲染 1920×1080；桌面 2560×1600、165 Hz 单独记录。背景限制讨论范围，不保证具体帧率。",
+        "decision": "动态模糊选择关闭，让快速转动和交战时的轮廓更容易辨认。保留粒子质量来维持战斗氛围，区分运动观感与特效细节的不同作用。",
+        "tradeoff": "接受少一些柔和的电影式运动过渡；这项选择主要回应可读性，不宣称必然改善帧率。",
+        "revisit_when": "若更喜欢电影式运动观感且没有辨识困扰，沿相同路线单独比较开启后的体验。"
+      },
+      "source_views": [
+        {
+          "source_key": "S02",
+          "source_id": "demo://mw2-rtx4060/src/community-config",
+          "view": "动态模糊与粒子承担不同视觉作用，关闭模糊侧重辨识；不能因为转动更清楚，就声称爆炸特效的负担已经消失。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S12",
+          "source_id": "demo://mw2-rtx4060/src/s12",
+          "view": "关闭模糊接受电影式运动过渡减少，换取快速转动时边缘可辨识；这是一项观感选择，不是必然提高帧率的结论。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S13",
+          "source_id": "demo://mw2-rtx4060/src/s13",
+          "view": "固定路线看快速转动时的目标辨识，同时保持抗锯齿与分辨率一致；静止画面不足以说明运动模糊的实际取舍。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        }
+      ],
+      "alternatives": [
+        {
+          "value": "on",
+          "benefit": "运动过程更柔和，电影感更强",
+          "cost": "快速转动时部分边缘可能更难辨认",
+          "not_selected_reason": "当前诉求首先保持流畅与交战可读性"
+        }
+      ],
+      "user_goal_fit": "丰富感仍由材质、光照和粒子承载，在快速运动时优先保持辨识与操作观察的一致性。",
+      "device_context": "当前背景为 RTX 4060 Laptop GPU、8 GB 显存、16 GB 内存，游戏渲染 1920×1080；桌面 2560×1600、165 Hz 单独记录。背景限制讨论范围，不保证具体帧率。",
+      "decision": "动态模糊选择关闭，让快速转动和交战时的轮廓更容易辨认。保留粒子质量来维持战斗氛围，区分运动观感与特效细节的不同作用。",
+      "tradeoff": "接受少一些柔和的电影式运动过渡；这项选择主要回应可读性，不宣称必然改善帧率。",
+      "revisit_when": "若更喜欢电影式运动观感且没有辨识困扰，沿相同路线单独比较开启后的体验。"
+    },
+    {
+      "id": "mw2.field_of_view",
+      "display_name": "视野",
+      "demo_original_name": "Field of View",
+      "group": "显示",
+      "type": "fixed",
+      "allowed_values": [
+        "80",
+        "90",
+        "100",
+        "110"
+      ],
+      "recommended_value": "100",
+      "quality_variant": "100",
+      "performance_variant": "100",
+      "reason": "视野保持 100，延续当前操作习惯与周边信息范围，不把它纳入爆炸反馈的首项性能调整。先保持构图一致，才能比较粒子或阴影变化。",
+      "evidence_source_ids": [
+        "demo://mw2-rtx4060/src/s05",
+        "demo://mw2-rtx4060/src/s12",
+        "demo://mw2-rtx4060/src/s15"
+      ],
+      "dependencies": [],
+      "needs_verification": false,
+      "unknown": false,
+      "evidence_decision": {
+        "setting_id": "mw2.field_of_view",
+        "selected_value": "100",
+        "source_pack_version": "mw1-richness/2",
+        "source_views": [
+          {
+            "source_key": "S05",
+            "source_id": "demo://mw2-rtx4060/src/s05",
+            "view": "视野保持100，作为分配画质预算前的固定条件；避免改变构图后把同屏内容差异误认为其他选项的效果。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S12",
+            "source_id": "demo://mw2-rtx4060/src/s12",
+            "view": "视野影响周边范围、远近大小与运动速度感。更大视野可能增加同屏内容，不能认定数字越大越好或没有代价。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          },
+          {
+            "source_key": "S15",
+            "source_id": "demo://mw2-rtx4060/src/s15",
+            "view": "改变视野后需要重新体验负载与运动观感；100是当前习惯基线，不把它当作普遍适用的性能最优值。",
+            "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+          }
+        ],
+        "alternatives": [
+          {
+            "value": "110",
+            "benefit": "增加周边可见范围",
+            "cost": "远近大小与运动感变化，同屏内容可能增加",
+            "not_selected_reason": "当前先保留习惯，不同时改变构图与画质"
+          }
+        ],
+        "user_goal_fit": "让体验反馈与画质调整保持可比较，同时尊重操作偏好，避免为局部卡顿随意改动熟悉的观察方式。",
+        "device_context": "当前背景为 RTX 4060 Laptop GPU、8 GB 显存、16 GB 内存，游戏渲染 1920×1080；桌面 2560×1600、165 Hz 单独记录。背景限制讨论范围，不保证具体帧率。",
+        "decision": "视野保持 100，延续当前操作习惯与周边信息范围，不把它纳入爆炸反馈的首项性能调整。先保持构图一致，才能比较粒子或阴影变化。",
+        "tradeoff": "接受当前远近大小与周边范围的折中；更宽视野会改变运动感和同屏内容，较窄视野又会减少周边信息。",
+        "revisit_when": "周边信息或运动速度感不合习惯时，在熟悉路线单独比较其他允许值并重新记录条件。"
+      },
+      "source_views": [
+        {
+          "source_key": "S05",
+          "source_id": "demo://mw2-rtx4060/src/s05",
+          "view": "视野保持100，作为分配画质预算前的固定条件；避免改变构图后把同屏内容差异误认为其他选项的效果。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S12",
+          "source_id": "demo://mw2-rtx4060/src/s12",
+          "view": "视野影响周边范围、远近大小与运动速度感。更大视野可能增加同屏内容，不能认定数字越大越好或没有代价。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        },
+        {
+          "source_key": "S15",
+          "source_id": "demo://mw2-rtx4060/src/s15",
+          "view": "改变视野后需要重新体验负载与运动观感；100是当前习惯基线，不把它当作普遍适用的性能最优值。",
+          "applicability": "当前固定设备、1080p 渲染与同条件场景比较；不外推其他设备或版本。"
+        }
+      ],
+      "alternatives": [
+        {
+          "value": "110",
+          "benefit": "增加周边可见范围",
+          "cost": "远近大小与运动感变化，同屏内容可能增加",
+          "not_selected_reason": "当前先保留习惯，不同时改变构图与画质"
+        }
+      ],
+      "user_goal_fit": "让体验反馈与画质调整保持可比较，同时尊重操作偏好，避免为局部卡顿随意改动熟悉的观察方式。",
+      "device_context": "当前背景为 RTX 4060 Laptop GPU、8 GB 显存、16 GB 内存，游戏渲染 1920×1080；桌面 2560×1600、165 Hz 单独记录。背景限制讨论范围，不保证具体帧率。",
+      "decision": "视野保持 100，延续当前操作习惯与周边信息范围，不把它纳入爆炸反馈的首项性能调整。先保持构图一致，才能比较粒子或阴影变化。",
+      "tradeoff": "接受当前远近大小与周边范围的折中；更宽视野会改变运动感和同屏内容，较窄视野又会减少周边信息。",
+      "revisit_when": "周边信息或运动速度感不合习惯时，在熟悉路线单独比较其他允许值并重新记录条件。"
+    }
+  ],
+  "pack_version": "mw1-richness/2",
+  "data_origin": "simulated"
+}

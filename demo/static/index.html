@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PC 游戏画质优化助手</title>
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div>
+        <h1>PC 游戏画质优化助手</h1>
+        <p class="brand-sub">找到适合你的游戏体验</p>
+      </div>
+    </div>
+    <div class="header-controls"><span class="header-status" id="service-status" role="status">正在准备…</span></div>
+  </header>
+
+  <div id="draft-bar" class="draft-bar" role="alert" hidden></div>
+
+  <div class="app-body">
+    <nav class="side-nav" aria-label="主导航">
+      <ul id="page-list"></ul>
+      <details class="more-nav"><summary>更多功能</summary><ul id="more-page-list"></ul></details>
+    </nav>
+
+    <main class="workspace" id="page-root" aria-live="polite">
+      <p class="empty">正在准备…</p>
+    </main>
+  </div>
+
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,137 @@
+{
+  "schema": "demo-fixtures/1",
+  "demo_only": true,
+  "scenario_id": "mw2-rtx4060",
+  "templates": {
+    "baseline": {
+      "label": "原配置：调整前记录",
+      "description": "用于与后续已记录配置形成对应关系，保留当前设置作为比较起点。",
+      "values": {
+        "mw2.display_mode": "fullscreen",
+        "mw2.render_resolution": "1920x1080",
+        "mw2.texture_detail": "medium",
+        "mw2.texture_filtering": "medium",
+        "mw2.shadow_quality": "medium",
+        "mw2.shadow_cascades": "low",
+        "mw2.ambient_occlusion": "low",
+        "mw2.reflection_quality": "low",
+        "mw2.particle_quality": "medium",
+        "mw2.anti_aliasing": "taa",
+        "mw2.upscaling": "off",
+        "mw2.vsync": "off",
+        "mw2.motion_blur": "off",
+        "mw2.field_of_view": "100"
+      },
+      "target_proposal": {
+        "metric": "average_present_rate",
+        "value": 60,
+        "unit": "fps",
+        "basis": "体验目标表达，不是已达到的测量结果或性能保证。"
+      },
+      "reference_results": [],
+      "conditions": [
+        "RTX 4060 Laptop GPU，8 GB 显存，16 GB 内存",
+        "游戏渲染 1920×1080，桌面显示 2560×1600",
+        "各项选择需结合相似场景的体验与记录复看"
+      ]
+    },
+    "main": {
+      "label": "主方案：流畅优先，保留画面丰富度",
+      "description": "保留高纹理、高过滤与战斗层次，以中档级联、遮蔽和反射留出空间；遇到明确反馈后逐项比较。",
+      "values": {
+        "mw2.display_mode": "fullscreen",
+        "mw2.render_resolution": "1920x1080",
+        "mw2.texture_detail": "high",
+        "mw2.texture_filtering": "high",
+        "mw2.shadow_quality": "high",
+        "mw2.shadow_cascades": "medium",
+        "mw2.ambient_occlusion": "medium",
+        "mw2.reflection_quality": "medium",
+        "mw2.particle_quality": "high",
+        "mw2.anti_aliasing": "smaa_t2x",
+        "mw2.upscaling": "off",
+        "mw2.vsync": "off",
+        "mw2.motion_blur": "off",
+        "mw2.field_of_view": "100"
+      },
+      "target_proposal": {
+        "metric": "average_present_rate",
+        "value": 60,
+        "unit": "fps",
+        "basis": "体验目标表达，不是已达到的测量结果或性能保证。"
+      },
+      "reference_results": [],
+      "conditions": [
+        "RTX 4060 Laptop GPU，8 GB 显存，16 GB 内存",
+        "游戏渲染 1920×1080，桌面显示 2560×1600",
+        "各项选择需结合相似场景的体验与记录复看"
+      ]
+    },
+    "quality": {
+      "label": "替代：偏画质",
+      "description": "提高阴影级联、遮蔽与反射的精度，接受复杂场景更多负担，适合单独比较次级细节的视觉收益。",
+      "values": {
+        "mw2.display_mode": "fullscreen",
+        "mw2.render_resolution": "1920x1080",
+        "mw2.texture_detail": "high",
+        "mw2.texture_filtering": "high",
+        "mw2.shadow_quality": "high",
+        "mw2.shadow_cascades": "high",
+        "mw2.ambient_occlusion": "high",
+        "mw2.reflection_quality": "high",
+        "mw2.particle_quality": "high",
+        "mw2.anti_aliasing": "smaa_t2x",
+        "mw2.upscaling": "off",
+        "mw2.vsync": "off",
+        "mw2.motion_blur": "off",
+        "mw2.field_of_view": "100"
+      },
+      "target_proposal": {
+        "metric": "average_present_rate",
+        "value": 60,
+        "unit": "fps",
+        "basis": "体验目标表达，不是已达到的测量结果或性能保证。"
+      },
+      "reference_results": [],
+      "conditions": [
+        "RTX 4060 Laptop GPU，8 GB 显存，16 GB 内存",
+        "游戏渲染 1920×1080，桌面显示 2560×1600",
+        "各项选择需结合相似场景的体验与记录复看"
+      ]
+    },
+    "performance": {
+      "label": "替代：偏性能",
+      "description": "降低部分纹理与次级效果，接受材质和阴影细节损失；作为不同偏好的替代方案。",
+      "values": {
+        "mw2.display_mode": "fullscreen",
+        "mw2.render_resolution": "1920x1080",
+        "mw2.texture_detail": "medium",
+        "mw2.texture_filtering": "medium",
+        "mw2.shadow_quality": "medium",
+        "mw2.shadow_cascades": "low",
+        "mw2.ambient_occlusion": "low",
+        "mw2.reflection_quality": "low",
+        "mw2.particle_quality": "medium",
+        "mw2.anti_aliasing": "taa",
+        "mw2.upscaling": "off",
+        "mw2.vsync": "off",
+        "mw2.motion_blur": "off",
+        "mw2.field_of_view": "100"
+      },
+      "target_proposal": {
+        "metric": "average_present_rate",
+        "value": 60,
+        "unit": "fps",
+        "basis": "体验目标表达，不是已达到的测量结果或性能保证。"
+      },
+      "reference_results": [],
+      "conditions": [
+        "RTX 4060 Laptop GPU，8 GB 显存，16 GB 内存",
+        "游戏渲染 1920×1080，桌面显示 2560×1600",
+        "各项选择需结合相似场景的体验与记录复看"
+      ]
+    }
+  },
+  "pack_version": "mw1-richness/2",
+  "data_origin": "simulated"
+}

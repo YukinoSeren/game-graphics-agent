@@ -1,0 +1,33 @@
+{
+  "schema": "demo-fixtures/1",
+  "demo_only": true,
+  "scenario_id": "mw2-rtx4060",
+  "game_name": "使命召唤：现代战争 I",
+  "gpu_name": "NVIDIA GeForce RTX 4060",
+  "cpu": null,
+  "memory_gb": null,
+  "vram_gb": null,
+  "driver_version": null,
+  "game_version": null,
+  "display_refresh_hz": null,
+  "install_path": null,
+  "process_name": null,
+  "resolution": {
+    "width": 1920,
+    "height": 1080,
+    "source": "demo_preset"
+  },
+  "scene_tag": "固定路线：交战场景甲（演示标签）",
+  "narrative": "平衡清晰度与流畅度，处理交战场景的帧时间尖峰",
+  "applicability": "preset",
+  "unknown_fields": [
+    "cpu",
+    "memory_gb",
+    "vram_gb",
+    "driver_version",
+    "game_version",
+    "display_refresh_hz",
+    "install_path",
+    "process_name"
+  ]
+}

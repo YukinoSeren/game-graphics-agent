@@ -1,0 +1,48 @@
+{
+  "schema": "demo-fixtures/1",
+  "demo_only": true,
+  "scenario_id": "fh6-rtx5090",
+  "symptom_rules": [
+    {
+      "id": "fh6.rule.stutter_reflection",
+      "symptoms": ["stutter"],
+      "severities": ["occasional", "frequent"],
+      "target_setting_id": "fh6.reflection_quality",
+      "from": "high",
+      "to": "medium",
+      "conflicting_protected_setting_ids": ["fh6.texture_detail"],
+      "alternative_setting_id": "fh6.lod_quality",
+      "alternative_from": "high",
+      "alternative_to": "medium",
+      "hypothesis": "高速驾驶场景的实时反射造成帧时间尖峰；演示规则只下调一项反射相关设置。",
+      "evidence_source_ids": ["demo://fh6-rtx5090/src/conditional-test"],
+      "retest": "使用相同场景、相同比较口径复测一轮"
+    },
+    {
+      "id": "fh6.rule.sharpness_texture",
+      "symptoms": ["blurry"],
+      "severities": ["occasional", "frequent"],
+      "target_setting_id": "fh6.texture_filtering",
+      "from": "medium",
+      "to": "high",
+      "conflicting_protected_setting_ids": ["fh6.texture_detail"],
+      "alternative_setting_id": null,
+      "alternative_from": null,
+      "alternative_to": null,
+      "hypothesis": "清晰度问题与纹理过滤相关，而不是继续降低反射。",
+      "evidence_source_ids": ["demo://fh6-rtx5090/src/settings-guide"],
+      "retest": "相同场景复测并确认纹理保护项"
+    }
+  ],
+  "keywords": {
+    "stutter": ["卡顿", "卡一下", "掉帧", "尖峰", "不流畅"],
+    "blurry": ["模糊", "不清晰", "看不清"],
+    "satisfied": ["满意", "挺好", "可以了", "不错"]
+  },
+  "protected_options": [
+    "fh6.texture_detail",
+    "fh6.texture_filtering",
+    "fh6.anti_aliasing"
+  ],
+  "no_improvement_limit": 2
+}

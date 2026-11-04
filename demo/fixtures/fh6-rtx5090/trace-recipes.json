@@ -1,0 +1,42 @@
+{
+  "schema": "demo-fixtures/1",
+  "demo_only": true,
+  "scenario_id": "fh6-rtx5090",
+  "recipes": {
+    "baseline": {
+      "frames": 3600,
+      "base_interval_us": 16667,
+      "jitter_us": 700,
+      "spike_every": 170,
+      "spike_us": 82000
+    },
+    "recommended": {
+      "frames": 3600,
+      "base_interval_us": 16667,
+      "jitter_us": 700,
+      "spike_every": 400,
+      "spike_us": 64000
+    },
+    "adjusted": {
+      "frames": 3600,
+      "base_interval_us": 16667,
+      "jitter_us": 700,
+      "spike_every": 950,
+      "spike_us": 54000
+    },
+    "no_gain": {
+      "frames": 3600,
+      "base_interval_us": 16667,
+      "jitter_us": 700,
+      "spike_every": 410,
+      "spike_us": 64500
+    },
+    "short": {
+      "frames": 18,
+      "base_interval_us": 16667,
+      "jitter_us": 700,
+      "spike_every": 10,
+      "spike_us": 55000
+    }
+  }
+}

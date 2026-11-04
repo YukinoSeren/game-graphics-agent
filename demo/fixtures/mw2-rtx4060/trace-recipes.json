@@ -1,0 +1,42 @@
+{
+  "schema": "demo-fixtures/1",
+  "demo_only": true,
+  "scenario_id": "mw2-rtx4060",
+  "recipes": {
+    "baseline": {
+      "frames": 3600,
+      "base_interval_us": 16667,
+      "jitter_us": 700,
+      "spike_every": 180,
+      "spike_us": 78000
+    },
+    "recommended": {
+      "frames": 3600,
+      "base_interval_us": 16667,
+      "jitter_us": 700,
+      "spike_every": 420,
+      "spike_us": 61000
+    },
+    "adjusted": {
+      "frames": 3600,
+      "base_interval_us": 16667,
+      "jitter_us": 700,
+      "spike_every": 900,
+      "spike_us": 52000
+    },
+    "no_gain": {
+      "frames": 3600,
+      "base_interval_us": 16667,
+      "jitter_us": 700,
+      "spike_every": 430,
+      "spike_us": 61500
+    },
+    "short": {
+      "frames": 18,
+      "base_interval_us": 16667,
+      "jitter_us": 700,
+      "spike_every": 10,
+      "spike_us": 55000
+    }
+  }
+}

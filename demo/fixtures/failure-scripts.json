@@ -1,0 +1,54 @@
+{
+  "schema": "demo-fixtures/1",
+  "demo_only": true,
+  "scripts": [
+    {
+      "id": "device_unknown",
+      "label": "设备字段未知",
+      "description": "模拟设备识别只返回显卡，CPU/内存/驱动保持未知并集中提问。",
+      "applies_to": "device.scan"
+    },
+    {
+      "id": "budget_short",
+      "label": "资料预算不足",
+      "description": "采集在第一轮补查前停止，保留已发布来源并展示未闭合缺口。",
+      "applies_to": "knowledge.collect"
+    },
+    {
+      "id": "duplicate_source",
+      "label": "来源重复/坏引用",
+      "description": "包含一份转载来源和一条被隔离的错误引用，计数与列表一致。",
+      "applies_to": "knowledge.collect"
+    },
+    {
+      "id": "task_interrupt",
+      "label": "任务中断",
+      "description": "当前模拟任务在下一阶段前标为中断，可用新任务继续剩余阶段。",
+      "applies_to": "task"
+    },
+    {
+      "id": "bad_csv",
+      "label": "CSV 不支持",
+      "description": "上传内容保留副本，指出格式问题，不替换成默认成功结果。",
+      "applies_to": "log.inspect"
+    },
+    {
+      "id": "stale_pointer",
+      "label": "当前版本冲突",
+      "description": "提交使用过时的当前配置指针，服务返回冲突且不覆盖新版本。",
+      "applies_to": "configuration"
+    },
+    {
+      "id": "no_gain",
+      "label": "无改善",
+      "description": "复测使用 no_gain 样例，比较显示无明显改善，允许保持/补测/停止。",
+      "applies_to": "comparison"
+    },
+    {
+      "id": "missing_artifact",
+      "label": "原件不可用",
+      "description": "模拟原件被移除，摘要可读但部分重算不可用。",
+      "applies_to": "performance.analyze"
+    }
+  ]
+}

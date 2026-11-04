@@ -1,0 +1,4 @@
+# Temporary demo artifacts only. Never store production data here.
+runtime/
+__pycache__/
+.pytest_cache/

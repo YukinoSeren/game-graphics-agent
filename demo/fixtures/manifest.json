@@ -1,0 +1,44 @@
+{
+  "schema": "demo-fixtures/1",
+  "demo_only": true,
+  "scenarios": [
+    {
+      "scenario_id": "mw2-rtx4060",
+      "files": {
+        "context.json": "mw2-rtx4060/context.json",
+        "sources.json": "mw2-rtx4060/sources.json",
+        "settings.json": "mw2-rtx4060/settings.json",
+        "templates.json": "mw2-rtx4060/templates.json",
+        "rules.json": "mw2-rtx4060/rules.json",
+        "trace-recipes.json": "mw2-rtx4060/trace-recipes.json"
+      },
+      "hashes": {
+        "context.json": "78ccd4b77002eb7e40f8ed9e4c07e9618059f9e1cbd0d5594e60a103f0f5943f",
+        "sources.json": "28b05b6d5eb09f22e95c1a33a68ffd46b40dfebe220be1b221126688fabc0a51",
+        "settings.json": "6f83ac1c7eb34804a90bcc86419b48809f222658cf707832eda874d5d2d5cf11",
+        "templates.json": "3cd2d61a6aee3982b3e9d8ae4a83c2593350bf9be8196578c68acc2bb7e3ef1f",
+        "rules.json": "48842e764b98406b5424f9d38f84904b19b7546f5f3548a614a9b5b4f4dae53e",
+        "trace-recipes.json": "5baeebacc9dffcbe374c96766db564636c10649cc136d454d02dd3d17d4e5d7d"
+      }
+    },
+    {
+      "scenario_id": "fh6-rtx5090",
+      "files": {
+        "context.json": "fh6-rtx5090/context.json",
+        "sources.json": "fh6-rtx5090/sources.json",
+        "settings.json": "fh6-rtx5090/settings.json",
+        "templates.json": "fh6-rtx5090/templates.json",
+        "rules.json": "fh6-rtx5090/rules.json",
+        "trace-recipes.json": "fh6-rtx5090/trace-recipes.json"
+      },
+      "hashes": {
+        "context.json": "0432eddd1019b9dc5372a0de70b85877a21473a5fefa4d1ab64bcf1eeea2e3e4",
+        "sources.json": "ca819cfe18fbf4d759c7ec3feefd61c3dc57823bb728d611263c0b2f9e600500",
+        "settings.json": "ccac10a7f1ac603672f3e2bd341ddb5bf7e1e5b44ac5d3818020cd14e12a6152",
+        "templates.json": "32fbcaf892f23d5cf366a55ad069db1fb74fc1abcc35e169e158add489899091",
+        "rules.json": "85b7b54e1de54c414a30aa6d131dafd52656d5c2d431ef168ab951e7036718ba",
+        "trace-recipes.json": "0d4984a6ef4088d811da72924f13ec1c89eb28c49fb242636931451198e03d74"
+      }
+    }
+  ]
+}

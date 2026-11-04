@@ -1,0 +1,138 @@
+{
+  "schema": "demo-fixtures/1",
+  "demo_only": true,
+  "scenario_id": "fh6-rtx5090",
+  "sources": [
+    {
+      "id": "demo://fh6-rtx5090/src/settings-guide",
+      "title": "地平线 6 画质设置说明（演示样例）",
+      "author_label": "演示资料作者 E（模拟）",
+      "published": "2025-09-05",
+      "revision": "r1",
+      "relationship": "original",
+      "related_ids": [],
+      "setting_ids": [
+        "fh6.display_mode",
+        "fh6.render_resolution",
+        "fh6.texture_detail",
+        "fh6.texture_filtering",
+        "fh6.shadow_quality",
+        "fh6.ambient_occlusion",
+        "fh6.particle_quality",
+        "fh6.anti_aliasing",
+        "fh6.vsync",
+        "fh6.motion_blur",
+        "fh6.frame_rate_limit"
+      ],
+      "content_blocks": [
+        {
+          "type": "paragraph",
+          "text": "本资料是演示用的模拟说明，不是真实游戏菜单截图或官方文档。设置名称仅用于演示界面分组。"
+        },
+        {
+          "type": "table",
+          "columns": ["设置", "建议值", "说明"],
+          "rows": [
+            ["Texture Detail", "high", "保持纹理细节，优先保留"],
+            ["Reflection Quality", "high", "高速场景开销明显，出现尖峰后可下调一级"],
+            ["Shadow Quality", "high", "演示预设保持 high"],
+            ["Frame Rate Limit", "60", "演示目标上限"]
+          ]
+        },
+        {
+          "type": "paragraph",
+          "text": "资料没有给出 CPU、内存、驱动或游戏版本条件，因此这些字段在演示中保持未知。"
+        }
+      ],
+      "limitations": "演示样例；未在真实游戏或真实硬件上核验。"
+    },
+    {
+      "id": "demo://fh6-rtx5090/src/community-config",
+      "title": "RTX 5090 4K 配置参考（演示样例，转载）",
+      "author_label": "演示资料作者 F（模拟转载）",
+      "published": "2025-09-12",
+      "revision": "r1",
+      "relationship": "repost",
+      "related_ids": ["demo://fh6-rtx5090/src/conditional-test"],
+      "setting_ids": [
+        "fh6.reflection_quality",
+        "fh6.texture_detail",
+        "fh6.lod_quality",
+        "fh6.particle_quality"
+      ],
+      "content_blocks": [
+        {
+          "type": "paragraph",
+          "text": "本条目转载自另一份演示样例，不能作为独立支持。界面对转载关系单独标注。"
+        },
+        {
+          "type": "table",
+          "columns": ["设置", "值"],
+          "rows": [
+            ["Reflection Quality", "high"],
+            ["Texture Detail", "high"],
+            ["Level of Detail", "high"],
+            ["Particle Quality", "high"]
+          ]
+        }
+      ],
+      "limitations": "转载内容；与原文不构成两份独立证据。"
+    },
+    {
+      "id": "demo://fh6-rtx5090/src/conditional-test",
+      "title": "条件化测试表：高速驾驶（演示样例）",
+      "author_label": "演示资料作者 G（模拟）",
+      "published": "2025-09-18",
+      "revision": "r1",
+      "relationship": "original",
+      "related_ids": ["demo://fh6-rtx5090/src/community-config"],
+      "setting_ids": [
+        "fh6.reflection_quality",
+        "fh6.texture_detail",
+        "fh6.lod_quality"
+      ],
+      "content_blocks": [
+        {
+          "type": "paragraph",
+          "text": "在演示设定的 3840×2160 与固定路线“高速驾驶甲”下，反射质量由 high 降到 medium 时，样例帧时间尖峰数量减少，纹理细节不变。"
+        },
+        {
+          "type": "table",
+          "columns": ["设置变化", "条件", "演示观察"],
+          "rows": [
+            ["Reflection Quality high→medium", "3840×2160，高速驾驶甲", "尖峰数量下降，纹理清晰度不变"],
+            ["Level of Detail high→medium", "同上", "远处物体切换更明显"],
+            ["Shadow Quality high→medium", "同上", "演示中尖峰变化不明显"]
+          ]
+        }
+      ],
+      "limitations": "单一条件演示；不能外推到其他分辨率、显卡或游戏版本。"
+    },
+    {
+      "id": "demo://fh6-rtx5090/src/version-notes",
+      "title": "版本与兼容性说明（演示样例）",
+      "author_label": "演示资料作者 H（模拟）",
+      "published": "2025-09-22",
+      "revision": "r1",
+      "relationship": "original",
+      "related_ids": [],
+      "setting_ids": ["fh6.upscaling", "fh6.anti_aliasing"],
+      "content_blocks": [
+        {
+          "type": "paragraph",
+          "text": "演示资料没有说明具体游戏版本号，也没有确认 DLSS、帧生成或 HDR 的菜单支持情况。相关设置保持 unknown。"
+        },
+        {
+          "type": "table",
+          "columns": ["技术", "演示资料支持情况"],
+          "rows": [
+            ["DLSS", "unknown"],
+            ["帧生成", "unknown"],
+            ["HDR", "unknown"]
+          ]
+        }
+      ],
+      "limitations": "缺少版本信息，不能推断真实游戏支持。"
+    }
+  ]
+}

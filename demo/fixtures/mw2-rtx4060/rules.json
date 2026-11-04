@@ -1,0 +1,120 @@
+{
+  "schema": "demo-fixtures/1",
+  "demo_only": true,
+  "scenario_id": "mw2-rtx4060",
+  "symptom_rules": [
+    {
+      "id": "mw2.rule.explosion_particle",
+      "priority": 100,
+      "text_keywords": [
+        "爆炸",
+        "烟雾"
+      ],
+      "symptoms": [
+        "stutter"
+      ],
+      "severities": [
+        "occasional",
+        "frequent"
+      ],
+      "target_setting_id": "mw2.particle_quality",
+      "from": "high",
+      "to": "medium",
+      "conflicting_protected_setting_ids": [],
+      "alternative_setting_id": "mw2.shadow_quality",
+      "alternative_from": "high",
+      "alternative_to": "medium",
+      "hypothesis": "用户描述爆炸或烟雾时卡顿，所选日志提供帧时间波动，因此先尝试减少密集特效负担；日志没有爆炸事件标记，不能断言唯一原因。",
+      "evidence_source_ids": [
+        "demo://mw2-rtx4060/src/s07",
+        "demo://mw2-rtx4060/src/s11",
+        "demo://mw2-rtx4060/src/s14"
+      ],
+      "tradeoff": "部分爆炸、火花和烟雾细节减少；纹理细节、纹理过滤与渲染分辨率保持。",
+      "retest": "在相似交战场景比较长帧与主观停顿，同时观察烟雾和火花细节；不承诺固定帧率提升。"
+    },
+    {
+      "id": "mw2.rule.stutter_shadow",
+      "symptoms": [
+        "stutter"
+      ],
+      "severities": [
+        "occasional",
+        "frequent"
+      ],
+      "target_setting_id": "mw2.shadow_quality",
+      "from": "high",
+      "to": "medium",
+      "conflicting_protected_setting_ids": [
+        "mw2.texture_detail"
+      ],
+      "alternative_setting_id": "mw2.shadow_cascades",
+      "alternative_from": "medium",
+      "alternative_to": "low",
+      "hypothesis": "普遍卡顿可尝试单项降低阴影质量；这是设置取舍假设，长帧分布本身不能定位唯一原因。",
+      "evidence_source_ids": [
+        "demo://mw2-rtx4060/src/s05",
+        "demo://mw2-rtx4060/src/s13"
+      ],
+      "retest": "使用相同场景、相同比较口径复测一轮",
+      "priority": 10
+    },
+    {
+      "id": "mw2.rule.sharpness_texture",
+      "symptoms": [
+        "blurry"
+      ],
+      "severities": [
+        "occasional",
+        "frequent"
+      ],
+      "target_setting_id": "mw2.texture_filtering",
+      "from": "medium",
+      "to": "high",
+      "conflicting_protected_setting_ids": [
+        "mw2.texture_detail"
+      ],
+      "alternative_setting_id": null,
+      "alternative_from": null,
+      "alternative_to": null,
+      "hypothesis": "清晰度问题与纹理过滤相关，而不是继续降低阴影。",
+      "evidence_source_ids": [
+        "demo://mw2-rtx4060/src/version-notes",
+        "demo://mw2-rtx4060/src/s06"
+      ],
+      "retest": "相同场景复测并确认清晰度保护项",
+      "priority": 10
+    }
+  ],
+  "keywords": {
+    "stutter": [
+      "卡顿",
+      "卡一下",
+      "掉帧",
+      "尖峰",
+      "不流畅"
+    ],
+    "blurry": [
+      "模糊",
+      "不清晰",
+      "看不清"
+    ],
+    "satisfied": [
+      "满意",
+      "挺好",
+      "可以了",
+      "不错"
+    ]
+  },
+  "protected_options": [
+    "mw2.texture_detail",
+    "mw2.texture_filtering",
+    "mw2.render_resolution",
+    "mw2.anti_aliasing",
+    "mw2.particle_quality",
+    "mw2.shadow_quality"
+  ],
+  "no_improvement_limit": 2,
+  "pack_version": "mw1-richness/2",
+  "data_origin": "simulated"
+}

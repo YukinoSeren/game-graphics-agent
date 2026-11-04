@@ -1,0 +1,136 @@
+{
+  "schema": "demo-fixtures/1",
+  "demo_only": true,
+  "scenario_id": "fh6-rtx5090",
+  "templates": {
+    "baseline": {
+      "label": "演示原配置：未按推荐调整前",
+      "description": "玩家此前使用的演示配置；仅用于形成 A0 基线，不代表真实测量。",
+      "values": {
+        "fh6.display_mode": "fullscreen",
+        "fh6.render_resolution": "3840x2160",
+        "fh6.texture_detail": "high",
+        "fh6.texture_filtering": "medium",
+        "fh6.reflection_quality": "medium",
+        "fh6.shadow_quality": "medium",
+        "fh6.ambient_occlusion": "medium",
+        "fh6.lod_quality": "medium",
+        "fh6.particle_quality": "medium",
+        "fh6.anti_aliasing": "taa",
+        "fh6.upscaling": null,
+        "fh6.vsync": "off",
+        "fh6.motion_blur": "off",
+        "fh6.frame_rate_limit": "60"
+      },
+      "target_proposal": {
+        "metric": "average_present_rate",
+        "value": 60,
+        "unit": "fps",
+        "basis": "演示目标表达，不是性能承诺。"
+      },
+      "reference_results": [],
+      "conditions": [
+        "预设背景 3840×2160"
+      ]
+    },
+    "main": {
+      "label": "主方案：4K 高画质下的稳定",
+      "description": "在演示预设 3840×2160 下保留纹理与整体画质，同时为高速驾驶场景的反射尖峰留出调整空间。",
+      "values": {
+        "fh6.display_mode": "fullscreen",
+        "fh6.render_resolution": "3840x2160",
+        "fh6.texture_detail": "high",
+        "fh6.texture_filtering": "high",
+        "fh6.reflection_quality": "high",
+        "fh6.shadow_quality": "high",
+        "fh6.ambient_occlusion": "high",
+        "fh6.lod_quality": "high",
+        "fh6.particle_quality": "high",
+        "fh6.anti_aliasing": "taa",
+        "fh6.upscaling": null,
+        "fh6.vsync": "off",
+        "fh6.motion_blur": "off",
+        "fh6.frame_rate_limit": "60"
+      },
+      "target_proposal": {
+        "metric": "average_present_rate",
+        "value": 60,
+        "unit": "fps",
+        "basis": "演示目标表达，不是性能承诺；实际以样例测试为准。"
+      },
+      "reference_results": [
+        {
+          "label": "样例作者参考（模拟公开数据）",
+          "resolution": "3840×2160",
+          "average_present_rate": 57,
+          "note": "演示用公开参考，非本机实测，也不与本演示样例直接比较。"
+        }
+      ],
+      "conditions": [
+        "预设背景 3840×2160",
+        "纹理细节保持 high",
+        "条件仅适用于本演示预设"
+      ]
+    },
+    "quality": {
+      "label": "替代：偏画质",
+      "description": "优先保留反射与细节层次，接受更多帧时间波动。",
+      "values": {
+        "fh6.display_mode": "fullscreen",
+        "fh6.render_resolution": "3840x2160",
+        "fh6.texture_detail": "ultra",
+        "fh6.texture_filtering": "ultra",
+        "fh6.reflection_quality": "ultra",
+        "fh6.shadow_quality": "ultra",
+        "fh6.ambient_occlusion": "ultra",
+        "fh6.lod_quality": "ultra",
+        "fh6.particle_quality": "ultra",
+        "fh6.anti_aliasing": "taa",
+        "fh6.upscaling": null,
+        "fh6.vsync": "off",
+        "fh6.motion_blur": "off",
+        "fh6.frame_rate_limit": "60"
+      },
+      "target_proposal": {
+        "metric": "average_present_rate",
+        "value": 60,
+        "unit": "fps",
+        "basis": "演示目标表达，不是性能承诺。"
+      },
+      "reference_results": [],
+      "conditions": [
+        "预设背景 3840×2160"
+      ]
+    },
+    "performance": {
+      "label": "替代：偏性能",
+      "description": "优先减少帧时间尖峰，允许反射与细节层次降一级。",
+      "values": {
+        "fh6.display_mode": "fullscreen",
+        "fh6.render_resolution": "2560x1440",
+        "fh6.texture_detail": "high",
+        "fh6.texture_filtering": "medium",
+        "fh6.reflection_quality": "medium",
+        "fh6.shadow_quality": "medium",
+        "fh6.ambient_occlusion": "medium",
+        "fh6.lod_quality": "medium",
+        "fh6.particle_quality": "medium",
+        "fh6.anti_aliasing": "fxaa",
+        "fh6.upscaling": null,
+        "fh6.vsync": "off",
+        "fh6.motion_blur": "off",
+        "fh6.frame_rate_limit": "60"
+      },
+      "target_proposal": {
+        "metric": "average_present_rate",
+        "value": 60,
+        "unit": "fps",
+        "basis": "演示目标表达，不是性能承诺。"
+      },
+      "reference_results": [],
+      "conditions": [
+        "预设背景 3840×2160"
+      ]
+    }
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "schema": "demo-fixtures/1",
+  "demo_only": true,
+  "scenario_id": "fh6-rtx5090",
+  "game_name": "极限竞速：地平线 6",
+  "gpu_name": "NVIDIA GeForce RTX 5090",
+  "cpu": null,
+  "memory_gb": null,
+  "vram_gb": null,
+  "driver_version": null,
+  "game_version": null,
+  "display_refresh_hz": null,
+  "install_path": null,
+  "process_name": null,
+  "resolution": {
+    "width": 3840,
+    "height": 2160,
+    "source": "demo_preset"
+  },
+  "scene_tag": "固定路线：高速驾驶甲（演示标签）",
+  "narrative": "较高画质目标下的稳定性，处理高速驾驶的偶发卡顿",
+  "applicability": "preset",
+  "unknown_fields": [
+    "cpu",
+    "memory_gb",
+    "vram_gb",
+    "driver_version",
+    "game_version",
+    "display_refresh_hz",
+    "install_path",
+    "process_name"
+  ]
+}

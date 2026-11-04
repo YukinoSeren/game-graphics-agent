@@ -286,7 +286,7 @@ def dispatch(application: Application, args: argparse.Namespace) -> Any:
         return application.consume_impact(args.notice_id, _mutation_context(args))
     if args.command == "task":
         if args.action == "get":
-            return application.get_task(args.task_id)
+            return application.get_task(args.task_id, _user_scope(args))
         if args.action == "run":
             return _run_one(application)
         if args.action == "cancel":

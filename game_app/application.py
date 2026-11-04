@@ -142,8 +142,8 @@ class Application:
             budget=budget,
         )
 
-    def get_task(self, task_id: str):
-        return self.tasks.get_task(task_id)
+    def get_task(self, task_id: str, user_scope_id: str | None = None):
+        return self.tasks.get_task(task_id, user_scope_id=user_scope_id)
 
     def cancel_task(self, task_id: str, context: MutationContext):
         return self.tasks.cancel_task(task_id, context)

@@ -1904,7 +1904,7 @@ class NextActionService:
                 ErrorCode.RESOURCE_NOT_FOUND, "the change set is not available"
             )
         change_set = ChangeSet.model_validate_json(stored.payload_bytes)
-        if _task_scope(self.repository, change_set.created_by_task_id) != user_scope_id:
+        if _change_set_owner(self.repository, change_set) != user_scope_id:
             raise ContractError(
                 ErrorCode.RESOURCE_NOT_FOUND, "the change set is not available"
             )

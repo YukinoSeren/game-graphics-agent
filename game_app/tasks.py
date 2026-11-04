@@ -320,9 +320,15 @@ class TaskService:
             return accepted
 
     # -- reads -------------------------------------------------------------
-    def get_task(self, task_id: str) -> TaskViewResult:
+    def get_task(self, task_id: str, *, user_scope_id: str | None = None) -> TaskViewResult:
         with self.repository.unit_of_work() as uow:
             row = self._task_row(uow, task_id)
+            if user_scope_id is not None and row["user_scope_id"] != user_scope_id:
+                # Another player's task is not merely hidden: it does not exist
+                # for this caller (shared error §3).
+                raise ContractError(
+                    ErrorCode.RESOURCE_NOT_FOUND, "the requested task is not available"
+                )
             return self._view(uow, row)
 
     def _view(self, uow: UnitOfWork, row: Any) -> TaskViewResult:
@@ -386,6 +392,10 @@ class TaskService:
             if replayed is not None:
                 return replayed
             row = self._task_row(uow, task_id)
+            if row["user_scope_id"] != context.user_scope_id:
+                raise ContractError(
+                    ErrorCode.RESOURCE_NOT_FOUND, "the requested task is not available"
+                )
             reference = ObjectRef(entity_type="TaskRun", entity_id=task_id)
             state = TaskState(row["state"])
             if state in TERMINAL_TASK_STATES:
@@ -493,6 +503,10 @@ class TaskService:
             if replay is not None:
                 return replay
             parent = self._task_row(uow, resume.parent_task_id)
+            if parent["user_scope_id"] != context.user_scope_id:
+                raise ContractError(
+                    ErrorCode.RESOURCE_NOT_FOUND, "the requested task is not available"
+                )
             if TaskState(parent["state"]) not in TERMINAL_TASK_STATES:
                 raise ContractError(
                     ErrorCode.TASK_STATE_CONFLICT,

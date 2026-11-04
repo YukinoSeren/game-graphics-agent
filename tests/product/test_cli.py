@@ -204,6 +204,34 @@ def test_the_same_key_with_different_content_conflicts(tmp_path, capsys):
     assert _task_count(fixture) == 1
 
 
+def test_another_players_task_is_not_found(tmp_path, capsys):
+    fixture = _fixture(tmp_path)
+    path = _input_file(tmp_path, _feedback_payload(fixture, "the scene stutters"))
+    _, out, _ = _run(
+        capsys, _args(fixture, "feedback", "record", "--input", path, key="mine"),
+    )
+    task_id = json.loads(out)["task_id"]
+
+    read_code, _, read_err = _run(
+        capsys, _args(fixture, "task", "get", task_id, scope=OTHER),
+    )
+    cancel_code, _, cancel_err = _run(
+        capsys,
+        _args(fixture, "task", "cancel", task_id, key="foreign", scope=OTHER),
+    )
+
+    assert read_code == cancel_code == 4
+    assert json.loads(read_err)["code"] == "RESOURCE_NOT_FOUND"
+    assert json.loads(cancel_err)["code"] == "RESOURCE_NOT_FOUND"
+    stored = ProductRepository(fixture.db)
+    try:
+        with stored.unit_of_work() as uow:
+            row = uow.query("SELECT state FROM tasks WHERE task_id=?", (task_id,))[0]
+    finally:
+        stored.close()
+    assert row["state"] == "queued"
+
+
 def test_the_same_key_and_content_replay_the_same_bytes(tmp_path, capsys):
     fixture = _fixture(tmp_path)
     path = _input_file(tmp_path, _feedback_payload(fixture, "the scene stutters"))

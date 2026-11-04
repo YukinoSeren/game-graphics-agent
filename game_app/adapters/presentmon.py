@@ -161,6 +161,200 @@ def _split_token(token: str) -> tuple[str, str | None]:
     return match["name"].strip(), match["unit"].strip()
 
 
+# --- sample intake (G-FORMAT evidence) ---------------------------------------
+#
+# Registering a real tool format needs a fixed tool version/options, an original
+# CSV, and its columns/units/stream/clock/anomalies (09 §7, G-FORMAT).  This
+# reader only *describes* a sample: it never registers a format, never parses
+# frames and never claims support.  A human reads the report, then decides
+# whether a LogFormat may be written with this sample's hash.
+
+_TIME_NAME_HINT = "time"
+_PROCESS_NAME_HINTS = ("processid", "process_id", "pid")
+_INTERVAL_NAME_HINTS = ("msbetweenpresents", "msbetweendisplaychange")
+_STREAM_NAME_HINTS = ("framestream", "presentmode", "stream")
+_FRAME_GENERATION_HINTS = ("framegeneration",)
+
+
+@dataclass(frozen=True)
+class SampleColumnFinding:
+    """One header token as the file actually states it."""
+
+    header_token: str
+    name: str
+    unit: str | None
+    role: str
+
+
+@dataclass(frozen=True)
+class SampleInspection:
+    """What one capture sample states about itself.
+
+    ``blockers`` are structural problems that make the file unusable as
+    evidence.  An empty tuple means the sample can be reviewed for
+    registration; it does **not** mean any tool is supported yet.
+    """
+
+    source_name: str
+    byte_length: int
+    sha256: str
+    header: tuple[str, ...]
+    columns: tuple[SampleColumnFinding, ...]
+    row_count: int
+    malformed_rows: int
+    process_ids: tuple[str, ...]
+    stream_values: tuple[str, ...]
+    frame_generation_values: tuple[str, ...]
+    time_column: str | None
+    time_monotonic: bool | None
+    interval_column: str | None
+    blockers: tuple[str, ...]
+
+    @property
+    def registration_ready(self) -> bool:
+        return not self.blockers
+
+
+def _role_of(name: str) -> str:
+    lowered = name.lower()
+    if _TIME_NAME_HINT in lowered:
+        return "time"
+    if lowered in _PROCESS_NAME_HINTS or lowered.startswith("process"):
+        return "process"
+    if lowered in _INTERVAL_NAME_HINTS:
+        return "interval"
+    if lowered in _STREAM_NAME_HINTS:
+        return "stream"
+    if lowered in _FRAME_GENERATION_HINTS:
+        return "frame_generation"
+    return "other"
+
+
+def _number(text: str) -> float | None:
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def inspect_sample(data: bytes, *, source_name: str) -> SampleInspection:
+    """Describe one capture original; register nothing and parse no frame."""
+
+    digest = hashlib.sha256(data).hexdigest()
+    blockers: list[str] = []
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return SampleInspection(
+            source_name=source_name, byte_length=len(data), sha256=digest,
+            header=(), columns=(), row_count=0, malformed_rows=0,
+            process_ids=(), stream_values=(), frame_generation_values=(),
+            time_column=None, time_monotonic=None, interval_column=None,
+            blockers=("the file is not UTF-8 text",),
+        )
+
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return SampleInspection(
+            source_name=source_name, byte_length=len(data), sha256=digest,
+            header=(), columns=(), row_count=0, malformed_rows=0,
+            process_ids=(), stream_values=(), frame_generation_values=(),
+            time_column=None, time_monotonic=None, interval_column=None,
+            blockers=("the file has no header or rows",),
+        )
+
+    try:
+        header_tokens = tuple(_header_tokens(lines[0]))
+    except ContractError as error:
+        return SampleInspection(
+            source_name=source_name, byte_length=len(data), sha256=digest,
+            header=(), columns=(), row_count=0, malformed_rows=0,
+            process_ids=(), stream_values=(), frame_generation_values=(),
+            time_column=None, time_monotonic=None, interval_column=None,
+            blockers=(error.message,),
+        )
+    columns = tuple(
+        SampleColumnFinding(
+            header_token=token,
+            name=_split_token(token)[0],
+            unit=_split_token(token)[1],
+            role=_role_of(_split_token(token)[0]),
+        )
+        for token in header_tokens
+    )
+    positions = {column.name: index for index, column in enumerate(columns)}
+    time_columns = [column for column in columns if column.role == "time"]
+    interval_columns = [column for column in columns if column.role == "interval"]
+    stream_columns = [column for column in columns if column.role == "stream"]
+    fg_columns = [column for column in columns if column.role == "frame_generation"]
+    process_columns = [column for column in columns if column.role == "process"]
+
+    rows = [line for line in lines[1:] if line.strip()]
+    malformed = 0
+    times: list[float] = []
+    process_ids: set[str] = set()
+    stream_values: set[str] = set()
+    fg_values: set[str] = set()
+    time_index = positions.get(time_columns[0].name) if time_columns else None
+    for line in rows:
+        fields = next(csv.reader([line]))
+        if len(fields) != len(columns):
+            malformed += 1
+            continue
+        if time_index is not None:
+            value = _number(fields[time_index])
+            if value is not None:
+                times.append(value)
+        for column in process_columns:
+            value = fields[positions[column.name]].strip()
+            if value:
+                process_ids.add(value)
+        for column in stream_columns:
+            value = fields[positions[column.name]].strip()
+            if value:
+                stream_values.add(value)
+        for column in fg_columns:
+            value = fields[positions[column.name]].strip()
+            if value:
+                fg_values.add(value)
+
+    if not rows:
+        blockers.append("the file states a header but no data rows")
+    if malformed:
+        blockers.append(
+            f"{malformed} row(s) do not have the header's column count"
+        )
+    if not time_columns:
+        blockers.append("no column states a time/clock value")
+    elif not times:
+        blockers.append("the time column has no numeric value")
+    time_monotonic = None
+    if len(times) >= 2:
+        time_monotonic = all(
+            later >= earlier for earlier, later in zip(times, times[1:])
+        )
+        if not time_monotonic:
+            blockers.append("the time column is not monotonic")
+
+    return SampleInspection(
+        source_name=source_name,
+        byte_length=len(data),
+        sha256=digest,
+        header=header_tokens,
+        columns=columns,
+        row_count=len(rows),
+        malformed_rows=malformed,
+        process_ids=tuple(sorted(process_ids)),
+        stream_values=tuple(sorted(stream_values)),
+        frame_generation_values=tuple(sorted(fg_values)),
+        time_column=time_columns[0].name if time_columns else None,
+        time_monotonic=time_monotonic,
+        interval_column=interval_columns[0].name if interval_columns else None,
+        blockers=tuple(blockers),
+    )
+
+
 def _check(
     check_id: str,
     status: CheckStatus,
@@ -877,6 +1071,9 @@ __all__ = [
     "LogColumn",
     "LogFormat",
     "LogParseResult",
+    "SampleColumnFinding",
+    "SampleInspection",
+    "inspect_sample",
     "OFFLINE_FORMAT_ID",
     "StreamObservation",
     "default_registry",

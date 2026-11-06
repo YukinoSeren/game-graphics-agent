@@ -101,3 +101,82 @@ def test_the_authorized_probe_records_what_this_machine_reported(tmp_path):
     for field in BASE_FIELDS:
         assert field in by_field
         assert by_field[field]["status"] in {"succeeded", "failed"}
+
+
+@requires_probe
+def test_a_real_scan_produces_an_honest_snapshot(tmp_path):
+    """The full device scan against this machine, on a temporary store.
+
+    This is the only place real hardware reaches a product snapshot.  It asserts
+    honesty rather than a particular machine: every adapter the machine reports
+    is kept, none is silently selected, a saturated VRAM reading stays unknown,
+    and a choice question is raised instead of picking the first item.
+    """
+
+    import json as _json
+
+    from game_app.contracts.common import MutationContext
+    from game_app.contracts.device import DeviceSnapshot
+    from game_app.contracts.information import InformationRequest
+    from game_app.device import DeviceService
+    from game_app.files import FileService
+    from game_app.repository import ProductRepository
+    from game_app.tasks import TaskService
+    from tests.product.support.spies import SpyProvider
+
+    repository = ProductRepository(tmp_path / "product.sqlite3")
+    repository.migrate()
+    files = FileService(repository, tmp_path / "managed")
+    device = DeviceService(repository, files, WindowsProbeAdapter(), timeout=30.0)
+    tasks = TaskService(repository, provider=SpyProvider(), files=files)
+    tasks.handlers["device_scan"] = device.handle
+
+    fields = list(BASE_FIELDS) + [
+        f"gpus.{index}.{attribute}"
+        for index in range(4)
+        for attribute in ("raw_name", "vram_bytes", "driver_version")
+    ]
+    accepted = tasks.register_task(
+        {"kind": "device_scan", "game_context_id": None, "field_paths": fields},
+        MutationContext(
+            user_scope_id="a" * 32, idempotency_key="real-scan",
+            request_id="b" * 32,
+        ),
+    )
+    tasks.run_once()
+
+    with repository.unit_of_work() as uow:
+        row = uow.query("SELECT result_refs FROM tasks WHERE task_id=?", (accepted.task_id,))[0]
+    refs = _json.loads(row["result_refs"] or "[]")
+    snapshot_ids = [
+        ref["entity_id"] for ref in refs if ref["entity_type"] == "DeviceSnapshot"
+    ]
+    assert snapshot_ids, f"a scan produced no snapshot: {refs}"
+
+    snapshot = DeviceSnapshot.model_validate_json(
+        repository.get_object("DeviceSnapshot", snapshot_ids[0]).payload_bytes
+    )
+    assert snapshot.gpus, "this machine reports at least one graphics adapter"
+    assert snapshot.selected_gpu_id is None  # never picks one silently
+
+    known_names = {
+        gpu.raw_name.value for gpu in snapshot.gpus
+        if gpu.raw_name.value_state.value == "known"
+    }
+    assert known_names, "at least one adapter name must be readable"
+
+    # A 32-bit saturated AdapterRAM is not a measurement; it must stay unknown.
+    for gpu in snapshot.gpus:
+        if gpu.vram_bytes.value_state.value == "known":
+            assert gpu.vram_bytes.value < 4 * 1024 ** 3 - 1024 ** 2
+
+    if len(snapshot.gpus) > 1:
+        request_ids = [
+            ref["entity_id"] for ref in refs
+            if ref["entity_type"] == "InformationRequest"
+        ]
+        assert request_ids, "several adapters must raise a choice question"
+        request = InformationRequest.model_validate_json(
+            repository.get_object("InformationRequest", request_ids[0]).payload_bytes
+        )
+        assert request.state is not None

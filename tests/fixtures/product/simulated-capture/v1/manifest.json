@@ -26,6 +26,12 @@
       "byte_length": 1379,
       "sha256": "9c9320d9de3decfb62348f717c3a90bc03758e0dada919951186493ce6dbfe86",
       "media_type": "text/csv"
+    },
+    {
+      "relative_name": "presentmon-with-framegen.csv",
+      "byte_length": 1443,
+      "sha256": "82b0ec6591ec65306d917108eca0e67c7225d61116424c1ab99808dc2aea4553",
+      "media_type": "text/csv"
     }
   ],
   "annotation_method": "synthetic: hand-authored to mimic a real tool's header shape; simulated, no tool support claimed",

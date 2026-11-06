@@ -17,9 +17,14 @@ import pytest
 
 from game_app.adapters.presentmon import (
     OFFLINE_FORMAT_ID,
+    SIMULATED_PRESENTMON_FORMAT_ID,
     default_registry,
     inspect_sample,
+    parse_log,
+    simulated_registry,
 )
+from game_app.contracts.common import EvidenceRef
+from game_app.contracts.enums import FrameStreamKind, LogQuality, ValueState
 from game_app.errors import ContractError
 from tests.product.support.fixtures import FixtureLoader
 
@@ -30,6 +35,18 @@ SAMPLE_DIR = FIXTURES / "simulated-capture" / "v1"
 def _sample(name: str, *, origin: str = "simulated"):
     return inspect_sample(
         (SAMPLE_DIR / name).read_bytes(), source_name=name, declared_origin=origin,
+    )
+
+
+def _parse(name: str):
+    evidence = EvidenceRef(
+        kind="artifact", file_id="b" * 32, content_hash="c" * 64,
+        locator=f"objects/{'b' * 32}",
+    )
+    return parse_log(
+        (SAMPLE_DIR / name).read_bytes(),
+        registry=simulated_registry(),
+        evidence=evidence,
     )
 
 
@@ -145,3 +162,80 @@ def test_no_simulated_sample_changes_the_enabled_format_set():
     ):
         _sample(name)
     assert tuple(item.format_id for item in default_registry().formats) == before
+
+
+# -- the offline parse path for a PresentMon-shaped registration --------------
+
+
+def test_the_simulated_registration_is_separate_from_the_product_registry():
+    assert SIMULATED_PRESENTMON_FORMAT_ID not in {
+        item.format_id for item in default_registry().formats
+    }
+    simulated = {item.format_id for item in simulated_registry().formats}
+    assert simulated == {OFFLINE_FORMAT_ID, SIMULATED_PRESENTMON_FORMAT_ID}
+
+
+def test_a_unitless_seconds_clock_is_read_with_the_registered_meaning():
+    result = _parse("presentmon-2x-shape.csv")
+
+    assert result.format_id == SIMULATED_PRESENTMON_FORMAT_ID
+    # PresentMon writes TimeInSeconds with no unit; the registration supplies
+    # the meaning, so the scale is 1.0 seconds and no conversion is claimed.
+    assert result.time_mapping.scale == 1.0
+    assert result.time_mapping.source_unit == "s"
+    assert result.source_ranges and result.source_ranges[0].unit == "s"
+    assert len(result.frames) == 12
+    assert len(result.valid_intervals_ms) == 11
+    assert result.frames[1].interval_ms == 16.7
+
+
+def test_absent_frame_generation_keeps_the_stream_unconfirmed():
+    result = _parse("presentmon-2x-shape.csv")
+
+    assert result.frame_generation.value_state is ValueState.unknown
+    assert result.frame_stream_kind is FrameStreamKind.unknown
+    assert any(
+        "frame generation is unknown" in limitation
+        for limitation in result.limitations
+    )
+
+
+def test_a_present_mode_token_outside_the_vocabulary_stays_unknown():
+    """An unregistered token never inherits another token's meaning."""
+
+    result = _parse("presentmon-runtime-column.csv")
+    assert result.frame_stream_kind is FrameStreamKind.unknown
+
+
+def test_two_present_modes_are_never_merged_into_one_stream():
+    result = _parse("presentmon-multistream.csv")
+
+    assert {item.stream_key for item in result.observed_streams} == {
+        "Composed: Flip", "Hardware: Independent Flip",
+    }
+    assert result.frame_stream_kind is FrameStreamKind.unknown
+    assert result.quality is LogQuality.invalid
+    assert any("not merged" in limitation for limitation in result.limitations)
+
+
+def test_a_stated_frame_generation_state_confirms_the_stream():
+    result = _parse("presentmon-with-framegen.csv")
+
+    assert result.frame_generation.value_state is ValueState.known
+    assert result.frame_generation.value is False
+    assert result.frame_stream_kind is FrameStreamKind.application_present
+
+
+def test_a_backwards_clock_breaks_the_chain_and_loses_no_row():
+    result = _parse("presentmon-backwards-clock.csv")
+
+    assert len(result.frames) == 12  # every row is kept, including the break
+    assert len(result.valid_intervals_ms) < 11
+    assert any("broke the interval chain" in item for item in result.limitations)
+
+
+def test_unregistered_columns_are_reported_not_silently_dropped():
+    result = _parse("presentmon-2x-shape.csv")
+    reported = " ".join(result.limitations)
+    for name in ("Application", "SwapChainAddress", "PresentRuntime", "SyncInterval"):
+        assert f"column {name} is not registered" in reported

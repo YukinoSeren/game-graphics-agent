@@ -88,6 +88,10 @@ class LogFormat:
     options_fingerprint: str
     fixture_hashes: tuple[str, ...]
     checks: tuple[CheckResult, ...]
+    # The exact stream vocabulary this sample used, mapped to the meaning the
+    # registration was verified with.  A value outside this table stays
+    # ``unknown``: a new token never inherits another token's meaning.
+    stream_values: tuple[tuple[str, FrameStreamKind], ...] = ()
 
     @property
     def names(self) -> tuple[str, ...]:
@@ -100,6 +104,43 @@ class LogFormat:
     @property
     def column_names(self) -> set[str]:
         return {column.mapping.source_column for column in self.columns}
+
+    @property
+    def stream_kinds(self) -> dict[str, FrameStreamKind]:
+        return dict(self.stream_values)
+
+
+@dataclass(frozen=True)
+class _RoleNames:
+    """The registered column that fills each parse role for one format.
+
+    The parser must never reach for a module-level column name: another
+    registration may call the same field ``TimeInSeconds`` or ``ProcessID``.
+    """
+
+    event: str | None
+    process: str | None
+    time: str | None
+    interval: str | None
+    stream: str | None
+    frame_type: str | None
+    gpu_busy: str | None
+    frame_generation: str | None
+
+
+def _role_names(format_: LogFormat) -> _RoleNames:
+    by_target = {column.mapping.target_field: column.mapping.source_column
+                 for column in format_.columns}
+    return _RoleNames(
+        event=by_target.get("event_index"),
+        process=by_target.get("process_pid"),
+        time=by_target.get("timestamp"),
+        interval=by_target.get("interval_ms"),
+        stream=by_target.get("frame_stream"),
+        frame_type=by_target.get("frame_type"),
+        gpu_busy=by_target.get("gpu_busy_ms"),
+        frame_generation=by_target.get("frame_generation"),
+    )
 
 
 class FormatRegistry:
@@ -411,13 +452,27 @@ def _check(
     )
 
 
-def _column(source: str, target: str, unit: str, *, required: bool = False) -> LogColumn:
+def _column(
+    source: str,
+    target: str,
+    unit: str,
+    *,
+    required: bool = False,
+    semantic_unit: str | None = None,
+) -> LogColumn:
+    """One verified column.
+
+    ``unit`` is what the sample wrote; ``semantic_unit`` is what the value
+    means when the sample wrote no unit at all (PresentMon's ``TimeInSeconds``
+    carries none).  With no ``semantic_unit`` the meaning is the written unit.
+    """
+
     return LogColumn(
         mapping=ColumnMapping(
             source_column=source,
             target_field=target,
             source_unit=unit,
-            target_unit=unit,
+            target_unit=semantic_unit or unit,
             conversion="identity",
         ),
         required=required,
@@ -475,11 +530,105 @@ def _offline_format() -> LogFormat:
                 note="this registration claims no support for any real tool",
             ),
         ),
+        stream_values=tuple(_STREAM_KINDS.items()),
     )
 
 
 def default_registry() -> FormatRegistry:
     return FormatRegistry([_offline_format()])
+
+
+# --- simulated PresentMon-shaped registration (offline only) -----------------
+#
+# PresentMon 2.x writes ``TimeInSeconds`` with no unit suffix, ``ProcessID``,
+# ``PresentMode`` and no frame-generation column.  That shape is materially
+# different from the offline fixture, so the parser is exercised against it by
+# a *simulated* registration.  It is deliberately kept out of
+# ``default_registry()``: it exists to cover parsing paths, and can never be
+# cited as G-FORMAT evidence or claim support for PresentMon.
+#
+# PresentMode values are present modes, not frame-stream kinds.  Mapping one to
+# ``application_present`` would be a claim this sample cannot support, so every
+# mode stays ``unknown``: the parse reports what it saw without promoting it.
+
+SIMULATED_PRESENTMON_FORMAT_ID = "simulated-presentmon-2x/v1"
+SIMULATED_PRESENTMON_HEADER = (
+    "Application",
+    "ProcessID",
+    "SwapChainAddress",
+    "PresentRuntime",
+    "SyncInterval",
+    "PresentFlags",
+    "AllowsTearing",
+    "PresentMode",
+    "TimeInSeconds",
+    "MsBetweenPresents",
+    "MsInPresentAPI",
+    "MsBetweenDisplayChange",
+    "MsUntilRenderComplete",
+    "MsUntilDisplayed",
+)
+
+
+def simulated_presentmon_format(*, fixture_hashes: tuple[str, ...] = ()) -> LogFormat:
+    """A registration for the simulated PresentMon-shaped sample only."""
+
+    columns = (
+        _column("ProcessID", "process_pid", UNITLESS, required=True),
+        _column("TimeInSeconds", "timestamp", UNITLESS, required=True,
+                semantic_unit="s"),
+        _column(INTERVAL_COLUMN, "interval_ms", UNITLESS, semantic_unit="ms"),
+        _column("PresentMode", "frame_stream", UNITLESS),
+        _column("MsUntilDisplayed", "gpu_busy_ms", UNITLESS, semantic_unit="ms"),
+        _column(FRAME_GENERATION_COLUMN, "frame_generation", UNITLESS),
+    )
+    return LogFormat(
+        format_id=SIMULATED_PRESENTMON_FORMAT_ID,
+        tool_name="simulated-presentmon",
+        tool_version="2x-shape",
+        header=SIMULATED_PRESENTMON_HEADER,
+        columns=columns,
+        time_basis="log_relative_seconds",
+        time_mapping_rule="unit_scale_only;offset_requires_anchor",
+        frame_stream_kind=FrameStreamKind.application_present,
+        options_fingerprint=hashlib.sha256(
+            "\n".join(SIMULATED_PRESENTMON_HEADER).encode("utf-8")
+            + b"\nunit=s;options=none"
+        ).hexdigest(),
+        fixture_hashes=tuple(fixture_hashes),
+        checks=(
+            _check(
+                "format.fixture_verified",
+                CheckStatus.pass_,
+                "simulated fixture comparison; evidence level offline_fixture",
+                note="hand-authored to mimic a real tool's header shape",
+            ),
+            _check(
+                "format.real_tool_support",
+                CheckStatus.not_run,
+                "no real capture tool sample; a simulated shape proves nothing"
+                " about PresentMon",
+                note="this registration claims no support for any real tool",
+            ),
+        ),
+        stream_values=(
+            # Documented PresentMon semantics: a hardware independent flip
+            # presents the application's own frames, a composed flip is
+            # produced by the desktop compositor.  Verified against the
+            # simulated sample only.
+            ("Hardware: Independent Flip", FrameStreamKind.application_present),
+            ("Composed: Flip", FrameStreamKind.displayed),
+        ),
+    )
+
+
+def simulated_registry(*, fixture_hashes: tuple[str, ...] = ()) -> FormatRegistry:
+    """Offline + simulated shapes; never the default product registry."""
+
+    return FormatRegistry([
+        _offline_format(),
+        simulated_presentmon_format(fixture_hashes=fixture_hashes),
+    ])
 
 
 # --- parse result ------------------------------------------------------------
@@ -568,9 +717,11 @@ def parse_log(
     if clock() - started > deadline_seconds:
         return _budget_exhausted(format_, column_map)
 
+    roles = _role_names(format_)
     rows = _Rows(
         format_=format_,
         states=states,
+        roles=roles,
         lines=lines[1:],
         positions=positions,
         evidence=evidence,
@@ -588,7 +739,7 @@ def parse_log(
     limitations.extend(fg_limitations)
     observed = _observed_streams(rows)
     stream_kind, stream_limitations = _resolve_stream(
-        format_, states, observed, frame_generation
+        format_, states, roles, observed, frame_generation
     )
     limitations.extend(stream_limitations)
 
@@ -601,13 +752,13 @@ def parse_log(
             "no pair of adjacent valid frames yields an interval; no frame-rate statistic"
             " is claimed"
         )
-    time_mapping = _time_mapping(format_, states)
+    time_mapping = _time_mapping(format_, states, roles)
     if time_mapping.scale is None:
         limitations.append(
             "the time column states no unit this format was verified with;"
             " the clock keeps its own basis and no scale is assumed"
         )
-    source_ranges = _source_ranges(states, frames)
+    source_ranges = _source_ranges(states, roles, frames)
     if not source_ranges and frames:
         limitations.append(
             "no source time range can be expressed without a verified time unit"
@@ -720,7 +871,11 @@ def _resolved_column_map(states: Sequence[_ColumnState]) -> list[ColumnMapping]:
     return resolved
 
 
-def _state(states: Sequence[_ColumnState], source: str) -> _ColumnState | None:
+def _state(
+    states: Sequence[_ColumnState], source: str | None
+) -> _ColumnState | None:
+    if source is None:
+        return None
     return next((state for state in states if state.source == source), None)
 
 
@@ -732,11 +887,13 @@ class _Rows:
         *,
         format_: LogFormat,
         states: Sequence[_ColumnState],
+        roles: _RoleNames,
         lines: Sequence[str],
         positions: dict[str, int],
         evidence: EvidenceRef,
     ) -> None:
         self.format = format_
+        self.roles = roles
         self.states = states
         self.lines = lines
         self.positions = positions
@@ -769,21 +926,32 @@ class _Rows:
             index += 1
             cell = self._cells(values)
 
-            if present.get("ProcessId"):
-                pid = _parse_int(cell.get("ProcessId"))
+            process_name = self.roles.process
+            if process_name is not None and present.get(process_name):
+                pid = _parse_int(cell.get(process_name))
                 if pid is not None and self._process is None:
                     self._process = _process_identity(pid, self.evidence)
             if self._process is None:
                 self.process_missing = True
                 return
 
-            timestamp = _parse_float(cell.get(TIME_COLUMN)) if present.get(TIME_COLUMN) else None
+            time_name = self.roles.time
+            timestamp = (
+                _parse_float(cell.get(time_name))
+                if time_name is not None and present.get(time_name)
+                else None
+            )
             if timestamp is None:
                 # An unplaceable row is reported, never emitted as a fake frame.
                 self._broken += 1
                 continue
 
-            raw_interval = cell.get(INTERVAL_COLUMN) if usable.get(INTERVAL_COLUMN) else None
+            interval_name = self.roles.interval
+            raw_interval = (
+                cell.get(interval_name)
+                if interval_name is not None and usable.get(interval_name)
+                else None
+            )
             interval = _parse_float(raw_interval)
             if raw_interval is not None and interval is None:
                 validity = "break"
@@ -798,7 +966,8 @@ class _Rows:
             else:
                 self._broken += 1
 
-            event_number = _parse_int(cell.get("EventNumber"))
+            event_name = self.roles.event
+            event_number = _parse_int(cell.get(event_name)) if event_name else None
             self.frames.append(NormalizedFrame(
                 event_index=index if event_number is None else event_number,
                 timestamp=timestamp,
@@ -807,17 +976,20 @@ class _Rows:
                 swapchain_id=None,
                 frame_stream_kind=self.format.frame_stream_kind,
                 interval_ms=interval if validity == "valid" else None,
-                frame_type=_text(cell.get("FrameType")),
+                frame_type=_text(cell.get(self.roles.frame_type or "")),
                 gpu_busy_ms=(
-                    _parse_float(cell.get("MsGPUActive"))
-                    if usable.get("MsGPUActive")
+                    _parse_float(cell.get(self.roles.gpu_busy))
+                    if self.roles.gpu_busy is not None
+                    and usable.get(self.roles.gpu_busy)
                     else None
                 ),
                 cpu_busy_ms=None,
                 validity=validity,
             ))
-            self.stream_values.append(_text(cell.get(STREAM_COLUMN)))
-            self.frame_generation_values.append(_parse_bool(cell.get(FRAME_GENERATION_COLUMN)))
+            self.stream_values.append(_text(cell.get(self.roles.stream or "")))
+            self.frame_generation_values.append(
+                _parse_bool(cell.get(self.roles.frame_generation or ""))
+            )
 
         if self._broken:
             self.limitations.append(
@@ -837,7 +1009,7 @@ class _Rows:
 
 
 def _frame_generation(rows: _Rows) -> tuple[FieldValue[bool], list[str]]:
-    state = _state(rows.states, FRAME_GENERATION_COLUMN)
+    state = _state(rows.states, rows.roles.frame_generation)
     if state is None or not state.present:
         return _unknown_frame_generation(), [
             "the log does not record frame generation; the present stream is not claimed"
@@ -882,9 +1054,10 @@ def _unknown_frame_generation() -> FieldValue[bool]:
 
 
 def _observed_streams(rows: _Rows) -> list[StreamObservation]:
-    state = _state(rows.states, STREAM_COLUMN)
+    state = _state(rows.states, rows.roles.stream)
     if state is None or not state.present:
         return []
+    vocabulary = rows.format.stream_kinds
     counts: dict[str, int] = {}
     for raw in rows.stream_values:
         key = raw or "unknown"
@@ -892,7 +1065,9 @@ def _observed_streams(rows: _Rows) -> list[StreamObservation]:
     return [
         StreamObservation(
             stream_key=key,
-            frame_stream_kind=_STREAM_KINDS.get(key, FrameStreamKind.unknown),
+            # A token outside the registration's own vocabulary is unknown: it
+            # never inherits the meaning of a different token.
+            frame_stream_kind=vocabulary.get(key, FrameStreamKind.unknown),
             row_count=count,
         )
         for key, count in sorted(counts.items())
@@ -902,10 +1077,11 @@ def _observed_streams(rows: _Rows) -> list[StreamObservation]:
 def _resolve_stream(
     format_: LogFormat,
     states: Sequence[_ColumnState],
+    roles: _RoleNames,
     observed: Sequence[StreamObservation],
     frame_generation: FieldValue[bool],
 ) -> tuple[FrameStreamKind, list[str]]:
-    state = _state(states, STREAM_COLUMN)
+    state = _state(states, roles.stream)
     if state is None or not state.present:
         return FrameStreamKind.unknown, [
             "the log does not state a frame stream, so the main stream is unknown"
@@ -951,13 +1127,37 @@ def _continuous_intervals(frames: Sequence[NormalizedFrame]) -> list[float]:
     return intervals
 
 
-def _time_mapping(format_: LogFormat, states: Sequence[_ColumnState]) -> TimeMapping:
-    state = _state(states, TIME_COLUMN)
-    scale = 0.001 if state is not None and state.unit_ok and state.unit == "ms" else None
+_SECONDS_PER_UNIT = {"ms": 0.001, "s": 1.0}
+
+
+def _semantic_unit(format_: LogFormat, roles: _RoleNames, column: str) -> str | None:
+    """The meaning the registration verified, independent of the file's token.
+
+    ``target_unit`` is what the value means; ``source_unit`` is what the sample
+    wrote.  PresentMon writes ``TimeInSeconds`` with no unit at all, so the
+    meaning has to come from the registration rather than from the header.
+    """
+
+    for item in format_.columns:
+        if item.mapping.source_column == column:
+            return item.mapping.target_unit
+    return None
+
+
+def _time_mapping(
+    format_: LogFormat, states: Sequence[_ColumnState], roles: _RoleNames
+) -> TimeMapping:
+    state = _state(states, roles.time)
+    unit = (
+        _semantic_unit(format_, roles, roles.time)
+        if state is not None and state.unit_ok and roles.time is not None
+        else None
+    )
+    scale = _SECONDS_PER_UNIT.get(unit) if unit else None
     return TimeMapping(
         source_basis=format_.time_basis,
         target_basis=TARGET_TIME_BASIS,
-        source_unit=(state.unit if state is not None and state.unit else "unknown"),
+        source_unit=(unit or "unknown"),
         target_unit="s",
         # Without anchor evidence the offset is unknown: the log keeps its own
         # basis and is never attached to a historical segment on a guess.
@@ -972,10 +1172,15 @@ def _time_mapping(format_: LogFormat, states: Sequence[_ColumnState]) -> TimeMap
 
 
 def _source_ranges(
-    states: Sequence[_ColumnState], frames: Sequence[NormalizedFrame]
+    states: Sequence[_ColumnState],
+    roles: _RoleNames,
+    frames: Sequence[NormalizedFrame],
 ) -> list[TimeRange]:
-    state = _state(states, TIME_COLUMN)
-    if state is None or not state.unit_ok or state.unit != "ms":
+    state = _state(states, roles.time)
+    if state is None or not state.unit_ok:
+        return []
+    semantic = state.column.mapping.target_unit
+    if semantic not in _SECONDS_PER_UNIT:
         return []
     timestamps = [frame.timestamp for frame in frames]
     if len(timestamps) < 2 or timestamps[-1] <= timestamps[0]:
@@ -984,7 +1189,7 @@ def _source_ranges(
         start=timestamps[0],
         end=timestamps[-1],
         time_basis=TIME_BASIS,
-        unit="ms",
+        unit=semantic,
     )]
 
 
@@ -1110,7 +1315,11 @@ __all__ = [
     "LogParseResult",
     "SampleColumnFinding",
     "SampleInspection",
+    "SIMULATED_PRESENTMON_FORMAT_ID",
+    "SIMULATED_PRESENTMON_HEADER",
     "inspect_sample",
+    "simulated_presentmon_format",
+    "simulated_registry",
     "OFFLINE_FORMAT_ID",
     "StreamObservation",
     "default_registry",

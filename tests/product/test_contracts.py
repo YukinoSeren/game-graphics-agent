@@ -51,7 +51,9 @@ from tests.product.support.validation import (
 )
 from tests.product.test_sessions import FakeClock
 
-# Every case the handoff names, plus the two F-1 slices added by this batch.
+# All 63 module V cases from 08 §2, plus the three B-* base cases.  A case may
+# be registered under a suffixed id (``VAL-V02-full`` covers ``VAL-V02``); the
+# coverage check below normalises that, so a family cannot hide behind a name.
 REQUIRED_CASES = {
     "FBK-V01", "FBK-V02", "FBK-V03", "FBK-V04", "FBK-V05", "FBK-V06",
     "REC-V01", "REC-V02", "REC-V03", "REC-V04", "REC-V05",
@@ -59,16 +61,26 @@ REQUIRED_CASES = {
     "PERF-V06", "PERF-V07", "PERF-V08", "PERF-V09",
     "DEV-V01", "DEV-V02", "DEV-V03", "DEV-V04",
     "DEV-V05", "DEV-V06", "DEV-V07", "DEV-V08",
-    "IMP-V01", "IMP-V02", "IMP-V03", "IMP-V05",
+    "IMP-V01", "IMP-V02", "IMP-V03", "IMP-V04", "IMP-V05",
     "KNW-V01", "KNW-V02", "KNW-V03", "KNW-V04", "KNW-V05", "KNW-V06",
     "ENG-V01", "ENG-V02", "ENG-V03", "ENG-V04", "ENG-V05", "ENG-V06",
     "ENG-V07",
     "UX-V01", "UX-V02", "UX-V03", "UX-V04", "UX-V05", "UX-V06",
-    "UX-V07", "UX-V08",
-    "VAL-V03", "VAL-V04", "VAL-V05", "VAL-V07", "VAL-V08",
+    "UX-V07", "UX-V08", "UX-V09",
+    "VAL-V01", "VAL-V02", "VAL-V03", "VAL-V04", "VAL-V05",
+    "VAL-V06", "VAL-V07", "VAL-V08",
     "B-DAT-14", "B-STA-13", "B-ERR-12",
 }
 F1_CASES = {"IMP-V04-research-retained", "IMP-V04-research-mapping"}
+
+_CASE_FAMILY = __import__("re").compile(r"^((?:FBK|REC|PERF|DEV|IMP|KNW|ENG|UX|VAL)-V\d{2})")
+
+
+def _family(case_id: str) -> str:
+    """``VAL-V02-full`` -> ``VAL-V02``; ``B-DAT-14`` -> itself."""
+
+    match = _CASE_FAMILY.match(case_id)
+    return match.group(1) if match else case_id
 
 # case_id -> (module, test function, requirement ids, purpose, assertions)
 MODULE_CASES = {
@@ -932,14 +944,7 @@ def test_the_matrix_runs_existing_modules_and_records_every_result(tmp_path):
                    " PresentMon CSV, version or options were available, so the"
                    " fixed-version format registration cannot be verified",
             blocked=True,
-            blocked_by="G-FORMAT (no real sample) / G-GAME",
-        ),
-        runner.not_run(
-            case_id="VAL-V02-full",
-            requirement_ids=["VAL-V02"],
-            reason="the 63-case matrix cannot be closed until every owner registers its cases",
-            blocked=True,
-            blocked_by="module owners",
+            blocked_by="G-FORMAT (no real sample)",
         ),
         runner.not_run(
             case_id="VAL-V04",
@@ -955,16 +960,60 @@ def test_the_matrix_runs_existing_modules_and_records_every_result(tmp_path):
             reason="needs a real game and player rounds; the evidence level here"
                    " is offline_fixture (F-R12)",
             blocked=True,
-            blocked_by="local_effect: no real game",
+            blocked_by="G-EFFECT (no real game)",
+        ),
+        runner.not_run(
+            case_id="VAL-V06",
+            requirement_ids=["C02", "C11", "D02", "VAL-V06"],
+            reason="the C5 page journey needs a browser and an HTTP surface;"
+                   " Q1 fixed the product as CLI-only",
+            blocked=True,
+            blocked_by="Q1 (CLI only)",
+        ),
+        runner.not_run(
+            case_id="UX-V09",
+            requirement_ids=["D-P01", "D-P04", "UX-V09"],
+            reason="the empty-library journey is a page flow; Q1 fixed the"
+                   " product as CLI-only",
+            blocked=True,
+            blocked_by="Q1 (CLI only)",
         ),
         runner.not_run(
             case_id="VAL-V08",
             requirement_ids=["D-P01", "D-P04", "VAL-V08"],
             reason="the D-P journey needs a browser; Q1 fixed the product as CLI-only",
             blocked=True,
-            blocked_by="UX-T03 / Q1 (CLI only)",
+            blocked_by="Q1 (CLI only)",
+        ),
+        runner.not_run(
+            case_id="VAL-V01",
+            requirement_ids=["C10", "VAL-V01"],
+            reason="VAL-V01 checks a design-only change set; this batch changed"
+                   " product code, so that boundary check does not apply to it"
+                   " (the original-bytes clause is asserted by the module tests)",
         ),
     ])
+
+    # VAL-V02 is the closure of the whole matrix, so its blocker is whatever
+    # still blocks the cases it closes — named, not "not finished".
+    remaining = sorted({
+        result.blocked_by for result in results
+        if result.status == "blocked" and result.blocked_by
+    })
+    registrations = len({_family(result.case_id) for result in results}) + 1
+    # VAL-V02 is the closure case itself, so it is counted here rather than
+    # being allowed to stand as its own evidence.
+    results.append(runner.not_run(
+        case_id="VAL-V02-full",
+        requirement_ids=["VAL-V02"],
+        reason=(
+            f"{registrations} of {len(REQUIRED_CASES)} required case families are"
+            " registered and every one that can run offline did run; full"
+            " closure still waits on: " + "; ".join(remaining)
+        ),
+        blocked=True,
+        blocked_by="; ".join(remaining),
+    ))
 
     report = runner.write_report(results, tmp_path / "report")
     records = load_results(tmp_path / "report")
@@ -972,12 +1021,22 @@ def test_the_matrix_runs_existing_modules_and_records_every_result(tmp_path):
     assert report.is_file()
     assert len(records) == len(results)
     statuses = {record["result"]["case_id"]: record["result"]["status"] for record in records}
-    for case_id in REQUIRED_CASES | F1_CASES:
-        assert case_id in statuses, f"matrix is missing {case_id}"
+    # Coverage is checked per case family so a suffixed id cannot stand in for
+    # a family that was never registered.
+    registered = {_family(result.case_id) for result in results}
+    for case_id in REQUIRED_CASES:
+        assert case_id in registered, f"matrix is missing {case_id}"
     for case_id in F1_CASES:
         assert statuses[case_id] == "passed"
+    assert registered == REQUIRED_CASES, sorted(registered - REQUIRED_CASES)
     assert statuses["PERF-V06"] == "blocked"
     assert statuses["VAL-V02-full"] == "blocked"
+    # The closure case names the real gates, never "not finished".
+    closure = next(
+        result for result in results if result.case_id == "VAL-V02-full"
+    )
+    assert "module owners" not in (closure.blocked_by or "")
+    assert "G-FORMAT" in (closure.blocked_by or "")
 
     summary = conclude_results([record["result"] for record in records])
     assert summary["passed"] > 0

@@ -169,11 +169,39 @@ def _split_token(token: str) -> tuple[str, str | None]:
 # frames and never claims support.  A human reads the report, then decides
 # whether a LogFormat may be written with this sample's hash.
 
-_TIME_NAME_HINT = "time"
-_PROCESS_NAME_HINTS = ("processid", "process_id", "pid")
-_INTERVAL_NAME_HINTS = ("msbetweenpresents", "msbetweendisplaychange")
-_STREAM_NAME_HINTS = ("framestream", "presentmode", "stream")
-_FRAME_GENERATION_HINTS = ("framegeneration",)
+_TIME_EXACT = frozenset({
+    "time", "timestamp", "timeinseconds", "timeinms", "timems", "times",
+})
+_PROCESS_EXACT = frozenset({"processid", "pid", "process"})
+_INTERVAL_EXACT = frozenset({
+    "msbetweenpresents", "msbetweendisplaychange", "msbetweendisplaychange",
+})
+_STREAM_EXACT = frozenset({"framestream", "presentmode", "stream"})
+_FRAME_GENERATION_EXACT = frozenset({"framegeneration"})
+
+
+def _normalised(name: str) -> str:
+    return "".join(character for character in name.lower() if character.isalnum())
+
+
+def _role_of(name: str) -> str:
+    """Classify one column by its whole name, never by a substring.
+
+    A substring test is wrong on real headers: ``PresentRuntime`` contains
+    "time" and would be mistaken for the clock, hiding ``TimeInSeconds``.
+    """
+    normalized = _normalised(name)
+    if normalized in _TIME_EXACT:
+        return "time"
+    if normalized in _PROCESS_EXACT:
+        return "process"
+    if normalized in _INTERVAL_EXACT:
+        return "interval"
+    if normalized in _STREAM_EXACT:
+        return "stream"
+    if normalized in _FRAME_GENERATION_EXACT:
+        return "frame_generation"
+    return "other"
 
 
 @dataclass(frozen=True)
@@ -209,25 +237,18 @@ class SampleInspection:
     time_monotonic: bool | None
     interval_column: str | None
     blockers: tuple[str, ...]
+    # "real" only when the bytes came from an actual capture tool run.  A
+    # simulated sample can exercise this reader, but it can never be cited as
+    # G-FORMAT evidence (09 §7).
+    declared_origin: str = "unknown"
 
     @property
     def registration_ready(self) -> bool:
         return not self.blockers
 
-
-def _role_of(name: str) -> str:
-    lowered = name.lower()
-    if _TIME_NAME_HINT in lowered:
-        return "time"
-    if lowered in _PROCESS_NAME_HINTS or lowered.startswith("process"):
-        return "process"
-    if lowered in _INTERVAL_NAME_HINTS:
-        return "interval"
-    if lowered in _STREAM_NAME_HINTS:
-        return "stream"
-    if lowered in _FRAME_GENERATION_HINTS:
-        return "frame_generation"
-    return "other"
+    @property
+    def citable_for_g_format(self) -> bool:
+        return self.declared_origin == "real" and self.registration_ready
 
 
 def _number(text: str) -> float | None:
@@ -238,8 +259,20 @@ def _number(text: str) -> float | None:
     return value if math.isfinite(value) else None
 
 
-def inspect_sample(data: bytes, *, source_name: str) -> SampleInspection:
-    """Describe one capture original; register nothing and parse no frame."""
+def inspect_sample(
+    data: bytes,
+    *,
+    source_name: str,
+    declared_origin: str = "unknown",
+) -> SampleInspection:
+    """Describe one capture original; register nothing and parse no frame.
+
+    ``declared_origin`` records where the bytes came from.  Only ``"real"``
+    makes the report citable as G-FORMAT evidence; a simulated sample is
+    useful for exercising this reader and nothing more.
+    """
+    if declared_origin not in {"real", "simulated", "unknown"}:
+        raise ValueError("declared_origin must be real, simulated or unknown")
 
     digest = hashlib.sha256(data).hexdigest()
     blockers: list[str] = []
@@ -251,6 +284,7 @@ def inspect_sample(data: bytes, *, source_name: str) -> SampleInspection:
             header=(), columns=(), row_count=0, malformed_rows=0,
             process_ids=(), stream_values=(), frame_generation_values=(),
             time_column=None, time_monotonic=None, interval_column=None,
+            declared_origin=declared_origin,
             blockers=("the file is not UTF-8 text",),
         )
 
@@ -261,6 +295,7 @@ def inspect_sample(data: bytes, *, source_name: str) -> SampleInspection:
             header=(), columns=(), row_count=0, malformed_rows=0,
             process_ids=(), stream_values=(), frame_generation_values=(),
             time_column=None, time_monotonic=None, interval_column=None,
+            declared_origin=declared_origin,
             blockers=("the file has no header or rows",),
         )
 
@@ -272,6 +307,7 @@ def inspect_sample(data: bytes, *, source_name: str) -> SampleInspection:
             header=(), columns=(), row_count=0, malformed_rows=0,
             process_ids=(), stream_values=(), frame_generation_values=(),
             time_column=None, time_monotonic=None, interval_column=None,
+            declared_origin=declared_origin,
             blockers=(error.message,),
         )
     columns = tuple(
@@ -352,6 +388,7 @@ def inspect_sample(data: bytes, *, source_name: str) -> SampleInspection:
         time_monotonic=time_monotonic,
         interval_column=interval_columns[0].name if interval_columns else None,
         blockers=tuple(blockers),
+        declared_origin=declared_origin,
     )
 
 

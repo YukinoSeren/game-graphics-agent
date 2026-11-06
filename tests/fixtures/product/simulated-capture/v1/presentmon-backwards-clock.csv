@@ -1,0 +1,13 @@
+Application,ProcessID,SwapChainAddress,PresentRuntime,SyncInterval,PresentFlags,AllowsTearing,PresentMode,TimeInSeconds,MsBetweenPresents,MsInPresentAPI,MsBetweenDisplayChange,MsUntilRenderComplete,MsUntilDisplayed
+Game.exe,4242,0x0000000000000000,0,1,0,1,Hardware: Independent Flip,0.0000,,0.3,,1.2,
+Game.exe,4242,0x0000000000000000,0,1,0,1,Hardware: Independent Flip,0.0167,16.7,0.3,16.7,1.2,16.7
+Game.exe,4242,0x0000000000000000,0,1,0,1,Hardware: Independent Flip,0.0334,16.7,0.3,16.7,1.2,16.7
+Game.exe,4242,0x0000000000000000,0,1,0,1,Hardware: Independent Flip,0.0501,16.7,0.3,16.7,1.2,16.7
+Game.exe,4242,0x0000000000000000,0,1,0,1,Hardware: Independent Flip,0.0668,16.7,0.3,16.7,1.2,16.7
+Game.exe,4242,0x0000000000000000,0,1,0,1,Hardware: Independent Flip,0.0835,16.7,0.3,16.7,1.2,16.7
+Game.exe,4242,0x0000000000000000,0,1,0,1,Hardware: Independent Flip,0.0502,16.7,0.3,16.7,1.2,16.7
+Game.exe,4242,0x0000000000000000,0,1,0,1,Hardware: Independent Flip,0.0669,16.7,0.3,16.7,1.2,16.7
+Game.exe,4242,0x0000000000000000,0,1,0,1,Hardware: Independent Flip,0.0836,16.7,0.3,16.7,1.2,16.7
+Game.exe,4242,0x0000000000000000,0,1,0,1,Hardware: Independent Flip,0.1003,16.7,0.3,16.7,1.2,16.7
+Game.exe,4242,0x0000000000000000,0,1,0,1,Hardware: Independent Flip,0.1170,16.7,0.3,16.7,1.2,16.7
+Game.exe,4242,0x0000000000000000,0,1,0,1,Hardware: Independent Flip,0.1337,16.7,0.3,16.7,1.2,16.7

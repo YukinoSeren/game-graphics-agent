@@ -103,6 +103,7 @@ def test_the_intake_script_reports_the_hash_and_claims_nothing(tmp_path):
             str(sample),
             "--tool-name", "PresentMon",
             "--tool-version", "unverified",
+            "--origin", "simulated",
             "--option=--process_name=SyntheticGame.exe",
             "--out", str(report_path),
         ],
@@ -120,6 +121,9 @@ def test_the_intake_script_reports_the_hash_and_claims_nothing(tmp_path):
     )
     assert report["tool_support_claimed"] is False
     assert report["registration_ready"] is True
+    # A simulated sample exercises the reader but is never G-FORMAT evidence.
+    assert report["declared_origin"] == "simulated"
+    assert report["citable_for_g_format"] is False
     assert report["tool"] == {"name": "PresentMon", "version": "unverified"}
 
 

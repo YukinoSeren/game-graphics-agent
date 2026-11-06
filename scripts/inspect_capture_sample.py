@@ -3,8 +3,12 @@
 Usage (the sample is read only, and nothing is written unless ``--out`` is set):
 
     py -3.13 scripts/inspect_capture_sample.py path/to/capture.csv \
-        --tool-name PresentMon --tool-version 2.3.1 \
+        --tool-name PresentMon --tool-version 2.3.1 --origin real \
         --option "--process_name=ForzaHorizon6.exe" --out sample.json
+
+``--origin`` is required: ``real`` for bytes an actual tool wrote, ``simulated``
+for hand-authored stand-ins.  Only a ``real`` sample can ever be cited as
+G-FORMAT evidence; a simulated one exercises this reader and nothing more.
 
 The output records the file hash, the header as stated, units, process ids,
 stream values, frame-generation values, the time column and its monotonicity.
@@ -30,6 +34,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tool-name", required=True)
     parser.add_argument("--tool-version", required=True)
     parser.add_argument(
+        "--origin", required=True, choices=["real", "simulated", "unknown"],
+        help="where the bytes came from; only 'real' is citable G-FORMAT evidence",
+    )
+    parser.add_argument(
         "--option", action="append", default=[],
         help="one exact capture option; repeat for each",
     )
@@ -41,11 +49,14 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write("the sample path is not an existing file\n")
         return 2
     data = path.read_bytes()
-    inspection = inspect_sample(data, source_name=path.name)
+    inspection = inspect_sample(
+        data, source_name=path.name, declared_origin=args.origin,
+    )
     report = {
         "kind": "capture_sample_inspection",
         "tool": {"name": args.tool_name, "version": args.tool_version},
         "options": list(args.option),
+        "declared_origin": inspection.declared_origin,
         "source_name": inspection.source_name,
         "byte_length": inspection.byte_length,
         "sha256": inspection.sha256,
@@ -69,6 +80,7 @@ def main(argv: list[str] | None = None) -> int:
         "interval_column": inspection.interval_column,
         "blockers": list(inspection.blockers),
         "registration_ready": inspection.registration_ready,
+        "citable_for_g_format": inspection.citable_for_g_format,
         "tool_support_claimed": False,
     }
     text = json.dumps(report, ensure_ascii=False, indent=2) + "\n"

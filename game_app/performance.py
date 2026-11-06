@@ -2363,6 +2363,19 @@ class PerformanceService:
             self._require_session_owner(uow, session, user_scope_id)
             return summary
 
+    def get_artifact(self, artifact_id: str, user_scope_id: str) -> CaptureArtifact:
+        """Read one capture artifact the caller owns.
+
+        A caller who does not own it sees the same RESOURCE_NOT_FOUND as a
+        missing artifact, exactly as the other read entries do.
+        """
+
+        with self.repository.unit_of_work() as uow:
+            artifact = self._load_artifact(uow, artifact_id)
+            session = self._load_session(uow, artifact.session_id)
+            self._require_session_owner(uow, session, user_scope_id)
+            return artifact
+
     # -- comparison protocols and comparisons (04 §4.2/§6) ------------------
     def create_comparison_protocol(
         self,

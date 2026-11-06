@@ -72,6 +72,8 @@ REQUIRED_CASES = {
     "B-DAT-14", "B-STA-13", "B-ERR-12",
 }
 F1_CASES = {"IMP-V04-research-retained", "IMP-V04-research-mapping"}
+# Cases this batch added for the CLI entry surface (Q1).
+CLI_CASES = {"UX-V01-cli-entry"}
 
 _CASE_FAMILY = __import__("re").compile(r"^((?:FBK|REC|PERF|DEV|IMP|KNW|ENG|UX|VAL)-V\d{2})")
 
@@ -547,6 +549,69 @@ def _b_err_12(_application, tmp_path):
     assert not (directory / "product.sqlite3").exists()
 
 
+def _cli_entry(_application, tmp_path):
+    """The CLI is the product surface (Q1): the journey's entries must exist.
+
+    This case checks the entry itself, not a module rule: every command a player
+    needs to begin and finish a journey is registered, and an empty database
+    still answers a catalog read without writing anything.
+    """
+
+    import contextlib
+    import io
+
+    from game_app.cli import build_parser, main as cli_main
+
+    parser = build_parser()
+    commands = next(
+        action for action in parser._actions if action.dest == "command"
+    ).choices
+    expected = {
+        "game": {"list", "select"},
+        "installation": {"list", "register"},
+        "local-setting": {"list", "register"},
+        "device": {"scan"},
+        "file": {"upload"},
+        "knowledge": {"collect"},
+        "import": {"run", "declare-identity"},
+        "package": {"build", "get"},
+        "session": {"create", "end-segment", "split", "end", "bind", "get"},
+        "adopt": None,
+        "analyze": None,
+        "compare": None,
+        "log": {"inspect", "associate"},
+        "artifact": {"get"},
+        "metric": {"list"},
+        "test-protocol": {"create"},
+        "comparison-protocol": {"create", "get"},
+        "answer": None,
+        "amendment": {"create"},
+    }
+    missing = [
+        name for name in expected if name not in commands
+    ]
+    assert not missing, f"the CLI does not expose {missing}"
+    for name, actions in expected.items():
+        if actions is None:
+            continue
+        available = commands[name]._subparsers._group_actions[0].choices
+        absent = actions - set(available)
+        assert not absent, f"{name} is missing {sorted(absent)}"
+
+    directory = tmp_path / "cli-entry"
+    directory.mkdir()
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli_main([
+            "game", "list",
+            "--db", str(directory / "product.sqlite3"),
+            "--files", str(directory / "managed"),
+            "--user-scope", "a" * 32,
+        ])
+    assert code == 0
+    assert json.loads(out.getvalue())["choices"] == []
+
+
 def _research_retained(_application, tmp_path):
     directory = tmp_path / "research-retained"
     directory.mkdir()
@@ -887,6 +952,20 @@ def test_the_matrix_runs_existing_modules_and_records_every_result(tmp_path):
             observations=["external_calls=0", "provider_sends=0"],
         ),
         runner.run(
+            case_id="UX-V01-cli-entry",
+            requirement_ids=["C02", "C03", "UX-V01"],
+            purpose="the CLI exposes every entry a journey needs",
+            steps=["build the parser", "read the catalog from an empty database"],
+            expected_assertions=[
+                "every journey command and action is registered",
+                "an empty catalog answers with no choices and exit 0",
+            ],
+            execute=lambda _app: _cli_entry(_app, tmp_path),
+            input_refs=["command line"],
+            mock_components=["CLI entry over a temporary store"],
+            observations=["external_calls=0", "provider_sends=0"],
+        ),
+        runner.run(
             case_id="KNW-V06",
             requirement_ids=["D-P01", "C02", "KNW-V06"],
             purpose="an empty catalog is read without writing anything",
@@ -1026,7 +1105,7 @@ def test_the_matrix_runs_existing_modules_and_records_every_result(tmp_path):
     registered = {_family(result.case_id) for result in results}
     for case_id in REQUIRED_CASES:
         assert case_id in registered, f"matrix is missing {case_id}"
-    for case_id in F1_CASES:
+    for case_id in F1_CASES | CLI_CASES:
         assert statuses[case_id] == "passed"
     assert registered == REQUIRED_CASES, sorted(registered - REQUIRED_CASES)
     assert statuses["PERF-V06"] == "blocked"

@@ -14,7 +14,7 @@ from game_app.adoption import AdoptionService
 from game_app.answers import AmendmentService, AnswerService
 from game_app.contracts.common import Budget, MutationContext
 from game_app.contracts.primitives import utc_now
-from game_app.device import DeviceService
+from game_app.device import ContextService, DeviceService
 from game_app.errors import ContractError, ErrorCode, FieldError
 from game_app.feedback import (
     FeedbackService,
@@ -52,11 +52,13 @@ class Application:
         )
         self.imports = ImportService(repository, self.files)
         self.tasks.handlers["knowledge_import"] = self.imports.handle
-        self.devices = None
+        # The device owner is always available: registering an installation or
+        # listing local settings needs no adapter.  Only *scanning* does, so the
+        # device_scan handler stays unregistered without a probe — the type is
+        # refused rather than executed as an empty success.
+        self.devices = DeviceService(repository, self.files, probe)
+        self.contexts = ContextService(repository, self.files)
         if probe is not None:
-            # Without an adapter the type stays unregistered: it is refused
-            # rather than executed as an empty success.
-            self.devices = DeviceService(repository, self.files, probe)
             self.tasks.handlers["device_scan"] = self.devices.handle
         self.adoption = AdoptionService(repository, self.files, clock=clock)
         self.answers = AnswerService(
@@ -182,6 +184,61 @@ class Application:
 
     def declare_import_identity(self, request: Any, context: MutationContext, **kwargs: Any):
         return self.identity.declare_import_identity(request, context, **kwargs)
+
+    # -- 02 identity / 01 context entries ----------------------------------
+    # Under Q1 the CLI is the product's only surface, so the entries a caller
+    # needs to begin a journey are exposed here as thin wrappers: no rule of
+    # their own, no write on a read path.
+    def list_games(self, query: Any, user_scope_id: str | None = None):
+        return self.identity.list_games(query, user_scope_id=user_scope_id)
+
+    def select_game(self, request: Any, context: MutationContext, **kwargs: Any):
+        return self.identity.select_game(
+            request,
+            user_scope_id=context.user_scope_id,
+            idempotency_key=context.idempotency_key,
+            request_id=context.request_id,
+            **kwargs,
+        )
+
+    def list_installations(self, query: Any, user_scope_id: str):
+        return self.contexts.list_installations(
+            query, user_scope_id=user_scope_id
+        )
+
+    def create_installation(self, request: Any, context: MutationContext, **kwargs: Any):
+        return self.contexts.create_installation(request, context, **kwargs)
+
+    def list_local_settings(self, installation_id: str, user_scope_id: str):
+        return self.contexts.list_local_settings(
+            installation_id, user_scope_id=user_scope_id
+        )
+
+    def scan_device(self, task_input: Any, context: MutationContext, **kwargs: Any):
+        """Register a device scan; refused when no adapter is configured."""
+
+        self.require_probe()
+        return self.register_task(task_input, context, **kwargs)
+
+    def register_local_setting(
+        self, request: Any, context: MutationContext, **kwargs: Any
+    ):
+        return self.contexts.register_local_setting(request, context, **kwargs)
+
+    def devices_required(self) -> Any:
+        """The device owner: always present, since only scanning needs a probe."""
+
+        return self.devices
+
+    def require_probe(self) -> None:
+        """Refuse a scan when no adapter is configured, with a stable code."""
+
+        if self.devices.probe is None:
+            raise ContractError(
+                ErrorCode.PROVIDER_NOT_CONFIGURED,
+                "no device adapter is configured; device scans are unavailable"
+                " in this environment",
+            )
 
     # -- 02 knowledge entries ----------------------------------------------
     def collect_knowledge(self, task_input: Any, context: MutationContext, **kwargs: Any):
@@ -325,6 +382,9 @@ class Application:
 
     def analyze(self, request: Any, context: MutationContext, **kwargs: Any):
         return self.performance.analyze(request, context)
+
+    def get_artifact(self, artifact_id: str, user_scope_id: str):
+        return self.performance.get_artifact(artifact_id, user_scope_id)
 
     def get_summary(self, summary_id: str, user_scope_id: str):
         return self.performance.get_summary(summary_id, user_scope_id)

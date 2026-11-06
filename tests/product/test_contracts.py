@@ -928,9 +928,11 @@ def test_the_matrix_runs_existing_modules_and_records_every_result(tmp_path):
         runner.not_run(
             case_id="PERF-V06",
             requirement_ids=["D02", "PERF-V06"],
-            reason="needs a verified PresentMon adapter and a real Windows game",
+            reason="no real capture sample exists in this environment: no"
+                   " PresentMon CSV, version or options were available, so the"
+                   " fixed-version format registration cannot be verified",
             blocked=True,
-            blocked_by="Q2/G-GAME/G-FORMAT",
+            blocked_by="G-FORMAT (no real sample) / G-GAME",
         ),
         runner.not_run(
             case_id="VAL-V02-full",
